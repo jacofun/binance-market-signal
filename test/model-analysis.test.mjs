@@ -12,6 +12,89 @@ test("model JSON is validated beyond syntax, and invented metrics/confidence are
   assert.equal(validateProposal(none, snapshot()).status, "none");
   assert.throws(() => validateProposal({ ...none, direction: "long" }, snapshot()));
 });
+
+test("Kimi receives the snapshot metric enum, price rules and a larger default output budget", async () => {
+  const config = loadConfig({ ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro" });
+  assert.equal(config.maxTokens, 4096);
+  assert.equal(loadConfig({ ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", DASHSCOPE_MAX_TOKENS: "512" }).maxTokens, 512);
+  assert.equal(loadConfig(env).maxTokens, 2000);
+  await analyzeWithModel(config, snapshot(), "trend", AbortSignal.timeout(1000), async (_url, options) => {
+    const body = JSON.parse(options.body);
+    const prompt = body.messages[0].content;
+    const schema = JSON.parse(prompt.split("按此 JSON Schema 输出：")[1].split("\n")[0]);
+    const metrics = schema.properties.evidence.items.properties.metric.enum;
+    assert.ok(metrics.includes("1h.ema20"));
+    assert.ok(metrics.includes("quote.price"));
+    assert.ok(!metrics.includes("openInterest"));
+    assert.match(prompt, /stopLoss < entry.min <= entry.max/);
+    assert.match(prompt, /只能引用1个枚举指标/);
+    assert.equal(body.max_tokens, 4096);
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal()) } }] }));
+  });
+});
+test("complete fenced JSON is accepted, while surrounding prose, corrupt JSON and reasoning are rejected", async () => {
+  const json = JSON.stringify(proposal());
+  for (const content of [json, "\uFEFF " + json, "```json\n" + json + "\n```", "```\n" + json + "\n```"]) {
+    const result = await analyzeWithModel(loadConfig(env), snapshot(), "trend", AbortSignal.timeout(1000), async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content, reasoning_content: "private-reasoning" } }],
+    })));
+    assert.equal(result.proposal.direction, "long");
+  }
+  for (const content of ["Here is the result: " + json, json.slice(0, -1), "```json\n" + json, null, ""]) {
+    await assert.rejects(analyzeWithModel(loadConfig(env), snapshot(), "trend", AbortSignal.timeout(1000), async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content, reasoning_content: json } }],
+    }))), { code: "INVALID_MODEL_OUTPUT" });
+  }
+});
+test("invalid output diagnostics distinguish truncation, JSON, schema, metrics and prices without leaking output", async () => {
+  const id = "f33b92e5-7ade-471a-b3c4-d638b5e1b542";
+  const cases = [
+    ["length", null, "truncated", undefined],
+    ["length", JSON.stringify(proposal()), "truncated", undefined],
+    ["content_filter", null, "finish_reason", undefined],
+    ["private-unknown-finish", null, "finish_reason", undefined],
+    ["stop", null, "empty_content", undefined],
+    ["stop", "private-invalid-json", "invalid_json", undefined],
+    ["stop", "x".repeat(24001), "content_too_large", undefined],
+    ["stop", JSON.stringify(proposal({ evidence: [{ metric: "private-unknown-metric", reason: "private-output" }] })), "unsupported_metric", "evidence[0].metric"],
+    ["stop", JSON.stringify(proposal({ stopLoss: 11000 })), "price_relationship", "stopLoss/targets"],
+    ["stop", JSON.stringify(proposal({ entry: { min: "9990", max: 10010 } })), "schema", "entry.min"],
+    ["stop", JSON.stringify(proposal({ counterarguments: [] })), "schema", "counterarguments"],
+    ["stop", JSON.stringify(proposal({ targets: [{ price: 20000, reason: "private-output" }] })), "price_scale", "entry/stopLoss/targets"],
+    ["stop", JSON.stringify(proposal({ privateField: "private-output" })), "schema", "proposal"],
+  ];
+  for (const [finish_reason, content, outputReason, outputField] of cases) {
+    let calls = 0;
+    await assert.rejects(analyzeWithModel(loadConfig(env), snapshot(), "trend", AbortSignal.timeout(1000), async () => {
+      calls++;
+      return new Response(JSON.stringify({
+        choices: [{ finish_reason, message: { content, reasoning_content: "private-reasoning" } }],
+        usage: { prompt_tokens: 123, completion_tokens: 2000 }, request_id: id,
+      }));
+    }), error => {
+      assert.equal(error.code, "INVALID_MODEL_OUTPUT");
+      assert.equal(error.upstream.outputReason, outputReason);
+      assert.equal(error.upstream.outputField, outputField);
+      assert.equal(error.upstream.outputTokens, 2000);
+      assert.equal(error.upstream.inputTokens, 123);
+      assert.equal(error.upstream.upstreamRequestId, id);
+      assert.equal(error.upstream.upstreamStatus, 200);
+      assert.equal(error.upstream.finishReason, finish_reason === "private-unknown-finish" ? "unknown" : finish_reason);
+      assert.equal(JSON.stringify(error).includes("private-"), false);
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+});
+test("malformed envelopes and oversized HTTP responses have output diagnostics", async () => {
+  for (const raw of ["not-json", "x".repeat(100000), "null", "{}", JSON.stringify({ choices: [null] }), JSON.stringify({ choices: [1] })]) {
+    await assert.rejects(analyzeWithModel(loadConfig(env), snapshot(), "trend", AbortSignal.timeout(1000), async () => new Response(raw)), error => {
+      assert.equal(error.code, "INVALID_MODEL_OUTPUT");
+      assert.ok(["response_envelope", "finish_reason"].includes(error.upstream.outputReason));
+      return true;
+    });
+  }
+});
 test("Bailian request disables thinking, asks for JSON, and never retries errors", async () => {
   let calls = 0;
   const config = loadConfig(env);

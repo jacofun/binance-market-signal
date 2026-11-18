@@ -40,7 +40,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
     timing: { requestedAt: start, completedAt: end, finalQuoteTime: latest.time,
       validUntil: Math.min(start + p.validForSeconds * 1000, start + config.maxAnalysisAgeMs),
       marketMs: modelStart - start, modelMs: modelEnd - modelStart, verificationMs: end - modelEnd, totalMs: end - start },
-    model: { name: config.model, promptVersion: "market-research-v1", ...result.usage }, codeVersion: SOURCE_COMMIT,
+    model: { name: config.model, promptVersion: "market-research-v2", ...result.usage }, codeVersion: SOURCE_COMMIT,
     notes: ["候选研究结果，触发条件须人工确认；不自动下单。", "盈亏比按入场区间不利端估算，未计手续费、滑点和资金费。"],
   };
 }

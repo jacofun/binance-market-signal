@@ -91,6 +91,24 @@ test("upstream model diagnostics reach response and logs without raw provider te
   assert.equal(JSON.stringify(body).includes("secret-provider-text"), false);
   assert.equal(logs.join("").includes("secret-provider-text"), false);
 });
+test("model output diagnostics reach HTTP and logs without content or reasoning", async t => {
+  const logs = [];
+  const { request } = await app(t, {
+    model: (...args) => analyzeWithModel(...args, async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "length", message: { content: "private-incomplete-output", reasoning_content: "private-reasoning" } }],
+      usage: { prompt_tokens: 100, completion_tokens: 2000 },
+    }))),
+    logger: { info: x => logs.push(x), error: x => logs.push(x) },
+  });
+  const response = await request(); const body = await response.json();
+  assert.equal(response.status, 502); assert.equal(body.error.code, "INVALID_MODEL_OUTPUT");
+  assert.equal(body.error.outputReason, "truncated"); assert.equal(body.error.finishReason, "length");
+  assert.equal(body.error.outputTokens, 2000);
+  const log = logs.map(x => JSON.parse(x)).find(x => x.event === "analysis_failed");
+  assert.equal(log.requestId, body.requestId); assert.equal(log.outputReason, "truncated");
+  assert.equal(JSON.stringify(body).includes("private-"), false);
+  assert.equal(logs.join("").includes("private-"), false);
+});
 test("RAM-invoked boot probe requires neither JWT nor a Bailian key and cannot trigger analysis", async t => {
   const { url } = await app(t, { env: {} });
   for (const path of ["/", "/invoke"]) {
