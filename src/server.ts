@@ -13,8 +13,9 @@ const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
 const ANALYSIS_PATHS = new Set(["/", "/analyze", "/trade/api/signal", "/trade/api/signal/analyze"]);
 const HEALTH_PATHS = new Set(["/", "/health", "/trade/api/signal", "/trade/api/signal/health"]);
-async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
-  if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")) throw new AppError("UNSUPPORTED_MEDIA_TYPE", "请使用 application/json。", 415);
+async function body(req: IncomingMessage, ramProbe = false): Promise<Record<string, unknown>> {
+  const type = req.headers["content-type"] || "";
+  if (!/^application\/json(?:\s*;|$)/i.test(type) && !(ramProbe && /^application\/octet-stream(?:\s*;|$)/i.test(type))) throw new AppError("UNSUPPORTED_MEDIA_TYPE", "请使用 application/json。", 415);
   if (Number(req.headers["content-length"] || 0) > 4096) throw new AppError("BODY_TOO_LARGE", "请求体超过 4 KiB。", 413);
   let length = 0;
   const chunks: Buffer[] = [];
@@ -69,7 +70,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       // A harmless RAM-invoked boot probe. No model/market configuration is read.
       // The ordinary HTTP /health endpoint serves the same minimal information.
       if ((path === "/" || path === "/invoke") && req.headers["x-fc-request-id"] && !req.headers[TOKEN_HEADER.toLowerCase()]) {
-        const input = await body(req);
+        const input = await body(req, true);
         if (Object.keys(input).length === 1 && input.action === "health") { send(200, health()); return; }
         throw new AppError("UNAUTHORIZED", "分析请求需要 X-JWT-Token。", 401);
       }

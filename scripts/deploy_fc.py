@@ -130,7 +130,9 @@ def preflight(client, target):
 def smoke(client, target, expected_commit):
     response = client.invoke_function_with_options(
         target["functionName"], models.InvokeFunctionRequest(body=io.BytesIO(b'{"action":"health"}')),
-        models.InvokeFunctionHeaders(common_headers={"Content-Type": "application/json"}, x_fc_invocation_type="Sync"),
+        # Let the SDK sign and set its own content type; an extra mixed-case
+        # Content-Type can conflict with the FC gateway's canonical signature.
+        models.InvokeFunctionHeaders(x_fc_invocation_type="Sync"),
         RuntimeOptions(connect_timeout=10000, read_timeout=60000, autoretry=False),
     )
     raw = response.body.read(4097) if hasattr(response.body, "read") else response.body

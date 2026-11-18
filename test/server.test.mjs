@@ -68,7 +68,7 @@ test("unexpected provider/model errors are sanitized in both HTTP response and l
 test("RAM-invoked boot probe requires neither JWT nor a Bailian key and cannot trigger analysis", async t => {
   const { url } = await app(t, { env: {} });
   for (const path of ["/", "/invoke"]) {
-    const response = await fetch(url + path, { method: "POST", headers: { "x-fc-request-id": "platform-probe", "content-type": "application/json" }, body: '{"action":"health"}' });
+    const response = await fetch(url + path, { method: "POST", headers: { "x-fc-request-id": "platform-probe", "content-type": "application/octet-stream" }, body: '{"action":"health"}' });
     assert.equal(response.status, 200); assert.equal((await response.json()).service, "binance-market-signal");
   }
 });

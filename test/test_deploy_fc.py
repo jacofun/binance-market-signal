@@ -47,6 +47,7 @@ class FakeClient:
     def invoke_function_with_options(self, name, request, headers, runtime):
         assert json.loads(request.body.read()) == {"action": "health"}
         assert runtime.autoretry is False
+        assert not headers.common_headers
         return models.InvokeFunctionResponse(status_code=200, body=io.BytesIO(json.dumps({
             "status": "ok", "service": "binance-market-signal", "nodeMajor": self.node, "codeVersion": self.health_commit}).encode()))
 
