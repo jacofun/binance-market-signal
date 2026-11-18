@@ -14,6 +14,8 @@ test("WebSocket adapter bootstraps via REST, consumes prices, bounds bars and re
   const config = loadConfig(env);
   const market = new WebSocketMarketDataProvider(config, async url => { calls++; return marketFetch(url); }, () => NOW, url => {
     assert.ok(url.startsWith("wss://fstream.binance.com/market/stream?streams="));
+    assert.ok(url.includes("btcusdt@kline_15m"));
+    assert.ok(!url.includes("btcusdt@kline_1d"));
     return socket;
   });
   t.after(() => market.close());
@@ -25,10 +27,10 @@ test("WebSocket adapter bootstraps via REST, consumes prices, bounds bars and re
   assert.equal(calls, count);
   await market.snapshot("BTCUSDT", AbortSignal.timeout(2000));
   assert.equal(calls - count, 2); // server time and OI, candles/quote served from cache
-  const rows = market.bars.get("BTCUSDT:1h");
+  const rows = market.bars.get("BTCUSDT:15m");
   rows.splice(30, 1);
   await market.snapshot("BTCUSDT", AbortSignal.timeout(2000));
-  assert.equal(market.bars.get("BTCUSDT:1h").length, 200);
+  assert.equal(market.bars.get("BTCUSDT:15m").length, 200);
   socket.close();
   const afterClose = calls;
   await market.quote("BTCUSDT", AbortSignal.timeout(1000));

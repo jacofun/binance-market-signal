@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { analyzeWithModel, validateProposal } from "../build/model.js";
 import { analyze } from "../build/analysis.js";
 import { loadConfig } from "../build/config.js";
-import { env, NOW, snapshot, proposal, modelResult, provider, quote } from "./fixtures.mjs";
+import { RestMarketDataProvider } from "../build/market.js";
+import { env, NOW, snapshot, proposal, modelResult, provider, quote, marketFetch } from "./fixtures.mjs";
 
 test("model JSON is validated beyond syntax, and invented metrics/confidence are rejected", () => {
   assert.equal(validateProposal(proposal(), snapshot()).direction, "long");
@@ -11,6 +12,19 @@ test("model JSON is validated beyond syntax, and invented metrics/confidence are
   const none = proposal({ status: "none", direction: null, entry: null, stopLoss: null, targets: [] });
   assert.equal(validateProposal(none, snapshot()).status, "none");
   assert.throws(() => validateProposal({ ...none, direction: "long" }, snapshot()));
+});
+
+test("short targets use observed lows in order, and missing volume data permits no opportunity", () => {
+  const short = proposal({ direction: "short", stopLoss: 10100, targets: [
+    { price: 9700, reason: "前20根低点" }, { price: 9500, reason: "区间低点" },
+  ] });
+  const market = snapshot();
+  assert.deepEqual(validateProposal(short, market).targets, short.targets);
+  assert.throws(() => validateProposal({ ...short, targets: short.targets.toReversed() }, market),
+    { upstream: { outputReason: "price_relationship", outputField: "targets[1].price" } });
+  market.frames.forEach(f => { f.volumePrice[0].volumeRatio20 = null; });
+  assert.throws(() => validateProposal(short, market), { upstream: { outputReason: "unsupported_metric", outputField: "evidence[0].metric" } });
+  assert.equal(validateProposal(proposal({ status: "none", direction: null, entry: null, stopLoss: null, targets: [], evidence: [] }), market).status, "none");
 });
 
 test("Kimi receives the snapshot metric enum, price rules and a larger default output budget", async () => {
@@ -61,6 +75,8 @@ test("invalid output diagnostics distinguish truncation, JSON, schema, metrics a
     ["stop", JSON.stringify(proposal({ entry: { min: "9990", max: 10010 } })), "schema", "entry.min"],
     ["stop", JSON.stringify(proposal({ counterarguments: [] })), "schema", "counterarguments"],
     ["stop", JSON.stringify(proposal({ targets: [{ price: 20000, reason: "private-output" }] })), "price_scale", "entry/stopLoss/targets"],
+    ["stop", JSON.stringify(proposal({ targets: [{ price: 10150, reason: "private-output" }] })), "unsupported_target", "targets[0].price"],
+    ["stop", JSON.stringify(proposal({ evidence: [{ metric: "1h.ema20", reason: "private-output" }] })), "missing_volume_price_evidence", "evidence"],
     ["stop", JSON.stringify(proposal({ privateField: "private-output" })), "schema", "proposal"],
   ];
   for (const [finish_reason, content, outputReason, outputField] of cases) {
@@ -114,8 +130,9 @@ test("Bailian request disables thinking, asks for JSON, and never retries errors
     assert.equal(n, 1);
   }
 });
-test("Bailian Kimi K3.1 Pro uses its fixed temperature with the Singapore workspace endpoint", async () => {
+test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps its fixed sampling", async () => {
   const config = loadConfig({ ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", DASHSCOPE_BASE_URL: "https://ws-example.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1" });
+  const input = await new RestMarketDataProvider(config, marketFetch, () => NOW).snapshot("BTCUSDT", AbortSignal.timeout(1000));
   let calls = 0;
   const request = async (url, options) => {
     calls++;
@@ -124,9 +141,18 @@ test("Bailian Kimi K3.1 Pro uses its fixed temperature with the Singapore worksp
     assert.equal(body.model, "kimi-k3.1-pro"); assert.equal(body.temperature, 1);
     assert.equal(body.top_p, undefined); assert.equal(body.presence_penalty, undefined);
     assert.equal(body.enable_thinking, false); assert.equal(body.response_format.type, "json_object");
-    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal()) } }] }));
+    const sent = JSON.parse(body.messages[1].content).snapshot;
+    assert.deepEqual(sent.candleColumns, ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"]);
+    assert.deepEqual(sent.frames.map(f => [f.interval, f.recentCandles.length]), [["4h", 200], ["1h", 200], ["15m", 200]]);
+    for (const [i, f] of sent.frames.entries()) {
+      assert.equal(f.recentCandles[0][0], input.frames[i].recentCandles[0].openTime);
+      assert.deepEqual(f.recentCandles.at(-1).slice(1), [10000, 10100, 9900, 10010, 10, 4]);
+      assert.equal(f.volumePrice.length, 5);
+      assert.equal(f.priceLevels.high200, 10100);
+    }
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal({ targets: [{ price: 10100, reason: "1小时区间前高" }] })) } }] }));
   };
-  assert.equal((await analyzeWithModel(config, snapshot(), "trend", AbortSignal.timeout(1000), request)).proposal.status, "candidate");
+  assert.equal((await analyzeWithModel(config, input, "trend", AbortSignal.timeout(1000), request)).proposal.status, "candidate");
   assert.equal(calls, 1);
 });
 test("model failures expose only HTTP status, recognized provider codes and bounded request IDs", async () => {

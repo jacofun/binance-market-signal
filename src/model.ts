@@ -23,9 +23,14 @@ function invalid(outputReason: ModelOutputDetails["outputReason"] = "schema", ou
   throw new AppError("INVALID_MODEL_OUTPUT", hint, 502, undefined, { outputReason, ...(outputField ? { outputField } : {}) });
 }
 
+const volumePriceMetrics = (snapshot: Snapshot) => snapshot.frames
+  .filter(f => f.volumePrice.some(bar => bar.volumeRatio20 !== null))
+  .map(f => `${f.interval}.volumePrice`);
+
 function allowedMetrics(snapshot: Snapshot): string[] {
   return ["quote.price", "quote.indexPrice", "quote.fundingRate", ...(snapshot.openInterest.length ? ["openInterest"] : []),
-    ...snapshot.frames.flatMap(f => ["close", "ema20", "ema50", "atr14", "volumeRatio20", "high20", "low20", "recentCandles"].map(k => `${f.interval}.${k}`))];
+    ...snapshot.frames.flatMap(f => ["close", "ema20", "ema50", "atr14", "volumeRatio20", "high20", "low20", "recentCandles", "priceLevels"].map(k => `${f.interval}.${k}`)),
+    ...volumePriceMetrics(snapshot)];
 }
 function schemaForSnapshot(snapshot: Snapshot) {
   return { ...proposalSchema, properties: { ...proposalSchema.properties, evidence: {
@@ -107,18 +112,40 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
     // Reject hallucinated scales and remote, ungrounded price regimes.
     const q = snapshot.quote.price;
     if ([p.entry.min, p.entry.max, p.stopLoss, ...p.targets.map(t => t.price)].some(v => v < q * 0.5 || v > q * 1.5)) invalid("price_scale", "entry/stopLoss/targets");
+    const levels = new Set(snapshot.frames.flatMap(f => p.direction === "long"
+      ? [f.high20, f.priceLevels.high200, ...f.priceLevels.swingHighs]
+      : [f.low20, f.priceLevels.low200, ...f.priceLevels.swingLows]));
+    const direction = p.direction === "long" ? 1 : -1;
+    for (const [i, target] of p.targets.entries()) {
+      const previous = p.targets[i - 1];
+      if (previous && (target.price - previous.price) * direction <= 0) invalid("price_relationship", `targets[${i}].price`);
+      if (!levels.has(target.price)) invalid("unsupported_target", `targets[${i}].price`);
+    }
+    const volumeMetrics = volumePriceMetrics(snapshot);
+    if (!p.evidence.some(e => volumeMetrics.includes(e.metric))) invalid("missing_volume_price_evidence", "evidence");
   }
   return p;
 }
 
 export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal, request: typeof fetch = fetch): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
+  const marketInput = {
+    ...snapshot,
+    candleColumns: ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"],
+    frames: snapshot.frames.map(({ recentCandles, ...summary }) => ({
+      ...summary,
+      recentCandles: recentCandles.map(c => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.takerBuyVolume]),
+    })),
+  };
   const system = `你是合约行情研究助手。只分析所提供的币安 USDT 永续行情，不使用外部新闻、账户信息或臆造指标。输出严格 JSON，不使用 Markdown。
 这是候选研究机会，不执行交易。允许暂无机会。candidate 仅表示候选价位，不表示自然语言触发条件已经满足；需要未来确认时用 watch。
-根据日线、4小时、1小时综合分析，风格由 style 指定；不得把所有行情强行解释成信号。不报告未经校准的胜率或确定性收益。
-所有价格参考为标记价格。给出入场区间、止损、1至3个目标、触发条件、失效条件、反对理由。
+按4小时判断趋势和区间，按1小时判断上涨、下跌或回撤结构及关键价位，按15分钟判断触发前的量价表现。按 style 分析；不得把所有行情强行解释成信号。不报告未经校准的胜率或确定性收益。
+recentCandles 按时间从旧到新，每列含义见 candleColumns。K线来自合约成交数据，quote.price 是判断机会当前是否可用的标记价格。
+对比价格涨跌、成交量与此前20根均量的比值，并看主动买量占比及K线收盘位置。区分放量突破后守住、放量冲高后回落、缩量回踩和放量反向；如周期之间冲突，把反向证据写进 counterarguments。volumePrice 是最近5根收盘线的量价摘要，closeChangePct 是相对上一根收盘的百分比，takerBuyShare 是0到1的主动买入量占比。不要把OI或主动买量占比解释为净多头仓位。
+给出入场区间、止损、1至3个目标、触发条件、失效条件、反对理由。candidate/watch 必须至少用一条 <周期>.volumePrice 证据，引用该周期实际涨跌和相对成交量并解释两者关系。量价证据不足时返回 none。
+做多目标从 high20、priceLevels.high200、priceLevels.swingHighs 中按原价选取；做空目标从 low20、priceLevels.low200、priceLevels.swingLows 中按原价选取。结合1小时与15分钟 ATR、沿途支撑阻力和量价表现判断距离是否合理，优先考虑靠近的有效结构。每个目标注明周期、对应结构及为何该位置有依据。目标按交易方向从近到远排列。不得为了凑固定盈亏比跳过明显障碍、外推未提供的价位或硬凑目标；无合理目标时返回 none。
 none 时 direction/entry/stopLoss 为 null，targets 为空。其余状态须给出完整价位、证据和反对理由。
-evidence.metric 必须引用输入中的 quote.price/quote.indexPrice/quote.fundingRate/openInterest 或 1h、4h、1d 的 close/ema20/ema50/atr14/volumeRatio20/high20/low20/recentCandles；数据不存在时禁止引用。
+evidence.metric 必须取自下方枚举；数据不存在时禁止引用。
 validForSeconds 必须为30至300之间的整数。所有价位必须为 JSON 数字，不能用字符串；entry.min <= entry.max。
 做多必须 stopLoss < entry.min <= entry.max < 每个目标价；做空必须 每个目标价 < entry.min <= entry.max < stopLoss。所有价位须在当前 quote.price 的0.5至1.5倍内，否则返回 none。
 candidate/watch 的 targets、triggerConditions、invalidationConditions、evidence、counterarguments 均至少1项。每条 evidence 只能引用1个枚举指标，不得用逗号、斜杠合并多个指标，也不加 snapshot/frames 前缀。
@@ -128,7 +155,7 @@ candidate/watch 的 targets、triggerConditions、invalidationConditions、evide
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }
-  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot }) }],
+  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot: marketInput }) }],
     // Bailian Kimi K3.1 Pro rejects non-default sampling values; Qwen keeps the
     // existing low-temperature setting. top_p/presence_penalty use defaults.
     stream: false, temperature: config.model === "kimi-k3.1-pro" ? 1 : 0.1, max_tokens: config.maxTokens,

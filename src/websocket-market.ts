@@ -1,4 +1,4 @@
-import { RestMarketDataProvider, INTERVAL_MS, numeric, parseCandles } from "./market.js";
+import { ANALYSIS_INTERVALS, CANDLE_LIMIT, RestMarketDataProvider, INTERVAL_MS, numeric, parseCandles } from "./market.js";
 import type { Config } from "./config.js";
 import type { Candle, Interval, Quote, Snapshot } from "./types.js";
 
@@ -23,7 +23,7 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
   private connect() {
     if (this.closed) return;
     const streams = this.settings.symbols.flatMap(symbol => [
-      ...["1h", "4h", "1d"].map(i => `${symbol.toLowerCase()}@kline_${i}`), `${symbol.toLowerCase()}@markPrice@1s`,
+      ...ANALYSIS_INTERVALS.map(i => `${symbol.toLowerCase()}@kline_${i}`), `${symbol.toLowerCase()}@markPrice@1s`,
     ]);
     const socket = this.socketFactory(`wss://fstream.binance.com/market/stream?streams=${streams.join("/")}`);
     this.socket = socket;
@@ -70,7 +70,7 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
     }
     if (raw.e === "kline") {
       const k = raw.k as Record<string, unknown> | undefined;
-      if (!k || k.x !== true || !["1h", "4h", "1d"].includes(String(k.i))) return;
+      if (!k || k.x !== true || !ANALYSIS_INTERVALS.includes(k.i as Interval)) return;
       const interval = k.i as Interval;
       const c: Candle = { openTime: numeric(k.t, true), closeTime: numeric(k.T, true), open: numeric(k.o, true), high: numeric(k.h, true),
         low: numeric(k.l, true), close: numeric(k.c, true), volume: numeric(k.v), takerBuyVolume: numeric(k.V) };
@@ -80,20 +80,22 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
       const key = `${symbol}:${interval}`;
       const rows = this.bars.get(key) || [];
       // Ignore duplicate or late events. A hole is repaired before analysis.
-      if (!rows.length || c.openTime > rows.at(-1)!.openTime) this.bars.set(key, [...rows, c].slice(-200));
+      if (!rows.length || c.openTime > rows.at(-1)!.openTime) this.bars.set(key, [...rows, c].slice(-CANDLE_LIMIT));
     }
   }
   override async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
     const key = `${symbol}:${interval}`;
     const rows = this.bars.get(key) || [];
     try {
-      return parseCandles(rows.map(c => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.closeTime, 0, 0, c.takerBuyVolume, 0]), interval, at);
+      const closed = parseCandles(rows.map(c => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.closeTime, 0, 0, c.takerBuyVolume, 0]), interval, at);
+      if (closed.length === CANDLE_LIMIT) return closed;
     } catch {
-      const repaired = await super.candles(symbol, interval, at, signal);
-      const merged = new Map([...repaired, ...(this.bars.get(key) || [])].map(c => [c.openTime, c]));
-      this.bars.set(key, [...merged.values()].sort((a, b) => a.openTime - b.openTime).slice(-200));
-      return repaired;
+      // Fall back to REST when cached bars are stale or have gaps.
     }
+    const repaired = await super.candles(symbol, interval, at, signal);
+    const merged = new Map([...repaired, ...(this.bars.get(key) || [])].map(c => [c.openTime, c]));
+    this.bars.set(key, [...merged.values()].sort((a, b) => a.openTime - b.openTime).slice(-CANDLE_LIMIT));
+    return repaired;
   }
   override async quote(symbol: string, signal: AbortSignal): Promise<Quote> {
     const q = this.quotes.get(symbol);

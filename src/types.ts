@@ -1,4 +1,4 @@
-export type Interval = "1h" | "4h" | "1d";
+export type Interval = "4h" | "1h" | "15m";
 export type Style = "trend" | "reversal" | "neutral";
 export interface Candle {
   openTime: number; closeTime: number; open: number; high: number; low: number;
@@ -11,6 +11,8 @@ export interface Frame {
   interval: Interval; lastCloseTime: number; close: number; ema20: number; ema50: number;
   atr14: number; volumeRatio20: number | null; high20: number; low20: number;
   recentCandles: Candle[];
+  volumePrice: { openTime: number; closeChangePct: number; volumeRatio20: number | null; takerBuyShare: number | null }[];
+  priceLevels: { high200: number; low200: number; swingHighs: number[]; swingLows: number[] };
 }
 export interface Snapshot {
   symbol: string; asOf: number; receivedAt: number; quote: Quote;

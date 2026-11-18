@@ -3,7 +3,9 @@ import { boundedJson, limited } from "./http.js";
 import type { Config } from "./config.js";
 import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot } from "./types.js";
 
-export const INTERVAL_MS: Record<Interval, number> = { "1h": 3600000, "4h": 14400000, "1d": 86400000 };
+export const ANALYSIS_INTERVALS = ["4h", "1h", "15m"] as const satisfies readonly Interval[];
+export const INTERVAL_MS: Record<Interval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000 };
+export const CANDLE_LIMIT = 200;
 const badData = () => new AppError("INVALID_MARKET_DATA", "行情缺失、时间不连续或字段无效，本次不生成交易机会。", 502);
 export function numeric(value: unknown, positive = false): number {
   if (typeof value !== "number" && (typeof value !== "string" || !/^-?\d+(\.\d+)?$/.test(value))) throw badData();
@@ -30,10 +32,29 @@ export function parseCandles(raw: unknown, interval: Interval, serverTime: numbe
   }).filter(c => c.closeTime < serverTime);
   if (rows.length < 60 || rows.some((c, i) => i > 0 && c.openTime !== rows[i - 1]!.openTime + period) ||
     rows.at(-1)!.closeTime !== Math.floor(serverTime / period) * period - 1) throw badData();
-  return rows.slice(-200);
+  return rows.slice(-CANDLE_LIMIT);
 }
+
+function priceLevels(candles: Candle[]): Frame["priceLevels"] {
+  const swingHighs: number[] = [];
+  const swingLows: number[] = [];
+  // Require two closed bars on either side. For a flat top/bottom, keep its last bar.
+  for (let i = 2; i < candles.length - 2; i++) {
+    const c = candles[i]!;
+    const before = candles.slice(i - 2, i);
+    const after = candles.slice(i + 1, i + 3);
+    if (before.every(b => c.high >= b.high) && after.every(b => c.high > b.high)) swingHighs.push(c.high);
+    if (before.every(b => c.low <= b.low) && after.every(b => c.low < b.low)) swingLows.push(c.low);
+  }
+  return {
+    high200: Math.max(...candles.map(c => c.high)), low200: Math.min(...candles.map(c => c.low)),
+    swingHighs: swingHighs.slice(-8), swingLows: swingLows.slice(-8),
+  };
+}
+
 export function frame(candles: Candle[], interval: Interval): Frame {
   if (candles.length < 60) throw badData();
+  candles = candles.slice(-CANDLE_LIMIT);
   const ema = (period: number) => {
     let value = candles.slice(0, period).reduce((s, c) => s + c.close, 0) / period;
     for (const c of candles.slice(period)) value += (c.close - value) * 2 / (period + 1);
@@ -44,10 +65,18 @@ export function frame(candles: Candle[], interval: Interval): Frame {
   for (const value of tr.slice(14)) atr = (atr * 13 + value) / 14;
   const last = candles.at(-1)!;
   const previous20 = candles.slice(-21, -1);
-  const volumeMean = previous20.reduce((s, c) => s + c.volume, 0) / 20;
+  const volumePrice = candles.slice(-5).map((c, i) => {
+    const index = candles.length - 5 + i;
+    const previous = candles[index - 1]!;
+    const volumeMean = candles.slice(index - 20, index).reduce((s, b) => s + b.volume, 0) / 20;
+    return { openTime: c.openTime, closeChangePct: (c.close / previous.close - 1) * 100,
+      volumeRatio20: volumeMean > 0 ? c.volume / volumeMean : null,
+      takerBuyShare: c.volume > 0 ? c.takerBuyVolume / c.volume : null };
+  });
   return { interval, lastCloseTime: last.closeTime, close: last.close, ema20: ema(20), ema50: ema(50), atr14: atr,
-    volumeRatio20: volumeMean > 0 ? last.volume / volumeMean : null,
-    high20: Math.max(...previous20.map(c => c.high)), low20: Math.min(...previous20.map(c => c.low)), recentCandles: candles.slice(-24) };
+    volumeRatio20: volumePrice.at(-1)!.volumeRatio20,
+    high20: Math.max(...previous20.map(c => c.high)), low20: Math.min(...previous20.map(c => c.low)),
+    recentCandles: candles, volumePrice, priceLevels: priceLevels(candles) };
 }
 
 export class RestMarketDataProvider implements MarketDataProvider {
@@ -91,7 +120,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
     return q;
   }
   async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
-    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: "201", endTime: String(at) }, signal), interval, at);
+    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(CANDLE_LIMIT + 1), endTime: String(at) }, signal), interval, at);
   }
   async openInterest(symbol: string, at: number, signal: AbortSignal): Promise<Snapshot["openInterest"]> {
     const raw = await this.get("/futures/data/openInterestHist", { symbol, period: "1h", limit: "12" }, signal);
@@ -109,7 +138,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
     const at = await this.serverTime(signal);
     const warnings: string[] = [];
     // At most two outbound market calls at a time on the 0.35-vCPU instance.
-    const tasks: (() => Promise<unknown>)[] = (["1h", "4h", "1d"] as Interval[]).map(interval => async () => frame(await this.candles(symbol, interval, at, signal), interval));
+    const tasks: (() => Promise<unknown>)[] = ANALYSIS_INTERVALS.map(interval => async () => frame(await this.candles(symbol, interval, at, signal), interval));
     tasks.push(() => this.quote(symbol, signal));
     tasks.push(async () => {
       try { return await this.openInterest(symbol, at, signal); }

@@ -35,12 +35,12 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
     schemaVersion: 1, analysisId: randomUUID(), symbol, style, status,
     opportunity: { ...p, status, rewardRisk: p.targets.map(t => ({ target: t.price, ratio: risk ? Math.abs(t.price - entryReference!) / risk : null })),
       triggerVerified: false, priceReference: "markPrice", expiredReasons: reasons },
-    market: { asOf: snapshot.asOf, frames: snapshot.frames.map(({ recentCandles: _candles, ...f }) => f),
+    market: { asOf: snapshot.asOf, frames: snapshot.frames.map(({ recentCandles: _candles, volumePrice: _volumePrice, priceLevels: _priceLevels, ...f }) => f),
       initialQuote: snapshot.quote, latestQuote: latest, priceDriftBps: driftBps, openInterest: snapshot.openInterest, source: snapshot.source, warnings: snapshot.warnings },
     timing: { requestedAt: start, completedAt: end, finalQuoteTime: latest.time,
       validUntil: Math.min(start + p.validForSeconds * 1000, start + config.maxAnalysisAgeMs),
       marketMs: modelStart - start, modelMs: modelEnd - modelStart, verificationMs: end - modelEnd, totalMs: end - start },
-    model: { name: config.model, promptVersion: "market-research-v2", ...result.usage }, codeVersion: SOURCE_COMMIT,
+    model: { name: config.model, promptVersion: "market-research-v3", ...result.usage }, codeVersion: SOURCE_COMMIT,
     notes: ["候选研究结果，触发条件须人工确认；不自动下单。", "盈亏比按入场区间不利端估算，未计手续费、滑点和资金费。"],
   };
 }

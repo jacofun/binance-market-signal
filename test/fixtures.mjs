@@ -1,4 +1,5 @@
 import { generateKeyPairSync, sign } from "node:crypto";
+import { ANALYSIS_INTERVALS, INTERVAL_MS } from "../build/market.js";
 export const NOW = Date.UTC(2026, 10, 18, 10, 30);
 export const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 export const jwk = { ...publicKey.export({ format: "jwk" }), kid: "trade-sync-v1", use: "sig", alg: "RS256" };
@@ -10,8 +11,8 @@ export function jwt(delta = {}, headerDelta = {}) {
   return `Bearer ${h}.${p}.${sign("RSA-SHA256", Buffer.from(`${h}.${p}`), privateKey).toString("base64url")}`;
 }
 export const quote = (delta = {}) => ({ symbol: "BTCUSDT", price: 10000, indexPrice: 10001, fundingRate: 0.0001, nextFundingTime: NOW + 3600000, time: NOW, ...delta });
-export const snapshot = () => ({ symbol: "BTCUSDT", asOf: NOW, receivedAt: NOW, quote: quote(), source: "rest", warnings: [], openInterest: [], frames: ["1h", "4h", "1d"].map(interval => ({ interval, lastCloseTime: NOW - 1, close: 10000, ema20: 9900, ema50: 9800, atr14: 100, volumeRatio20: 1.5, high20: 10100, low20: 9700, recentCandles: [] })) });
-export const proposal = (delta = {}) => ({ status: "candidate", direction: "long", title: "趋势候选", summary: "等待本人确认触发条件", entry: { min: 9990, max: 10010 }, stopLoss: 9900, targets: [{ price: 10200, reason: "前方结构目标" }], triggerConditions: ["确认回踩"], invalidationConditions: ["跌破止损"], evidence: [{ metric: "1h.ema20", reason: "趋势条件" }], counterarguments: ["信号未经收益验证"], validForSeconds: 120, ...delta });
+export const snapshot = () => ({ symbol: "BTCUSDT", asOf: NOW, receivedAt: NOW, quote: quote(), source: "rest", warnings: [], openInterest: [], frames: ANALYSIS_INTERVALS.map(interval => ({ interval, lastCloseTime: NOW - 1, close: 10000, ema20: 9900, ema50: 9800, atr14: 100, volumeRatio20: 1.5, high20: 10100, low20: 9700, recentCandles: [], volumePrice: [{ openTime: NOW - INTERVAL_MS[interval], closeChangePct: 0.5, volumeRatio20: 1.5, takerBuyShare: 0.6 }], priceLevels: { high200: 10200, low200: 9500, swingHighs: [], swingLows: [] } })) });
+export const proposal = (delta = {}) => ({ status: "candidate", direction: "long", title: "趋势候选", summary: "等待本人确认触发条件", entry: { min: 9990, max: 10010 }, stopLoss: 9900, targets: [{ price: 10200, reason: "前方结构目标" }], triggerConditions: ["确认回踩"], invalidationConditions: ["跌破止损"], evidence: [{ metric: "1h.volumePrice", reason: "1小时上涨0.5%，成交量为前20根均量的1.5倍" }], counterarguments: ["信号未经收益验证"], validForSeconds: 120, ...delta });
 export const modelResult = (p = proposal()) => ({ proposal: p, usage: { inputTokens: 100, outputTokens: 100 } });
 export const provider = (delta = {}) => ({ snapshot: async () => snapshot(), quote: async () => quote(), close() {}, ...delta });
 export const silent = { info() {}, error() {} };
@@ -26,7 +27,7 @@ export function marketFetch(url) {
   const u = new URL(url);
   let data;
   if (u.pathname.endsWith("/time")) data = { serverTime: NOW };
-  else if (u.pathname.endsWith("/klines")) data = klines({ "1h": 3600000, "4h": 14400000, "1d": 86400000 }[u.searchParams.get("interval")]);
+  else if (u.pathname.endsWith("/klines")) data = klines(INTERVAL_MS[u.searchParams.get("interval")]);
   else if (u.pathname.endsWith("/premiumIndex")) data = { symbol: "BTCUSDT", markPrice: "10000", indexPrice: "10001", lastFundingRate: "0.0001", nextFundingTime: NOW + 3600000, time: NOW };
   else data = [{ symbol: "BTCUSDT", timestamp: NOW - 1000, sumOpenInterest: "100", sumOpenInterestValue: "1000000" }];
   return Promise.resolve(new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } }));
