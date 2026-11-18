@@ -69,7 +69,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 | `DASHSCOPE_RESPONSE_FORMAT` | `json_object` | 可选 `json_schema`，须模型支持；无静默降级 |
 | `DASHSCOPE_ENABLE_THINKING` | `false` | 首版关闭思考模式以控制延迟；不支持该参数的模型可设 `omit` |
 | `DASHSCOPE_TIMEOUT_MS` | `45000` | 模型调用超时，范围1000–90000 |
-| `DASHSCOPE_MAX_TOKENS` | `2000` | 输出上限，范围512–4096；截断结果会被拒绝 |
+| `DASHSCOPE_MAX_TOKENS` | Kimi K3.1 Pro 为 `4096`，其他模型 `2000` | 输出上限，范围512–4096；显式配置优先；截断结果会被拒绝 |
 | `BINANCE_TIMEOUT_MS` | `8000` | 每个行情请求超时，范围1000–15000 |
 | `SIGNAL_REQUEST_TIMEOUT_MS` | `65000` | 完整请求预算，范围5000–110000 |
 | `SIGNAL_MAX_ANALYSIS_AGE_MS` | `60000` | 从请求开始计算的机会时效上限，范围5000–110000 |
@@ -78,6 +78,24 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 | `SIGNAL_COOLDOWN_SECONDS` | `10` | 同一 subject 在单实例内的分析间隔，范围0–300 |
 
 没有 OSS 或币安账户密钥环境变量。百炼 Key 只放 FC 环境变量，不需要放 GitHub Secrets。`GET /health` 成功只说明服务启动成功，不说明密钥、模型权限或币安行情已经验证。
+
+### 排查 INVALID_MODEL_OUTPUT
+
+`INVALID_MODEL_OUTPUT` 表示模型响应读取、正文解析或业务校验失败，与 HTTP 4xx/5xx 的 `MODEL_UNAVAILABLE` 不同。旧日志只有总错误码，无法据此确定一次历史请求的具体失败环节。新版错误响应及 `analysis_failed` 日志提供以下诊断信息，不记录模型正文、思考内容或 API Key：
+
+| `outputReason` | 含义与处理 |
+| --- | --- |
+| `truncated` | `finish_reason=length`，输出被截断；检查 `DASHSCOPE_MAX_TOKENS`，Kimi 建议4096；实时分析建议 `DASHSCOPE_ENABLE_THINKING=false` |
+| `empty_content` | 正文为空；思考内容不能代替最终 JSON |
+| `invalid_json` | 正文不是完整 JSON；不提取解释文字中的片段，不修复残缺 JSON |
+| `schema` | 必需字段、类型或列表不符合要求，查看 `outputField` |
+| `unsupported_metric` | 引用了不在当前快照指标枚举中的名称，查看 `outputField` |
+| `price_relationship` / `price_scale` | 止盈止损方向、区间或价格尺度不合规，结果继续拒绝 |
+| `finish_reason` / `response_envelope` / `content_too_large` | 结束状态异常、响应封装无效或响应超限 |
+
+按可用情况同时提供 `finishReason`、`outputChars`、`inputTokens`、`outputTokens` 和经过格式检查的 `upstreamRequestId`。`outputField` 由服务端固定字段路径生成，不包含模型返回的字段名或值。例如 `outputReason=unsupported_metric, outputField=evidence[0].metric` 可以定位首条证据的指标引用错误。
+
+`market-research-v2` 提示词使用与服务端相同的动态指标枚举，明确数字类型、多空价位关系、非空列表要求和精简输出要求。仅兼容剥离包住完整 JSON 的单个 Markdown 代码块，之后执行同一套严格校验；不自动重试，不改变模型给出的交易价位。Kimi 使用百炼文档支持的 JSON Mode（`DASHSCOPE_RESPONSE_FORMAT=json_object`），其格式保证不等于业务 Schema 校验保证。
 
 ## HTTP触发器与CDN
 

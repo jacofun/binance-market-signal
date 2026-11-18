@@ -45,7 +45,7 @@ export function loadConfig(env: Env) {
     binanceTimeoutMs: integer(env, "BINANCE_TIMEOUT_MS", 8000, 1000, 15000),
     modelTimeoutMs: integer(env, "DASHSCOPE_TIMEOUT_MS", 45000, 1000, 90000),
     requestTimeoutMs: integer(env, "SIGNAL_REQUEST_TIMEOUT_MS", 65000, 5000, 110000),
-    maxTokens: integer(env, "DASHSCOPE_MAX_TOKENS", 2000, 512, 4096),
+    maxTokens: integer(env, "DASHSCOPE_MAX_TOKENS", model === "kimi-k3.1-pro" ? 4096 : 2000, 512, 4096),
     maxPriceAgeMs: integer(env, "SIGNAL_MAX_PRICE_AGE_MS", 5000, 1000, 15000),
     maxAnalysisAgeMs: integer(env, "SIGNAL_MAX_ANALYSIS_AGE_MS", 60000, 5000, 110000),
     maxPriceDriftBps: integer(env, "SIGNAL_MAX_PRICE_DRIFT_BPS", 30, 1, 500),
