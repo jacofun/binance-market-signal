@@ -174,6 +174,11 @@ def audit_native_jwt(client, target):
             config = _object(trigger.trigger_config)
             if config.get("disableurlinternet") is True:
                 continue
+            # The default function URL may be RAM-signature protected while the
+            # CDN origin custom domain uses JWT. This is not an anonymous bypass.
+            if config.get("authtype") == "function":
+                policies.append({"type": "ram-trigger", "name": trigger.trigger_name, "policy": {"authType": "function"}})
+                continue
             try:
                 policy = _jwt_policy(config.get("authtype"), config.get("authconfig"))
             except DeployError:
@@ -212,9 +217,10 @@ def audit_native_jwt(client, target):
         seen.add(token)
     else:
         raise DeployError("FC custom-domain pagination exceeded its bound.")
-    if not policies:
+    if not any(policy["type"] != "ram-trigger" for policy in policies):
         raise DeployError("No JWT-protected public HTTP ingress was found for the function.")
     print(json.dumps({"event": "native_jwt_verified", "httpTriggers": trigger_count,
+                      "ramProtectedTriggers": sum(policy["type"] == "ram-trigger" for policy in policies),
                       "customDomains": len(policies) - trigger_count}), flush=True)
     return hashlib.sha256(json.dumps(policies, sort_keys=True).encode()).hexdigest()
 
