@@ -170,10 +170,17 @@ def audit_native_jwt(client, target):
         for trigger in page.triggers or []:
             if trigger.trigger_type != "http":
                 continue
+            trigger = client.get_trigger(target["functionName"], trigger.trigger_name).body
             config = _object(trigger.trigger_config)
             if config.get("disableurlinternet") is True:
                 continue
-            policy = _jwt_policy(config.get("authtype"), config.get("authconfig"))
+            try:
+                policy = _jwt_policy(config.get("authtype"), config.get("authconfig"))
+            except DeployError:
+                print(json.dumps({"event": "native_jwt_policy_unconfirmed", "source": "httpTrigger",
+                                  "authType": config.get("authtype"), "fields": sorted(config),
+                                  "authConfigType": type(config.get("authconfig")).__name__}), flush=True)
+                raise
             policies.append({"type": "trigger", "name": trigger.trigger_name, "policy": policy})
         token = page.next_token
         if not token:

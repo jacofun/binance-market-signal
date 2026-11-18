@@ -41,6 +41,9 @@ class FakeClient:
                 auth_config=models.AuthConfig(auth_type=self.domain_policy["authType"], auth_info=json.dumps(self.domain_policy["authConfig"])))]
         return SimpleNamespace(body=models.ListCustomDomainOutput(custom_domains=domains))
 
+    def get_trigger(self, name, trigger_name):
+        return SimpleNamespace(body=models.Trigger(trigger_type="http", trigger_name=trigger_name, trigger_config=json.dumps(self.policy)))
+
     def get_function(self, name, request):
         custom = copy.deepcopy(self.request.body.custom_runtime_config) if self.request else models.CustomRuntimeConfig(
             command=["/opt/nodejs24/bin/node"], args=["index.js"], port=9000)

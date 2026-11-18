@@ -114,7 +114,7 @@ SIGNAL_AUTH_MODE=local-jwks MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true np
 - `ALIYUN_FC_ACCESS_KEY_ID`
 - `ALIYUN_FC_ACCESS_KEY_SECRET`
 
-RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`，以及只读鉴权审计的 `fc:ListTriggers`、`fc:ListCustomDomains`、`fc:GetCustomDomain`。不需要OSS或镜像仓库权限。
+RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`，以及只读鉴权审计的 `fc:ListTriggers`、`fc:GetTrigger`、`fc:ListCustomDomains`、`fc:GetCustomDomain`。不需要OSS或镜像仓库权限。
 
 部署前核对现有 `binance-market-signal`：`ap-northeast-2`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
 
