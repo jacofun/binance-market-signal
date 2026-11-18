@@ -1,4 +1,4 @@
-import { AppError } from "./errors.js";
+import { AppError, type ModelFailureDetails } from "./errors.js";
 import { boundedJson } from "./http.js";
 import type { Config } from "./config.js";
 import type { ModelResult, Proposal, Snapshot, Style } from "./types.js";
@@ -19,6 +19,33 @@ export const proposalSchema = {
   },
 };
 function invalid(): never { throw new AppError("INVALID_MODEL_OUTPUT", "模型返回的机会结构或价位关系无效，本次结果不作为交易机会。", 502); }
+// Never forward arbitrary provider messages, headers or response bodies. They
+// can echo a credential or prompt. Keep only recognized codes and UUID/hex IDs.
+const UPSTREAM_CODES = new Set([
+  "InvalidParameter", "InvalidParameter.NotSupportEnableThinking", "InternalError.Algo.InvalidParameter",
+  "invalid_parameter_error", "invalid_request_error", "ModelNotFound", "model_not_found", "NotFound",
+  "InvalidApiKey", "invalid_api_key", "AccessDenied.Unpurchased", "Arrearage", "insufficient_quota",
+  "Throttling.RateQuota", "Throttling.AllocationQuota", "InternalError", "ServiceUnavailable", "service_unavailable",
+]);
+const providerObject = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+function safeRequestId(value: unknown): string | undefined {
+  return typeof value === "string" && /^(?:[a-f0-9]{32}|[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/i.test(value) ? value : undefined;
+}
+async function modelFailureDetails(response: Response): Promise<ModelFailureDetails> {
+  const details: ModelFailureDetails = { upstreamStatus: response.status };
+  details.upstreamRequestId = safeRequestId(response.headers.get("x-request-id"));
+  try {
+    const body = providerObject(await boundedJson(response, 8192, "MODEL_UNAVAILABLE"));
+    const error = providerObject(body.error);
+    const code = error.code ?? body.code ?? error.type;
+    if (typeof code === "string" && UPSTREAM_CODES.has(code)) details.upstreamCode = code;
+    details.upstreamRequestId ||= safeRequestId(body.request_id) || safeRequestId(error.request_id);
+  } catch {
+    // Preserve the original HTTP failure even for HTML, oversized, malformed or
+    // interrupted error bodies. No automatic retry and no raw-body logging.
+  }
+  return details;
+}
 function object(value: unknown, names: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== names.length || names.some(n => !(n in value))) invalid();
   return value as Record<string, unknown>;
@@ -77,7 +104,9 @@ validForSeconds 取30至300秒。缺少或矛盾的数据须明确说明，不�
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }
   const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot }) }],
-    stream: false, temperature: 0.1, max_tokens: config.maxTokens,
+    // Bailian Kimi K3.1 Pro rejects non-default sampling values; Qwen keeps the
+    // existing low-temperature setting. top_p/presence_penalty use defaults.
+    stream: false, temperature: config.model === "kimi-k3.1-pro" ? 1 : 0.1, max_tokens: config.maxTokens,
     ...(config.enableThinking === "omit" ? {} : { enable_thinking: false }),
     response_format: config.responseFormat === "json_schema" ? { type: "json_schema", json_schema: { name: "market_opportunity", strict: true, schema: proposalSchema } } : { type: "json_object" },
   };
@@ -85,9 +114,10 @@ validForSeconds 取30至300秒。缺少或矛盾的数据须明确说明，不�
     const response = await request(config.endpoint, { method: "POST", redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(config.modelTimeoutMs)]),
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(body) });
     if (!response.ok) {
-      await response.body?.cancel();
+      const details = await modelFailureDetails(response);
       const code = [401, 403].includes(response.status) ? "MODEL_AUTH_FAILED" : response.status === 429 ? "MODEL_RATE_LIMITED" : "MODEL_UNAVAILABLE";
-      throw new AppError(code, "百炼调用失败，请检查 API Key 所属地域、模型权限、配额和结构化输出支持情况。", 502);
+      const hint = details.upstreamCode ? `，${details.upstreamCode}` : "";
+      throw new AppError(code, `百炼调用失败（HTTP ${response.status}${hint}），请检查模型参数、开通状态及 API Key 所属地域。`, 502, undefined, details);
     }
     const result = await boundedJson(response, 96 * 1024, "INVALID_MODEL_OUTPUT") as {
       choices?: { finish_reason?: string; message?: { content?: unknown } }[]; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };

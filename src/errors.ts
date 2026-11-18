@@ -1,5 +1,11 @@
+export interface ModelFailureDetails {
+  upstreamStatus: number;
+  upstreamCode?: string;
+  upstreamRequestId?: string;
+}
+
 export class AppError extends Error {
-  constructor(public code: string, message: string, public status = 400, public retryAfter?: number) {
+  constructor(public code: string, message: string, public status = 400, public retryAfter?: number, public upstream?: ModelFailureDetails) {
     super(message);
   }
 }

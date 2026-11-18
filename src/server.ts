@@ -100,8 +100,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId, symbol: input.symbol, status: result.status, totalMs: result.timing.totalMs }));
     } catch (error) {
       const safe = abort.signal.aborted ? new AppError("REQUEST_TIMEOUT", "分析已取消或超时，请重新获取行情。", 504) : publicError(error);
-      send(safe.status, { requestId, error: { code: safe.code, message: safe.message } }, safe.retryAfter ? { "Retry-After": String(safe.retryAfter) } : {});
-      logger.error(JSON.stringify({ event: "analysis_failed", requestId, code: safe.code }));
+      send(safe.status, { requestId, error: { code: safe.code, message: safe.message, ...safe.upstream } }, safe.retryAfter ? { "Retry-After": String(safe.retryAfter) } : {});
+      logger.error(JSON.stringify({ event: "analysis_failed", requestId, code: safe.code, ...safe.upstream }));
     } finally {
       clearTimeout(timer); req.off("aborted", disconnected); res.off("close", disconnected);
       if (acquired) active = false;

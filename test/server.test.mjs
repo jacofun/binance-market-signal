@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { makeServer } from "../build/server.js";
+import { analyzeWithModel } from "../build/model.js";
 import { env, jwt, NOW, provider, modelResult, silent } from "./fixtures.mjs";
 
 async function app(t, options = {}) {
@@ -72,6 +73,23 @@ test("unexpected provider/model errors are sanitized in both HTTP response and l
   const { request } = await app(t, { model: async () => { throw new Error("private-token-and-url"); }, logger: { info: x => logs.push(x), error: x => logs.push(x) } });
   const response = await request(); assert.equal(response.status, 500);
   assert.equal((await response.text()).includes("private-token"), false); assert.equal(logs.join("").includes("private-token"), false);
+});
+test("upstream model diagnostics reach response and logs without raw provider text", async t => {
+  const logs = [];
+  const { request } = await app(t, {
+    model: (...args) => analyzeWithModel(...args, async () => new Response(JSON.stringify({ error: { code: "InvalidParameter", message: "secret-provider-text" } }), {
+      status: 400, headers: { "x-request-id": "5a5096c5-8e7e-47d7-8998-e4cf310cd50c" },
+    })),
+    logger: { info: x => logs.push(x), error: x => logs.push(x) },
+  });
+  const response = await request(); const body = await response.json();
+  assert.equal(response.status, 502); assert.equal(body.error.code, "MODEL_UNAVAILABLE");
+  assert.equal(body.error.upstreamStatus, 400); assert.equal(body.error.upstreamCode, "InvalidParameter");
+  assert.equal(body.error.upstreamRequestId, "5a5096c5-8e7e-47d7-8998-e4cf310cd50c");
+  const log = logs.map(x => JSON.parse(x)).find(x => x.event === "analysis_failed");
+  assert.equal(log.requestId, body.requestId); assert.equal(log.upstreamStatus, 400); assert.equal(log.upstreamCode, "InvalidParameter");
+  assert.equal(JSON.stringify(body).includes("secret-provider-text"), false);
+  assert.equal(logs.join("").includes("secret-provider-text"), false);
 });
 test("RAM-invoked boot probe requires neither JWT nor a Bailian key and cannot trigger analysis", async t => {
   const { url } = await app(t, { env: {} });

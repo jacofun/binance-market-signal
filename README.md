@@ -2,7 +2,7 @@
 
 新加坡（`ap-southeast-1`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
 
-一次请求完成：币安公开行情 → 收盘K线/指标 → 百炼分析 → 最新标记价格再次核验 → 返回候选机会详情。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志只记录请求编号、状态和耗时，不记录 JWT、密钥、模型完整回复或请求头。
+一次请求完成：币安公开行情 → 收盘K线/指标 → 百炼分析 → 最新标记价格再次核验 → 返回候选机会详情。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
 
 ## 接口
 
@@ -49,6 +49,10 @@ FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证
 ```
 
 百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
+
+百炼 `kimi-k3.1-pro` 的采样参数固定为 `temperature=1.0`、`top_p=0.95`、`presence_penalty=0.0`。代码按模型名自动设置温度为 1，其余两个参数不传，使用服务端默认值；其他模型沿用温度 0.1，无需新增温度环境变量。Kimi 建议先用 `DASHSCOPE_RESPONSE_FORMAT=json_object`、`DASHSCOPE_ENABLE_THINKING=false` 验证完整调用。这里保持既有的非思考请求模式；若改用 `omit` 交由模型默认启用思考，需另行评估输出预算和超时。参考：[百炼 Kimi 参数约束](https://www.alibabacloud.com/help/en/model-studio/kimi-api#default-parameters)。
+
+模型失败时，HTTP 错误响应和 `analysis_failed` 日志保留 `upstreamStatus`，并按可用情况提供 `upstreamCode`、`upstreamRequestId`。上游错误正文只进行最多 8 KiB 的有界读取，代码仅允许已知错误码和 UUID/32位十六进制请求编号进入诊断字段；原始错误消息、未知字段和 HTML 不记录或透传。不自动重试。`MODEL_UNAVAILABLE` 加 `upstreamStatus=400` 应优先检查参数；404 检查模型 ID、开通状态和地域；5xx 根据上游请求编号排查服务异常。
 
 签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。业务鉴权不要求 `x-fc-control-path`、`x-fc-function-name` 或 `x-fc-request-id`；这些运行时元数据不构成密码学证明，缺失或取值不同不会拦截分析请求。信任边界是 FC 原生 JWT 入口，部署前后继续审计入口鉴权。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
 
