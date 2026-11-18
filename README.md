@@ -1,6 +1,6 @@
 # binance-market-signal
 
-首尔（`ap-northeast-2`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
+新加坡（`ap-southeast-1`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
 
 一次请求完成：币安公开行情 → 收盘K线/指标 → 百炼分析 → 最新标记价格再次核验 → 返回候选机会详情。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志只记录请求编号、状态和耗时，不记录 JWT、密钥、模型完整回复或请求头。
 
@@ -51,7 +51,7 @@ FC 默认使用 `fc-jwt` 模式，由控制台原生 JWT 入口验签，**不需
 }
 ```
 
-百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，函数部署在首尔不要求模型也在首尔。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
+百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
 
 签名公钥只保留在 FC 触发器/自定义域名的 JWT 配置中，无需下载、重新生成或复制到函数环境变量。默认 `SIGNAL_AUTH_MODE=fc-jwt`（可省略）；函数要求 FC 的 HTTP 调用上下文，读取 `X-JWT-Token` 中已经由平台验签的声明，并校验 RS256 格式、issuer、audience、scope、sub/jti 与最长120秒有效期。平台上下文不是密码学证明，验签信任边界是 FC 原生 JWT 入口；禁止将该模式直接暴露在未鉴权的普通HTTP服务器上。
 
@@ -96,7 +96,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 
 `MarketDataProvider` 是统一接口，已有 `RestMarketDataProvider` 和 `WebSocketMarketDataProvider`。后者使用Node.js 24内置WebSocket客户端，无第三方依赖，支持订阅合并、断流检查、指数退避重连、定期轮换连接、重复/旧事件忽略、每交易对/周期最多200根缓存及REST缺口修复。连接断开期间报价缓存失效。模型分析不会阻塞行情回调，不会对每个行情tick都调用大模型。
 
-FC首版使用 `MARKET_DATA_MODE=rest`，部署脚本不接受FC配置为websocket模式。未来在首尔常驻主机上启动持续服务：
+FC首版使用 `MARKET_DATA_MODE=rest`，部署脚本不接受FC配置为websocket模式。未来在新加坡常驻主机上启动持续服务：
 
 ```sh
 npm ci --ignore-scripts
@@ -116,7 +116,7 @@ SIGNAL_AUTH_MODE=local-jwks MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true np
 
 RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`，以及只读鉴权审计的 `fc:ListTriggers`、`fc:GetTrigger`、`fc:ListCustomDomains`、`fc:GetCustomDomain`。不需要OSS或镜像仓库权限。
 
-部署前核对现有 `binance-market-signal`：`ap-northeast-2`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
+部署前核对现有 `binance-market-signal`：`ap-southeast-1`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
 

@@ -7,7 +7,7 @@ resources:
   marketSignal:
     component: fc3
     props:
-      region: ap-northeast-2
+      region: ap-southeast-1
       functionName: binance-market-signal
       runtime: custom.debian12
       cpu: 0.35

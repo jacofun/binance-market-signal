@@ -66,7 +66,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
       }
       if (!response.ok) {
         await response.body?.cancel();
-        throw new AppError("BINANCE_UNAVAILABLE", "币安行情请求失败，请检查首尔函数公网连接及接口可用性。", 502);
+        throw new AppError("BINANCE_UNAVAILABLE", "币安行情请求失败，请检查新加坡函数公网连接及接口可用性。", 502);
       }
       return await boundedJson(response, 512 * 1024, "INVALID_MARKET_DATA");
     } catch (error) {
