@@ -6,6 +6,7 @@ import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot } fro
 export const ANALYSIS_INTERVALS = ["4h", "1h", "15m"] as const satisfies readonly Interval[];
 export const INTERVAL_MS: Record<Interval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000 };
 export const CANDLE_LIMIT = 200;
+export const candleRow = (c: Candle) => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.takerBuyVolume];
 const badData = () => new AppError("INVALID_MARKET_DATA", "行情缺失、时间不连续或字段无效，本次不生成交易机会。", 502);
 export function numeric(value: unknown, positive = false): number {
   if (typeof value !== "number" && (typeof value !== "string" || !/^-?\d+(\.\d+)?$/.test(value))) throw badData();

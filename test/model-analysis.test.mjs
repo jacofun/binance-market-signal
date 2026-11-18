@@ -133,6 +133,7 @@ test("Bailian request disables thinking, asks for JSON, and never retries errors
 test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps its fixed sampling", async () => {
   const config = loadConfig({ ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", DASHSCOPE_BASE_URL: "https://ws-example.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1" });
   const input = await new RestMarketDataProvider(config, marketFetch, () => NOW).snapshot("BTCUSDT", AbortSignal.timeout(1000));
+  let modelFrames;
   let calls = 0;
   const request = async (url, options) => {
     calls++;
@@ -142,6 +143,7 @@ test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps 
     assert.equal(body.top_p, undefined); assert.equal(body.presence_penalty, undefined);
     assert.equal(body.enable_thinking, false); assert.equal(body.response_format.type, "json_object");
     const sent = JSON.parse(body.messages[1].content).snapshot;
+    modelFrames = sent.frames;
     assert.deepEqual(sent.candleColumns, ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"]);
     assert.deepEqual(sent.frames.map(f => [f.interval, f.recentCandles.length]), [["4h", 200], ["1h", 200], ["15m", 200]]);
     for (const [i, f] of sent.frames.entries()) {
@@ -152,7 +154,11 @@ test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps 
     }
     return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal({ targets: [{ price: 10100, reason: "1小时区间前高" }] })) } }] }));
   };
-  assert.equal((await analyzeWithModel(config, input, "trend", AbortSignal.timeout(1000), request)).proposal.status, "candidate");
+  const market = provider({ snapshot: async () => input });
+  const result = await analyze(config, market, "BTCUSDT", "trend", AbortSignal.timeout(1000),
+    (...args) => analyzeWithModel(...args, request), () => NOW);
+  assert.equal(result.status, "candidate");
+  assert.deepEqual(result.market.chart, modelFrames.map(f => ({ interval: f.interval, candles: f.recentCandles })));
   assert.equal(calls, 1);
 });
 test("model failures expose only HTTP status, recognized provider codes and bounded request IDs", async () => {

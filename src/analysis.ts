@@ -4,6 +4,7 @@ import { analyzeWithModel } from "./model.js";
 import type { Config } from "./config.js";
 import type { MarketDataProvider, ModelResult, Proposal, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
+import { candleRow } from "./market.js";
 
 export type Model = typeof analyzeWithModel;
 export async function analyze(config: Config, provider: MarketDataProvider, symbol: string, style: Style, signal: AbortSignal,
@@ -36,6 +37,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
     opportunity: { ...p, status, rewardRisk: p.targets.map(t => ({ target: t.price, ratio: risk ? Math.abs(t.price - entryReference!) / risk : null })),
       triggerVerified: false, priceReference: "markPrice", expiredReasons: reasons },
     market: { asOf: snapshot.asOf, frames: snapshot.frames.map(({ recentCandles: _candles, volumePrice: _volumePrice, priceLevels: _priceLevels, ...f }) => f),
+      chart: snapshot.frames.map(f => ({ interval: f.interval, candles: f.recentCandles.map(candleRow) })),
       initialQuote: snapshot.quote, latestQuote: latest, priceDriftBps: driftBps, openInterest: snapshot.openInterest, source: snapshot.source, warnings: snapshot.warnings },
     timing: { requestedAt: start, completedAt: end, finalQuoteTime: latest.time,
       validUntil: Math.min(start + p.validForSeconds * 1000, start + config.maxAnalysisAgeMs),
