@@ -10,10 +10,30 @@ test("only contiguous closed candles enter indicators, with known ATR and volume
   assert.equal(bars.at(-1).closeTime, Math.floor(NOW / 3600000) * 3600000 - 1);
   const f = frame(bars, "1h");
   assert.equal(f.ema20, 10010); assert.equal(f.ema50, 10010); assert.equal(f.atr14, 200); assert.equal(f.volumeRatio20, 1);
-  assert.equal(f.recentCandles.length, 24);
+  assert.equal(f.recentCandles.length, 200);
   for (const rows of [klines(3600000).slice(0, -2), klines(3600000).filter((_, i) => i !== 30), klines(3600000).slice(-20)]) assert.throws(() => parseCandles(rows, "1h", NOW));
   const broken = klines(3600000); broken[20][4] = "Infinity";
   assert.throws(() => parseCandles(broken, "1h", NOW));
+});
+test("closed candles produce volume-price evidence and confirmed historical levels", () => {
+  const rows = klines(900000);
+  rows[40][2] = "10500";
+  rows[42][3] = "9500";
+  const latest = rows.at(-2);
+  latest[4] = "10100";
+  latest[5] = "25";
+  latest[9] = "15";
+  rows.at(-1)[2] = "15000";
+  const result = frame(parseCandles(rows, "15m", NOW), "15m");
+  assert.equal(result.priceLevels.high200, 10500);
+  assert.deepEqual(result.priceLevels.swingHighs, [10500]);
+  assert.deepEqual(result.priceLevels.swingLows, [9500]);
+  assert.equal(result.high20, 10100);
+  const recent = result.volumePrice.at(-1);
+  assert.equal(recent.openTime, latest[0]);
+  assert.ok(Math.abs(recent.closeChangePct - (10100 / 10010 - 1) * 100) < 1e-9);
+  assert.equal(recent.volumeRatio20, 2.5);
+  assert.equal(recent.takerBuyShare, 0.6);
 });
 test("REST snapshot uses no account secrets and caps parallel calls at two", async () => {
   let active = 0, peak = 0;
@@ -25,7 +45,8 @@ test("REST snapshot uses no account secrets and caps parallel calls at two", asy
   };
   const market = new RestMarketDataProvider(loadConfig(env), request, () => NOW);
   const result = await market.snapshot("BTCUSDT", AbortSignal.timeout(1000));
-  assert.equal(result.frames.length, 3); assert.equal(result.openInterest.length, 1); assert.equal(peak, 2);
+  assert.deepEqual(result.frames.map(f => [f.interval, f.recentCandles.length]), [["4h", 200], ["1h", 200], ["15m", 200]]);
+  assert.equal(result.openInterest.length, 1); assert.equal(peak, 2);
 });
 test("optional OI failure is explicit, but rate limits stop analysis", async () => {
   const config = loadConfig(env);
