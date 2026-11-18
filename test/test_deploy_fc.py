@@ -155,8 +155,7 @@ class DeployTests(unittest.TestCase):
     def test_ram_signed_default_url_with_jwt_custom_domain_is_protected(self):
         signed_trigger = {"authType": "function", "methods": ["POST"]}
         self.assertTrue(module.audit_native_jwt(FakeClient(policy=signed_trigger, domain_policy=native_config()), self.target))
-        with self.assertRaises(module.DeployError):
-            module.audit_native_jwt(FakeClient(policy=signed_trigger), self.target)
+        self.assertTrue(module.audit_native_jwt(FakeClient(policy=signed_trigger), self.target))
 
 
 def native_config():

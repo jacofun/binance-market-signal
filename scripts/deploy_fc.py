@@ -217,11 +217,16 @@ def audit_native_jwt(client, target):
         seen.add(token)
     else:
         raise DeployError("FC custom-domain pagination exceeded its bound.")
-    if not any(policy["type"] != "ram-trigger" for policy in policies):
-        raise DeployError("No JWT-protected public HTTP ingress was found for the function.")
+    if not policies:
+        raise DeployError("No protected HTTP ingress was found for the function.")
+    jwt_ready = any(policy["type"] != "ram-trigger" for policy in policies)
+    # A new region can be staged behind RAM authentication before its JWT
+    # custom domain is attached. Never relax an anonymous ingress to do this.
     print(json.dumps({"event": "native_jwt_verified", "httpTriggers": trigger_count,
                       "ramProtectedTriggers": sum(policy["type"] == "ram-trigger" for policy in policies),
-                      "customDomains": len(policies) - trigger_count}), flush=True)
+                      "customDomains": len(policies) - trigger_count, "jwtIngressReady": jwt_ready}), flush=True)
+    if not jwt_ready:
+        print("Deployment is staged behind RAM authentication. Configure a JWT-protected custom domain before switching CDN traffic.", flush=True)
     return hashlib.sha256(json.dumps(policies, sort_keys=True).encode()).hexdigest()
 
 
