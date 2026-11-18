@@ -2,32 +2,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeAuthorizer } from "../build/auth.js";
 import { loadConfig } from "../build/config.js";
-import { env, jwk, jwt, NOW } from "./fixtures.mjs";
+import { env, jwt, NOW, platform as platformHeaders } from "./fixtures.mjs";
 
-test("signal JWT checks issuer, distinct audience/scope, expiry and signatures", () => {
-  const auth = makeAuthorizer(env);
-  assert.equal(auth(jwt(), NOW / 1000), "owner");
-  for (const delta of [{ aud: "binance-trade-sync" }, { scope: "trading:sync" }, { iss: "https://evil.test" }, { exp: NOW / 1000 }, { exp: NOW / 1000 + 121 }, { iat: NOW / 1000 + 6 }, { nbf: NOW / 1000 + 1 }, { sub: "" }, { jti: "" }]) {
-    assert.throws(() => auth(jwt(delta), NOW / 1000), { code: "UNAUTHORIZED" });
+test("FC-only authorizer accepts the existing shared sync ticket without JWT environment settings", () => {
+  const auth = makeAuthorizer();
+  const platform = { controlPath: platformHeaders["x-fc-control-path"], functionName: platformHeaders["x-fc-function-name"], requestId: platformHeaders["x-fc-request-id"] };
+  assert.equal(auth(jwt(), NOW / 1000, platform), "owner");
+  // FC owns issuer/audience/scope policy. No per-function override is applied.
+  assert.equal(auth(jwt({ aud: "shared-domain", scope: "trading:sync" }), NOW / 1000, platform), "owner");
+  for (const context of [{}, { ...platform, controlPath: "/invoke" }, { ...platform, functionName: "other" }]) {
+    assert.throws(() => auth(jwt(), NOW / 1000, context), { code: "GATEWAY_REQUIRED" });
   }
-  for (const header of [{ alg: "none" }, { alg: "HS256" }, { kid: "other" }, { jku: "https://evil.test" }, { crit: [] }]) {
-    assert.throws(() => auth(jwt({}, header), NOW / 1000), { code: "UNAUTHORIZED" });
+  for (const value of [undefined, "Basic abc", "Bearer malformed", jwt() + ", extra", jwt({ sub: "" }), jwt({ exp: NOW / 1000 })]) {
+    assert.throws(() => auth(value, NOW / 1000, platform), { code: "UNAUTHORIZED" });
   }
-  for (const value of [undefined, "Basic abc", jwt() + "=", jwt() + ", extra", jwt().slice(0, -6) + "broken"]) assert.throws(() => auth(value, NOW / 1000), { code: "UNAUTHORIZED" });
 });
-test("missing/private/duplicate public keys fail closed without logging secrets", () => {
-  for (const keys of [[], [jwk, jwk], [{ ...jwk, d: "private-material" }]]) {
-    assert.throws(() => makeAuthorizer({ SIGNAL_AUTH_MODE: "local-jwks", SIGNAL_JWT_JWKS: JSON.stringify({ keys }) })(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
-  }
-  assert.throws(() => makeAuthorizer({ SIGNAL_AUTH_MODE: "local-jwks" })(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
-});
-test("FC mode needs no local JWKS and retains purpose checks after ingress verification", () => {
-  const auth = makeAuthorizer({});
-  const context = { controlPath: "/http-invoke", functionName: "binance-market-signal", requestId: "platform-id" };
-  assert.equal(auth(jwt(), NOW / 1000, context), "owner");
-  for (const c of [{}, { ...context, controlPath: "/invoke" }, { ...context, functionName: "other" }]) assert.throws(() => auth(jwt(), NOW / 1000, c), { code: "GATEWAY_REQUIRED" });
-  for (const delta of [{ scope: "trading:sync" }, { aud: "binance-trade-sync" }, { exp: NOW / 1000 }]) assert.throws(() => auth(jwt(delta), NOW / 1000, context), { code: "UNAUTHORIZED" });
-});
+
 test("model destination is confined to trusted Bailian endpoints and configuration is bounded", () => {
   assert.equal(loadConfig(env).model, "qwen-plus");
   for (const url of ["https://dashscope.aliyuncs.com/compatible-mode/v1", "https://workspace123.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/"]) {

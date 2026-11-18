@@ -240,8 +240,6 @@ def preflight(client, target):
         raise DeployError("Existing PORT environment variable must be 9000; stopped before writing.")
     if (current.environment_variables or {}).get("MARKET_DATA_MODE", "rest") != "rest":
         raise DeployError("FC deployment expects MARKET_DATA_MODE=rest; deploy continuous collection on a resident host.")
-    if (current.environment_variables or {}).get("SIGNAL_AUTH_MODE", "fc-jwt") != "fc-jwt":
-        raise DeployError("FC deployment expects SIGNAL_AUTH_MODE=fc-jwt; use local-jwks on standalone hosts.")
     custom = copy.deepcopy(current.custom_runtime_config) or models.CustomRuntimeConfig()
     if custom.port not in (None, 9000):
         raise DeployError("Existing custom runtime must listen on port 9000; stopped before writing.")

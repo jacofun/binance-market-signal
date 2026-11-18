@@ -17,7 +17,7 @@
 ```http
 POST https://yanxiao.me/trade/api/signal/analyze
 Content-Type: application/json
-X-JWT-Token: Bearer <120秒以内的RS256 JWT>
+X-JWT-Token: Bearer <北京现有接口签发的交易JWT>
 
 {"symbol":"BTCUSDT","style":"trend"}
 ```
@@ -35,16 +35,13 @@ X-JWT-Token: Bearer <120秒以内的RS256 JWT>
 
 ## FC 环境变量
 
-FC 默认使用 `fc-jwt` 模式，由控制台原生 JWT 入口验签，**不需要配置 `SIGNAL_JWT_JWKS`**。只需配置 `DASHSCOPE_API_KEY`，并建议明确百炼地域端点与模型。示例值中的占位符必须替换：
+FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证。**不需要任何 SIGNAL_JWT_*、SIGNAL_AUTH_MODE 或 SYNC_JWT_* 环境变量，旧值不再读取。**只需配置 `DASHSCOPE_API_KEY`，并建议明确百炼地域端点与模型。示例值中的占位符必须替换：
 
 ```json
 {
   "DASHSCOPE_API_KEY": "填写百炼API Key",
   "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "DASHSCOPE_MODEL": "qwen-plus",
-  "SIGNAL_AUTH_MODE": "fc-jwt",
-  "SIGNAL_JWT_ISSUER": "https://www.yanxiao.me",
-  "SIGNAL_JWT_AUDIENCE": "binance-market-signal",
   "SIGNAL_ALLOWED_SYMBOLS": "BTCUSDT",
   "PORT": "9000",
   "MARKET_DATA_MODE": "rest"
@@ -53,12 +50,13 @@ FC 默认使用 `fc-jwt` 模式，由控制台原生 JWT 入口验签，**不需
 
 百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
 
-签名公钥只保留在 FC 触发器/自定义域名的 JWT 配置中，无需下载、重新生成或复制到函数环境变量。默认 `SIGNAL_AUTH_MODE=fc-jwt`（可省略）；函数要求 FC 的 HTTP 调用上下文，读取 `X-JWT-Token` 中已经由平台验签的声明，并校验 RS256 格式、issuer、audience、scope、sub/jti 与最长120秒有效期。平台上下文不是密码学证明，验签信任边界是 FC 原生 JWT 入口；禁止将该模式直接暴露在未鉴权的普通HTTP服务器上。
+签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。保留 FC HTTP 调用上下文检查；这些 Header 不构成密码学证明，信任边界是 FC 原生 JWT 入口。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
 
 CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的FC自定义域名，确认业务JWT入口使用RS256公钥、唯一的 `X-JWT-Token` 来源，且全部分析路径受到JWT保护。默认函数URL可保留RAM签名鉴权，它是受IAM权限约束的管理调用入口；不接受匿名入口。跨地域迁移时，允许先在仅有RAM签名保护的默认函数URL后部署代码；工作流会标记 `jwtIngressReady=false`。切换CDN流量前，再配置受JWT保护的自定义域名。匿名入口仍会阻止部署。不接受会绕过业务路径鉴权的白名单/黑名单策略，只允许精确的健康检查路径例外；配置无法确认时停止部署。读取的JWKS只在CI内存中检查，不写入环境变量、部署包或日志，工作流不会修改任何鉴权配置。
 
-未来独立部署到ECS/常驻容器时，显式设置 `SIGNAL_AUTH_MODE=local-jwks`，并配置只含RSA公钥的 `SIGNAL_JWT_JWKS` JSON字符串，启用函数本地验签；原生模式不会读取这个变量。
-现有网站签发的 `aud=binance-trade-sync, scope=trading:sync` 令牌不能调用分析接口；网站对接时需增加新 audience/scope 的凭证签发入口。本仓库只实现新服务，不修改网站仓库和页面。本地可信环境可通过 `SIGNAL_PRIVATE_KEY` 与 `SIGNAL_KEY_ID` 调用 `npm run --silent token` 生成测试令牌；这些签名参数不配置在 FC、不存仓库、不传给浏览器。
+网站复用 `POST /api/private-auth/trading/binance/token`，沿用现有 `BINANCE_SYNC_*` 签名配置以及 `aud=binance-trade-sync, scope=trading:sync`，不需要新增签名接口或环境变量。交易日志页的“分析交易机会”获取短期凭证后直接请求 `/trade/api/signal/analyze`；北京不代理行情和模型调用。凭证仅驻留当前请求内存，不落浏览器存储。同一交易凭证授权这个域名内的同步与分析两项能力，签发接口继续限制 owner、登录态、Origin 和 CSRF。
+
+可信本地测试脚本 `npm run --silent token` 也使用现有 `BINANCE_SYNC_PRIVATE_KEY`、`BINANCE_SYNC_KEY_ID`、`BINANCE_SYNC_ISSUER` 和 `BINANCE_SYNC_AUDIENCE`；私钥仅供本地或北京签发中心，禁止放入本函数。
 
 可选参数及默认值：
 
@@ -81,7 +79,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 
 将 `/trade/api/signal/*` 回源本函数，`/trade/api/sync/*` 仍回源原同步函数。业务方法 POST，允许 OPTIONS 预检，使用 HTTPS 回源、禁止缓存、原样透传 `X-JWT-Token`/JSON请求体，不通过重定向切换接口。CDN/浏览器等待预算需覆盖函数的默认65秒分析预算；平台不支持该等待时间时需要调整预算或另行实现流式/异步协议。
 
-沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC默认模式必须保持原生JWT启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。函数继续校验分析用途声明，不再重复配置公钥。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
+沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC 必须保持原生 JWT 启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。函数不再配置单独的用途或公钥，沿用同步凭证和原生域名鉴权。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
 
 ## 小规格实例的实现
 
@@ -101,8 +99,8 @@ FC首版使用 `MARKET_DATA_MODE=rest`，部署脚本不接受FC配置为websock
 ```sh
 npm ci --ignore-scripts
 npm run build
-# 常驻服务须配置本地验签所需的 SIGNAL_JWT_JWKS 公钥。
-SIGNAL_AUTH_MODE=local-jwks MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
+# 当前 HTTP 处理器依赖 FC 原生 JWT；独立主机上线前须增加可信验签网关/鉴权适配器。
+MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 ```
 
 常驻模式启动时开始订阅。相同HTTP接口读取实时缓存，缓存未就绪或缺少已收盘K线时通过REST恢复。它是单进程内存缓存，进程重启后通过REST重新初始化；不承诺逐笔成交零丢失。多实例共享、全局去重、故障切换及持久化消息队列属于进一步扩展，不能仅凭FC选择Node.js 24保证持续接收。
@@ -131,6 +129,6 @@ python3 -m unittest discover -s test -p 'test_deploy_fc.py' -v
 npm run package
 ```
 
-测试覆盖JWT用途隔离、鉴权先于上游调用、CORS/路径、收盘及连续性、限流、过期报价、模型无效/截断输出、分析后重新核价、小实例并发、WebSocket缓存/补齐与部署配置保留。模型和行情使用可注入测试数据；真实百炼分析与真实WebSocket长时间稳定性仍需在配置完成后的运行环境验证。
+测试覆盖共用交易凭证和FC入口边界、鉴权先于上游调用、CORS/路径、收盘及连续性、限流、过期报价、模型无效/截断输出、分析后重新核价、小实例并发、WebSocket缓存/补齐与部署配置保留。模型和行情使用可注入测试数据；真实百炼分析与真实WebSocket长时间稳定性仍需在配置完成后的运行环境验证。
 
 参考：[FC自定义运行时](https://www.alibabacloud.com/help/en/functioncompute/custom-runtime/)、[百炼兼容接口](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)、[币安USD-M行情](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data)。

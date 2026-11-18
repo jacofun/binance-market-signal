@@ -35,7 +35,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
   env?: Env; provider?: MarketDataProvider; model?: Model; now?: () => number;
   logger?: Pick<Console, "info" | "error">;
 } = {}) {
-  const authorize = makeAuthorizer(env);
+  const authorize = makeAuthorizer();
   let config: Config | undefined;
   let market = provider;
   let active = false;

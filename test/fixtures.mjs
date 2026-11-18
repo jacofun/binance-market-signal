@@ -2,11 +2,12 @@ import { generateKeyPairSync, sign } from "node:crypto";
 export const NOW = Date.UTC(2026, 10, 18, 10, 30);
 export const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 export const jwk = { ...publicKey.export({ format: "jwk" }), kid: "trade-sync-v1", use: "sig", alg: "RS256" };
-export const env = { DASHSCOPE_API_KEY: "test-private-model-key", SIGNAL_AUTH_MODE: "local-jwks", SIGNAL_JWT_JWKS: JSON.stringify({ keys: [jwk] }), SIGNAL_COOLDOWN_SECONDS: "0" };
+export const env = { DASHSCOPE_API_KEY: "test-private-model-key", SIGNAL_COOLDOWN_SECONDS: "0" };
+export const platform = { "x-fc-control-path": "/http-invoke", "x-fc-function-name": "binance-market-signal", "x-fc-request-id": "platform-id" };
 export function jwt(delta = {}, headerDelta = {}) {
   const encode = value => Buffer.from(JSON.stringify(value)).toString("base64url");
   const h = encode({ typ: "JWT", alg: "RS256", kid: jwk.kid, ...headerDelta });
-  const p = encode({ iss: "https://www.yanxiao.me", aud: "binance-market-signal", scope: "market:analyze", sub: "owner", jti: "test-id", iat: NOW / 1000, exp: NOW / 1000 + 120, ...delta });
+  const p = encode({ iss: "https://www.yanxiao.me", aud: "binance-trade-sync", scope: "trading:sync", sub: "owner", jti: "test-id", iat: NOW / 1000, exp: NOW / 1000 + 120, ...delta });
   return `Bearer ${h}.${p}.${sign("RSA-SHA256", Buffer.from(`${h}.${p}`), privateKey).toString("base64url")}`;
 }
 export const quote = (delta = {}) => ({ symbol: "BTCUSDT", price: 10000, indexPrice: 10001, fundingRate: 0.0001, nextFundingTime: NOW + 3600000, time: NOW, ...delta });
