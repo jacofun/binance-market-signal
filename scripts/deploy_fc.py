@@ -172,8 +172,11 @@ def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
             if (deployed.runtime != target["runtime"] or deployed.timeout != target["timeout"]
                     or value_of(deployed.custom_runtime_config) != value_of(custom)):
                 raise DeployError("Deployed runtime/startup/timeout verification failed.")
-            if snapshot(deployed) != before:
-                raise DeployError("FC configuration changed during deployment; inspect the console.")
+            after = snapshot(deployed)
+            changed = [name for name in PRESERVED_FIELDS if before[name] != after[name]]
+            if changed:
+                # Field names are safe to log; environment/configuration values are not.
+                raise DeployError("FC configuration changed during deployment (fields: " + ", ".join(changed) + "); inspect the console.")
             expected_commit = os.environ.get("GITHUB_SHA", "development")
             result = {"functionName": name, "region": target["region"], "runtime": deployed.runtime,
                       "timeout": deployed.timeout, "codeChecksum": checksum,
