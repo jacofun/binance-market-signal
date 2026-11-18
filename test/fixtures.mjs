@@ -3,7 +3,6 @@ export const NOW = Date.UTC(2026, 10, 18, 10, 30);
 export const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 export const jwk = { ...publicKey.export({ format: "jwk" }), kid: "trade-sync-v1", use: "sig", alg: "RS256" };
 export const env = { DASHSCOPE_API_KEY: "test-private-model-key", SIGNAL_COOLDOWN_SECONDS: "0" };
-export const platform = { "x-fc-control-path": "/http-invoke", "x-fc-function-name": "binance-market-signal", "x-fc-request-id": "platform-id" };
 export function jwt(delta = {}, headerDelta = {}) {
   const encode = value => Buffer.from(JSON.stringify(value)).toString("base64url");
   const h = encode({ typ: "JWT", alg: "RS256", kid: jwk.kid, ...headerDelta });

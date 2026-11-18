@@ -2,19 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeAuthorizer } from "../build/auth.js";
 import { loadConfig } from "../build/config.js";
-import { env, jwt, NOW, platform as platformHeaders } from "./fixtures.mjs";
+import { env, jwt, NOW } from "./fixtures.mjs";
 
 test("FC-only authorizer accepts the existing shared sync ticket without JWT environment settings", () => {
   const auth = makeAuthorizer();
-  const platform = { controlPath: platformHeaders["x-fc-control-path"], functionName: platformHeaders["x-fc-function-name"], requestId: platformHeaders["x-fc-request-id"] };
-  assert.equal(auth(jwt(), NOW / 1000, platform), "owner");
+  assert.equal(auth(jwt(), NOW / 1000), "owner");
   // FC owns issuer/audience/scope policy. No per-function override is applied.
-  assert.equal(auth(jwt({ aud: "shared-domain", scope: "trading:sync" }), NOW / 1000, platform), "owner");
-  for (const context of [{}, { ...platform, controlPath: "/invoke" }, { ...platform, functionName: "other" }]) {
-    assert.throws(() => auth(jwt(), NOW / 1000, context), { code: "GATEWAY_REQUIRED" });
-  }
+  assert.equal(auth(jwt({ aud: "shared-domain", scope: "trading:sync" }), NOW / 1000), "owner");
   for (const value of [undefined, "Basic abc", "Bearer malformed", jwt() + ", extra", jwt({ sub: "" }), jwt({ exp: NOW / 1000 })]) {
-    assert.throws(() => auth(value, NOW / 1000, platform), { code: "UNAUTHORIZED" });
+    assert.throws(() => auth(value, NOW / 1000), { code: "UNAUTHORIZED" });
   }
 });
 

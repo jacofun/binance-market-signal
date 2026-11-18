@@ -2,14 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { makeServer } from "../build/server.js";
-import { env, jwt, NOW, provider, modelResult, silent, platform } from "./fixtures.mjs";
+import { env, jwt, NOW, provider, modelResult, silent } from "./fixtures.mjs";
 
 async function app(t, options = {}) {
   const server = makeServer({ env, now: () => NOW, logger: silent, provider: provider(), model: async () => modelResult(), ...options });
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   t.after(async () => { server.closeAllConnections(); await new Promise(r => server.close(r)); });
   const url = `http://127.0.0.1:${server.address().port}`;
-  const request = (path = "/trade/api/signal/analyze", body = { symbol: "BTCUSDT" }, headers = {}) => fetch(url + path, { method: "POST", headers: { "content-type": "application/json", "X-JWT-Token": jwt(), ...platform, ...headers }, body: JSON.stringify(body) });
+  const request = (path = "/trade/api/signal/analyze", body = { symbol: "BTCUSDT" }, headers = {}) => fetch(url + path, { method: "POST", headers: { "content-type": "application/json", "X-JWT-Token": jwt(), ...headers }, body: JSON.stringify(body) });
   return { url, request };
 }
 test("health and CORS work before business configuration; unauthorized calls do not touch providers", async t => {
@@ -34,12 +34,13 @@ test("full prefix and CDN-rewritten root paths return opportunities using only X
   const wrong = await request("/trade/api/signal/analyze", { symbol: "BTCUSDT" }, { "X-JWT-Token": "", Authorization: jwt() });
   assert.equal(wrong.status, 401);
 });
-test("FC native mode works without JWKS but rejects non-HTTP invocation context", async t => {
+test("shared ticket reaches analysis without FC metadata headers or JWT environment settings", async t => {
   const { request } = await app(t, { env: { DASHSCOPE_API_KEY: env.DASHSCOPE_API_KEY, SIGNAL_COOLDOWN_SECONDS: "0" } });
-  assert.equal((await request("/analyze", { symbol: "BTCUSDT" }, { "x-fc-control-path": "" })).status, 401);
-  const platform = { "x-fc-control-path": "/http-invoke", "x-fc-function-name": "binance-market-signal", "x-fc-request-id": "platform-id" };
-  assert.equal((await request("/analyze", { symbol: "BTCUSDT" }, platform)).status, 200);
-  assert.equal((await request("/analyze", { symbol: "BTCUSDT" }, { ...platform, "X-JWT-Token": jwt({ scope: "trading:sync" }) })).status, 200);
+  for (const headers of [{}, { "x-fc-control-path": "/invoke" }, { "x-fc-function-name": "unexpected-name" }, { "x-fc-request-id": "" }]) {
+    const response = await request("/analyze", { symbol: "BTCUSDT" }, headers);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, "candidate");
+  }
 });
 test("malformed token, origin, symbol, media type and oversized bodies fail before market fetch", async t => {
   let calls = 0;

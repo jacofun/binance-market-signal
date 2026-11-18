@@ -50,7 +50,7 @@ FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证
 
 百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
 
-签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。保留 FC HTTP 调用上下文检查；这些 Header 不构成密码学证明，信任边界是 FC 原生 JWT 入口。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
+签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。业务鉴权不要求 `x-fc-control-path`、`x-fc-function-name` 或 `x-fc-request-id`；这些运行时元数据不构成密码学证明，缺失或取值不同不会拦截分析请求。信任边界是 FC 原生 JWT 入口，部署前后继续审计入口鉴权。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
 
 CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的FC自定义域名，确认业务JWT入口使用RS256公钥、唯一的 `X-JWT-Token` 来源，且全部分析路径受到JWT保护。默认函数URL可保留RAM签名鉴权，它是受IAM权限约束的管理调用入口；不接受匿名入口。跨地域迁移时，允许先在仅有RAM签名保护的默认函数URL后部署代码；工作流会标记 `jwtIngressReady=false`。切换CDN流量前，再配置受JWT保护的自定义域名。匿名入口仍会阻止部署。不接受会绕过业务路径鉴权的白名单/黑名单策略，只允许精确的健康检查路径例外；配置无法确认时停止部署。读取的JWKS只在CI内存中检查，不写入环境变量、部署包或日志，工作流不会修改任何鉴权配置。
 
