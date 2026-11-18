@@ -1,5 +1,6 @@
 import { AppError, type ModelFailureDetails, type ModelOutputDetails } from "./errors.js";
 import { boundedJson } from "./http.js";
+import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelResult, Proposal, Snapshot, Style } from "./types.js";
 
@@ -134,7 +135,7 @@ export async function analyzeWithModel(config: Config, snapshot: Snapshot, style
     candleColumns: ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"],
     frames: snapshot.frames.map(({ recentCandles, ...summary }) => ({
       ...summary,
-      recentCandles: recentCandles.map(c => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.takerBuyVolume]),
+      recentCandles: recentCandles.map(candleRow),
     })),
   };
   const system = `你是合约行情研究助手。只分析所提供的币安 USDT 永续行情，不使用外部新闻、账户信息或臆造指标。输出严格 JSON，不使用 Markdown。
