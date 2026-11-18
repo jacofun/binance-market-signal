@@ -1,0 +1,21 @@
+# CI preserves environment variables, role, layers, CPU, memory, disk and triggers.
+# Only code, the startup command and timeout are managed here.
+edition: 3.0.0
+name: binance-market-signal
+access: default
+resources:
+  marketSignal:
+    component: fc3
+    props:
+      region: ap-northeast-2
+      functionName: binance-market-signal
+      runtime: custom.debian12
+      cpu: 0.35
+      memorySize: 512
+      diskSize: 10240
+      timeout: 120
+      customRuntimeConfig:
+        command: ["/bin/sh", "/code/bootstrap"]
+        args: []
+        port: 9000
+      code: ./dist/binance-market-signal.zip

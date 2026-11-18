@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext", "moduleResolution": "NodeNext", "types": ["node"],
+    "strict": true, "noUncheckedIndexedAccess": true, "noUnusedLocals": true,
+    "noUnusedParameters": true, "skipLibCheck": true, "rootDir": "src", "outDir": "build",
+    "sourceMap": false, "declaration": false
+  },
+  "include": ["src/**/*.ts"]
+}
