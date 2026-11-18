@@ -34,6 +34,13 @@ test("full prefix and CDN-rewritten root paths return opportunities using only X
   const wrong = await request("/trade/api/signal/analyze", { symbol: "BTCUSDT" }, { "X-JWT-Token": "", Authorization: jwt() });
   assert.equal(wrong.status, 401);
 });
+test("FC native mode works without JWKS but rejects non-HTTP invocation context", async t => {
+  const { request } = await app(t, { env: { DASHSCOPE_API_KEY: env.DASHSCOPE_API_KEY, SIGNAL_COOLDOWN_SECONDS: "0" } });
+  assert.equal((await request()).status, 401);
+  const platform = { "x-fc-control-path": "/http-invoke", "x-fc-function-name": "binance-market-signal", "x-fc-request-id": "platform-id" };
+  assert.equal((await request("/analyze", { symbol: "BTCUSDT" }, platform)).status, 200);
+  assert.equal((await request("/analyze", { symbol: "BTCUSDT" }, { ...platform, "X-JWT-Token": jwt({ scope: "trading:sync" }) })).status, 401);
+});
 test("wrong scope, origin, symbol, media type and oversized bodies fail before market fetch", async t => {
   let calls = 0;
   const { request, url } = await app(t, { provider: provider({ snapshot: async () => { calls++; throw new Error(); } }) });

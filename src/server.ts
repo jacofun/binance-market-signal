@@ -78,7 +78,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (req.rawHeaders.filter((_, i) => i % 2 === 0 && req.rawHeaders[i]!.toLowerCase() === TOKEN_HEADER.toLowerCase()).length !== 1) {
         throw new AppError("UNAUTHORIZED", "请提供唯一的 X-JWT-Token。", 401);
       }
-      const sub = authorize(req.headers[TOKEN_HEADER.toLowerCase()] as string | undefined, Math.floor(now() / 1000));
+      const platformHeader = (name: string) => typeof req.headers[name] === "string" ? req.headers[name] as string : undefined;
+      const sub = authorize(req.headers[TOKEN_HEADER.toLowerCase()] as string | undefined, Math.floor(now() / 1000), {
+        controlPath: platformHeader("x-fc-control-path"), functionName: platformHeader("x-fc-function-name"), requestId: platformHeader("x-fc-request-id"),
+      });
       const input = await body(req);
       if (Object.keys(input).some(k => !["symbol", "style"].includes(k)) || typeof input.symbol !== "string" ||
         (input.style !== undefined && !["trend", "reversal", "neutral"].includes(String(input.style)))) {

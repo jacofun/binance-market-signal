@@ -35,14 +35,14 @@ X-JWT-Token: Bearer <120秒以内的RS256 JWT>
 
 ## FC 环境变量
 
-必需配置 `DASHSCOPE_API_KEY` 和 `SIGNAL_JWT_JWKS`；建议同时明确配置百炼地域端点与模型。示例值中的占位符必须替换：
+FC 默认使用 `fc-jwt` 模式，由控制台原生 JWT 入口验签，**不需要配置 `SIGNAL_JWT_JWKS`**。只需配置 `DASHSCOPE_API_KEY`，并建议明确百炼地域端点与模型。示例值中的占位符必须替换：
 
 ```json
 {
   "DASHSCOPE_API_KEY": "填写百炼API Key",
   "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "DASHSCOPE_MODEL": "qwen-plus",
-  "SIGNAL_JWT_JWKS": "{\"keys\":[填写现有网站签名公钥JWK对象]}",
+  "SIGNAL_AUTH_MODE": "fc-jwt",
   "SIGNAL_JWT_ISSUER": "https://www.yanxiao.me",
   "SIGNAL_JWT_AUDIENCE": "binance-market-signal",
   "SIGNAL_ALLOWED_SYMBOLS": "BTCUSDT",
@@ -53,8 +53,11 @@ X-JWT-Token: Bearer <120秒以内的RS256 JWT>
 
 百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，函数部署在首尔不要求模型也在首尔。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
 
-`SIGNAL_JWT_JWKS` 是完整 JWKS 的 JSON **字符串**，只含 RSA 公钥。可复用现有首尔同步函数的 `SYNC_JWT_JWKS` 公钥值，不能复制签名私钥到本函数。签发端需使用相同 `kid`；算法 RS256、issuer 如上、audience `binance-market-signal`、scope **`market:analyze`**，含非空 `sub/jti` 和整数 `iat/exp`，最长120秒。
+签名公钥只保留在 FC 触发器/自定义域名的 JWT 配置中，无需下载、重新生成或复制到函数环境变量。默认 `SIGNAL_AUTH_MODE=fc-jwt`（可省略）；函数要求 FC 的 HTTP 调用上下文，读取 `X-JWT-Token` 中已经由平台验签的声明，并校验 RS256 格式、issuer、audience、scope、sub/jti 与最长120秒有效期。平台上下文不是密码学证明，验签信任边界是 FC 原生 JWT 入口；禁止将该模式直接暴露在未鉴权的普通HTTP服务器上。
 
+CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的FC自定义域名，确认使用RS256公钥、唯一的 `X-JWT-Token` 来源，且全部分析路径受到JWT保护。不接受会绕过业务路径鉴权的白名单/黑名单策略，只允许精确的健康检查路径例外；配置无法确认时停止部署。读取的JWKS只在CI内存中检查，不写入环境变量、部署包或日志，工作流不会修改任何鉴权配置。
+
+未来独立部署到ECS/常驻容器时，显式设置 `SIGNAL_AUTH_MODE=local-jwks`，并配置只含RSA公钥的 `SIGNAL_JWT_JWKS` JSON字符串，启用函数本地验签；原生模式不会读取这个变量。
 现有网站签发的 `aud=binance-trade-sync, scope=trading:sync` 令牌不能调用分析接口；网站对接时需增加新 audience/scope 的凭证签发入口。本仓库只实现新服务，不修改网站仓库和页面。本地可信环境可通过 `SIGNAL_PRIVATE_KEY` 与 `SIGNAL_KEY_ID` 调用 `npm run --silent token` 生成测试令牌；这些签名参数不配置在 FC、不存仓库、不传给浏览器。
 
 可选参数及默认值：
@@ -78,7 +81,7 @@ X-JWT-Token: Bearer <120秒以内的RS256 JWT>
 
 将 `/trade/api/signal/*` 回源本函数，`/trade/api/sync/*` 仍回源原同步函数。业务方法 POST，允许 OPTIONS 预检，使用 HTTPS 回源、禁止缓存、原样透传 `X-JWT-Token`/JSON请求体，不通过重定向切换接口。CDN/浏览器等待预算需覆盖函数的默认65秒分析预算；平台不支持该等待时间时需要调整预算或另行实现流式/异步协议。
 
-沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。代码本身校验 JWT，即使触发器未启用原生JWT也不能匿名分析。若同时启用 FC 原生JWT，配置公钥/issuer/audience、去掉 `Bearer ` 前缀，确保无JWT的 OPTIONS 能到达代码或由网关直接处理。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
+沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC默认模式必须保持原生JWT启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。函数继续校验分析用途声明，不再重复配置公钥。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
 
 ## 小规格实例的实现
 
@@ -98,8 +101,8 @@ FC首版使用 `MARKET_DATA_MODE=rest`，部署脚本不接受FC配置为websock
 ```sh
 npm ci --ignore-scripts
 npm run build
-# 其他模型/JWT环境变量仍需配置在进程环境中。
-MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
+# 常驻服务须配置本地验签所需的 SIGNAL_JWT_JWKS 公钥。
+SIGNAL_AUTH_MODE=local-jwks MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 ```
 
 常驻模式启动时开始订阅。相同HTTP接口读取实时缓存，缓存未就绪或缺少已收盘K线时通过REST恢复。它是单进程内存缓存，进程重启后通过REST重新初始化；不承诺逐笔成交零丢失。多实例共享、全局去重、故障切换及持久化消息队列属于进一步扩展，不能仅凭FC选择Node.js 24保证持续接收。
@@ -111,7 +114,7 @@ MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 - `ALIYUN_FC_ACCESS_KEY_ID`
 - `ALIYUN_FC_ACCESS_KEY_SECRET`
 
-RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`。不需要OSS或镜像仓库权限。
+RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`，以及只读鉴权审计的 `fc:ListTriggers`、`fc:ListCustomDomains`、`fc:GetCustomDomain`。不需要OSS或镜像仓库权限。
 
 部署前核对现有 `binance-market-signal`：`ap-northeast-2`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
 

@@ -3,6 +3,7 @@ import { AppError } from "./errors.js";
 import type { Env } from "./config.js";
 
 export const TOKEN_HEADER = "X-JWT-Token";
+export interface GatewayContext { controlPath?: string; functionName?: string; requestId?: string }
 const denied = () => new AppError("UNAUTHORIZED", "分析凭证无效或已过期。", 401);
 function parse(part: string): Record<string, unknown> {
   if (!/^[A-Za-z0-9_-]+$/.test(part)) throw denied();
@@ -31,8 +32,17 @@ export function makeAuthorizer(env: Env) {
       return result;
     } catch { throw new AppError("JWT_NOT_CONFIGURED", "请配置只含公钥的 SIGNAL_JWT_JWKS。", 503); }
   }
-  return (authorization: string | undefined, nowSeconds = Math.floor(Date.now() / 1000)): string => {
-    const trustedKeys = getKeys();
+  return (authorization: string | undefined, nowSeconds = Math.floor(Date.now() / 1000), gateway: GatewayContext = {}): string => {
+    const mode = env.SIGNAL_AUTH_MODE?.trim() || "fc-jwt";
+    if (mode !== "fc-jwt" && mode !== "local-jwks") throw new AppError("INVALID_AUTH_CONFIGURATION", "SIGNAL_AUTH_MODE 只支持 fc-jwt/local-jwks。", 503);
+    // In fc-jwt mode signature verification belongs to the FC ingress, not to
+    // these headers. CI audits every HTTP trigger and matching custom domain.
+    // Platform context rejects accidental direct invocation; it is not a signature.
+    if (mode === "fc-jwt" && (gateway.controlPath !== "/http-invoke" || gateway.functionName !== "binance-market-signal" ||
+      typeof gateway.requestId !== "string" || !gateway.requestId || gateway.requestId.length > 256)) {
+      throw new AppError("GATEWAY_REQUIRED", "分析接口须经启用 JWT 认证的 FC HTTP 入口调用。", 401);
+    }
+    const trustedKeys = mode === "local-jwks" ? getKeys() : undefined;
     try {
       if (!authorization || authorization.length > 8192 || !/^Bearer [^ ]+$/i.test(authorization)) throw denied();
       const parts = authorization.slice(7).split(".");
@@ -40,9 +50,11 @@ export function makeAuthorizer(env: Env) {
       const [h, p, s] = parts as [string, string, string];
       const header = parse(h);
       if (header.alg !== "RS256" || header.typ !== "JWT" || ["crit", "jku", "jwk", "x5u"].some(k => k in header)) throw denied();
-      const key = trustedKeys.get(String(header.kid));
-      if (!key || !/^[A-Za-z0-9_-]+$/.test(s) || Buffer.from(s, "base64url").toString("base64url") !== s ||
-        !verify("RSA-SHA256", Buffer.from(`${h}.${p}`), key, Buffer.from(s, "base64url"))) throw denied();
+      if (!/^[A-Za-z0-9_-]+$/.test(s) || Buffer.from(s, "base64url").toString("base64url") !== s || Buffer.from(s, "base64url").length < 256) throw denied();
+      if (trustedKeys) {
+        const key = trustedKeys.get(String(header.kid));
+        if (!key || !verify("RSA-SHA256", Buffer.from(`${h}.${p}`), key, Buffer.from(s, "base64url"))) throw denied();
+      }
       const c = parse(p);
       if (c.iss !== (env.SIGNAL_JWT_ISSUER?.trim() || "https://www.yanxiao.me") ||
         c.aud !== (env.SIGNAL_JWT_AUDIENCE?.trim() || "binance-market-signal") || c.scope !== "market:analyze" ||

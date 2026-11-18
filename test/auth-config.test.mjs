@@ -17,9 +17,16 @@ test("signal JWT checks issuer, distinct audience/scope, expiry and signatures",
 });
 test("missing/private/duplicate public keys fail closed without logging secrets", () => {
   for (const keys of [[], [jwk, jwk], [{ ...jwk, d: "private-material" }]]) {
-    assert.throws(() => makeAuthorizer({ SIGNAL_JWT_JWKS: JSON.stringify({ keys }) })(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
+    assert.throws(() => makeAuthorizer({ SIGNAL_AUTH_MODE: "local-jwks", SIGNAL_JWT_JWKS: JSON.stringify({ keys }) })(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
   }
-  assert.throws(() => makeAuthorizer({})(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
+  assert.throws(() => makeAuthorizer({ SIGNAL_AUTH_MODE: "local-jwks" })(jwt(), NOW / 1000), { code: "JWT_NOT_CONFIGURED" });
+});
+test("FC mode needs no local JWKS and retains purpose checks after ingress verification", () => {
+  const auth = makeAuthorizer({});
+  const context = { controlPath: "/http-invoke", functionName: "binance-market-signal", requestId: "platform-id" };
+  assert.equal(auth(jwt(), NOW / 1000, context), "owner");
+  for (const c of [{}, { ...context, controlPath: "/invoke" }, { ...context, functionName: "other" }]) assert.throws(() => auth(jwt(), NOW / 1000, c), { code: "GATEWAY_REQUIRED" });
+  for (const delta of [{ scope: "trading:sync" }, { aud: "binance-trade-sync" }, { exp: NOW / 1000 }]) assert.throws(() => auth(jwt(delta), NOW / 1000, context), { code: "UNAUTHORIZED" });
 });
 test("model destination is confined to trusted Bailian endpoints and configuration is bounded", () => {
   assert.equal(loadConfig(env).model, "qwen-plus");

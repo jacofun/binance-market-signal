@@ -100,6 +100,118 @@ def snapshot(function):
     return {key: value_of(getattr(function, key, None)) for key in PRESERVED_FIELDS}
 
 
+def _object(value):
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError()
+    return {key.lower(): item for key, item in value.items()}
+
+
+def _jwt_policy(auth_type, auth_config):
+    """Inspect policy in memory. Never print the JWKS or returned configuration."""
+    try:
+        if not isinstance(auth_type, str) or auth_type.lower() != "jwt":
+            raise ValueError()
+        policy = _object(auth_config)
+        if set(policy) - {"jwks", "tokenlookup", "claimpassby", "whitelist", "blacklist", "matchmode", "issuer", "issuers", "audience", "audiences"}:
+            raise ValueError()
+        jwks = _object(policy.get("jwks"))
+        keys = jwks.get("keys")
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 5:
+            raise ValueError()
+        for key in keys:
+            if (not isinstance(key, dict) or key.get("kty") != "RSA" or key.get("alg") != "RS256"
+                    or key.get("use") != "sig" or any(name in key for name in ("d", "p", "q", "dp", "dq", "qi", "oth", "k"))):
+                raise ValueError()
+            n = key.get("n", "")
+            if not isinstance(n, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", n):
+                raise ValueError()
+            if int.from_bytes(base64.urlsafe_b64decode(n + "=" * (-len(n) % 4)), "big").bit_length() < 2048:
+                raise ValueError()
+        lookup = policy.get("tokenlookup")
+        if isinstance(lookup, str):
+            parts = lookup.split(":", 2)
+            if len(parts) != 3 or "," in lookup or parts[0].lower() != "header" or parts[1].lower() != "x-jwt-token" or parts[2].strip() != "Bearer":
+                raise ValueError()
+        else:
+            lookup = _object(lookup)
+            if (lookup.get("readposition", "").lower() != "header" or lookup.get("parametername", "").lower() != "x-jwt-token"
+                    or lookup.get("prefix", "").strip() != "Bearer"):
+                raise ValueError()
+        # All analysis aliases must be protected; only exact health exceptions are safe.
+        if policy.get("blacklist"):
+            raise ValueError()
+        whitelist = policy.get("whitelist") or []
+        if not isinstance(whitelist, list):
+            raise ValueError()
+        if any(path not in ("/health", "/trade/api/signal/health") for path in whitelist):
+            raise ValueError()
+        mode = policy.get("matchmode", "all")
+        if not isinstance(mode, str) or mode.lower() not in ("all", "matchall", "match_all", "whitelist"):
+            raise ValueError()
+        if "x-jwt-token" in str(policy.get("claimpassby", "")).lower():
+            raise ValueError()
+        return policy
+    except (ValueError, TypeError, AttributeError, KeyError):
+        try:
+            fields = sorted(_object(auth_config))
+        except (ValueError, TypeError, AttributeError):
+            fields = []
+        raise DeployError("FC ingress must enforce RS256 JWT from X-JWT-Token for all analysis paths; policy fields: " + ", ".join(fields)) from None
+
+
+def audit_native_jwt(client, target):
+    policies = []
+    token = None
+    seen = set()
+    for _ in range(20):
+        page = client.list_triggers(target["functionName"], models.ListTriggersRequest(limit=100, next_token=token)).body
+        for trigger in page.triggers or []:
+            if trigger.trigger_type != "http":
+                continue
+            config = _object(trigger.trigger_config)
+            if config.get("disableurlinternet") is True:
+                continue
+            policy = _jwt_policy(config.get("authtype"), config.get("authconfig"))
+            policies.append({"type": "trigger", "name": trigger.trigger_name, "policy": policy})
+        token = page.next_token
+        if not token:
+            break
+        if token in seen:
+            raise DeployError("FC trigger pagination did not complete.")
+        seen.add(token)
+    else:
+        raise DeployError("FC trigger pagination exceeded its bound.")
+    trigger_count = len(policies)
+    token = None
+    seen = set()
+    for _ in range(20):
+        page = client.list_custom_domains(models.ListCustomDomainsRequest(limit=100, next_token=token)).body
+        for domain in page.custom_domains or []:
+            if domain.route_config is None:
+                domain = client.get_custom_domain(domain.domain_name).body
+            routes = (domain.route_config.routes if domain.route_config else []) or []
+            if not any(route.function_name == target["functionName"] for route in routes):
+                continue
+            auth = domain.auth_config
+            policy = _jwt_policy(auth.auth_type if auth else None, auth.auth_info if auth else None)
+            policies.append({"type": "domain", "name": domain.domain_name, "policy": policy})
+        token = page.next_token
+        if not token:
+            break
+        if token in seen:
+            raise DeployError("FC custom-domain pagination did not complete.")
+        seen.add(token)
+    else:
+        raise DeployError("FC custom-domain pagination exceeded its bound.")
+    if not policies:
+        raise DeployError("No JWT-protected public HTTP ingress was found for the function.")
+    print(json.dumps({"event": "native_jwt_verified", "httpTriggers": trigger_count,
+                      "customDomains": len(policies) - trigger_count}), flush=True)
+    return hashlib.sha256(json.dumps(policies, sort_keys=True).encode()).hexdigest()
+
+
 def preflight(client, target):
     current = client.get_function(target["functionName"], models.GetFunctionRequest()).body
     if current.runtime != target["runtime"]:
@@ -110,6 +222,8 @@ def preflight(client, target):
         raise DeployError("Existing PORT environment variable must be 9000; stopped before writing.")
     if (current.environment_variables or {}).get("MARKET_DATA_MODE", "rest") != "rest":
         raise DeployError("FC deployment expects MARKET_DATA_MODE=rest; deploy continuous collection on a resident host.")
+    if (current.environment_variables or {}).get("SIGNAL_AUTH_MODE", "fc-jwt") != "fc-jwt":
+        raise DeployError("FC deployment expects SIGNAL_AUTH_MODE=fc-jwt; use local-jwks on standalone hosts.")
     custom = copy.deepcopy(current.custom_runtime_config) or models.CustomRuntimeConfig()
     if custom.port not in (None, 9000):
         raise DeployError("Existing custom runtime must listen on port 9000; stopped before writing.")
@@ -153,6 +267,7 @@ def smoke(client, target, expected_commit):
 def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
     name = target["functionName"]
     current, custom = preflight(client, target)
+    ingress_before = audit_native_jwt(client, target)
     before = snapshot(current)
     checksum = crc64(package)
     print(json.dumps({"event": "fc_preflight", "runtime": current.runtime,
@@ -179,6 +294,8 @@ def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
             if changed:
                 # Field names are safe to log; environment/configuration values are not.
                 raise DeployError("FC configuration changed during deployment (fields: " + ", ".join(changed) + "); inspect the console.")
+            if audit_native_jwt(client, target) != ingress_before:
+                raise DeployError("FC JWT ingress policy changed during deployment; inspect the console.")
             expected_commit = os.environ.get("GITHUB_SHA", "development")
             result = {"functionName": name, "region": target["region"], "runtime": deployed.runtime,
                       "timeout": deployed.timeout, "codeChecksum": checksum,
@@ -200,6 +317,7 @@ def main():
     client = Client(config)
     if "--preflight" in sys.argv:
         preflight(client, target)
+        audit_native_jwt(client, target)
         print("Existing FC custom runtime, port and resource specifications verified.")
         return 0
     package = load_zip(root / target["code"])

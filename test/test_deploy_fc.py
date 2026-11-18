@@ -21,13 +21,25 @@ spec.loader.exec_module(module)
 
 
 class FakeClient:
-    def __init__(self, *, runtime="custom.debian12", drift=False, failed=False, health_commit="development", node=24):
+    def __init__(self, *, runtime="custom.debian12", drift=False, failed=False, health_commit="development", node=24, policy=None, domain_policy=None):
         self.runtime = runtime
         self.drift = drift
         self.failed = failed
         self.health_commit = health_commit
         self.node = node
         self.request = None
+        self.policy = policy if policy is not None else native_config()
+        self.domain_policy = domain_policy
+
+    def list_triggers(self, name, request):
+        return SimpleNamespace(body=models.ListTriggersOutput(triggers=[models.Trigger(trigger_type="http", trigger_name="defaultTrigger", trigger_config=json.dumps(self.policy))]))
+
+    def list_custom_domains(self, request):
+        domains = []
+        if self.domain_policy is not None:
+            domains = [models.CustomDomain(domain_name="example.test", route_config=models.RouteConfig(routes=[models.PathConfig(function_name="binance-market-signal", path="/*")]),
+                auth_config=models.AuthConfig(auth_type=self.domain_policy["authType"], auth_info=json.dumps(self.domain_policy["authConfig"])))]
+        return SimpleNamespace(body=models.ListCustomDomainOutput(custom_domains=domains))
 
     def get_function(self, name, request):
         custom = copy.deepcopy(self.request.body.custom_runtime_config) if self.request else models.CustomRuntimeConfig(
@@ -109,6 +121,39 @@ class DeployTests(unittest.TestCase):
         step = workflow["jobs"]["deploy"]["steps"][-1]
         self.assertEqual(set(step["env"]), {"ALIYUN_FC_ACCESS_KEY_ID", "ALIYUN_FC_ACCESS_KEY_SECRET"})
         self.assertIn("steps.current.outputs.deploy", step["if"])
+
+    def test_native_jwt_policy_is_audited_without_logging_keys(self):
+        self.assertTrue(module.audit_native_jwt(FakeClient(), self.target))
+        legacy = native_config()
+        legacy["authConfig"]["tokenLookup"] = "header:X-JWT-Token:Bearer "
+        legacy["authConfig"]["whitelist"] = ["/health"]
+        self.assertTrue(module.audit_native_jwt(FakeClient(policy=legacy), self.target))
+
+    def test_anonymous_or_bypass_policy_stops_before_writing(self):
+        cases = []
+        anonymous = native_config(); anonymous["authType"] = "anonymous"; cases.append(anonymous)
+        for change in [{"whitelist": ["/analyze"]}, {"blacklist": ["/analyze"]}, {"matchMode": "blacklist"},
+                       {"tokenLookup": "header:X-JWT-Token:Bearer,cookie:jwt"}, {"futureUnknownBypass": True},
+                       {"claimPassBy": "header:sub:X-JWT-Token"}]:
+            value = native_config(); value["authConfig"].update(change); cases.append(value)
+        for policy in cases:
+            client = FakeClient(policy=policy)
+            with self.assertRaises(module.DeployError) as error:
+                module.deploy(client, self.target, b"zip")
+            self.assertIsNone(client.request)
+            self.assertNotIn("public-modulus", str(error.exception))
+
+    def test_matching_custom_domains_must_also_require_jwt(self):
+        domain = native_config(); domain["authType"] = "anonymous"
+        with self.assertRaises(module.DeployError):
+            module.audit_native_jwt(FakeClient(domain_policy=domain), self.target)
+        self.assertTrue(module.audit_native_jwt(FakeClient(domain_policy=native_config()), self.target))
+
+
+def native_config():
+    modulus = base64.urlsafe_b64encode(bytes([128]) + bytes([1]) * 255).decode().rstrip("=")
+    return {"authType": "jwt", "authConfig": {"jwks": {"keys": [{"kty": "RSA", "alg": "RS256", "use": "sig", "e": "AQAB", "n": modulus}]},
+        "tokenLookup": {"readPosition": "header", "parameterName": "X-JWT-Token", "prefix": "Bearer "}}}
 
 
 if __name__ == "__main__":
