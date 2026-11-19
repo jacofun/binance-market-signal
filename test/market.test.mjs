@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { RestMarketDataProvider, parseCandles, frame } from "../build/market.js";
 import { loadConfig } from "../build/config.js";
 import { env, NOW, klines, marketFetch } from "./fixtures.mjs";
+import { limited } from "../build/http.js";
 
 test("only contiguous closed candles enter indicators, with known ATR and volume ratio", () => {
   const bars = parseCandles(klines(3600000), "1h", NOW);
@@ -63,4 +64,13 @@ test("stale and future quotes are rejected, transport errors are sanitized", asy
   }
   const market = new RestMarketDataProvider(loadConfig(env), async () => { throw new Error("https://secret-url/key"); });
   await assert.rejects(market.quote("BTCUSDT", AbortSignal.timeout(1000)), error => !error.message.includes("secret-url") && error.code === "BINANCE_TIMEOUT");
+});
+
+test("concurrent upstream tasks preserve the first failure", async () => {
+  const first = new Error("first request failure");
+  const later = new Error("later request failure");
+  await assert.rejects(limited([
+    async () => { throw first; },
+    async () => { await Promise.resolve(); throw later; },
+  ]), error => error === first);
 });

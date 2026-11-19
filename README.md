@@ -102,6 +102,14 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 
 按可用情况同时提供 `finishReason`、`outputChars`、`inputTokens`、`outputTokens` 和经过格式检查的 `upstreamRequestId`。`outputField` 由服务端固定字段路径生成，不包含模型返回的字段名或值。例如 `outputReason=unsupported_metric, outputField=evidence[0].metric` 可以定位首条证据的指标引用错误。
 
+### 云函数日志
+
+用网站响应的 `requestId` 搜索 `analysis_failed` 或 `analysis_completed`。失败日志包含代码版本、HTTP 状态、耗时和执行阶段（`request`、`market_snapshot`、`model`、`proposal_validation`、`quote_verification`）。超时和客户端断开分别记录为 `request_deadline` 和 `client_disconnected`。币安请求失败时可查看固定的 `marketEndpoint` 和上游返回的 `marketHttpStatus`。百炼用 `upstreamRequestId` 关联上游请求。
+
+业务校验失败时查看 `validation.reason`。例如，`zone_not_found` 表示本次快照缺少引用区域，`zone_broken` 表示区域已突破，`entry_out_of_bounds` 同时记录入场上下限和区域上下限。止损方向或距离、目标范围、阻挡区域和价格步长有各自的原因及数值上下文。格式不合法的模型区域 ID 只记录为 `malformed`。这些字段只进入 FC 日志。
+
+日志的 `exception` 保留最多四层异常类型、受控的错误码和服务模块行号，可以区分 DNS、连接超时、断线及 JSON 格式错误。HTTP 错误响应保持原有结构。日志仅采集诊断字段，不采集 Token、API Key、请求正文、完整模型输出或上游异常原文。
+
 ### V4 数据契约
 
 - `schemaVersion=4`、`model.promptVersion=market-research-v4`。保留 `opportunity`、`market.chart` 和当前 JWT 接口。先更新网站和私有鉴权函数对 V4 的解析及归档，再更新行情分析函数。

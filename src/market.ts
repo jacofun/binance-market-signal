@@ -82,22 +82,30 @@ export class RestMarketDataProvider implements MarketDataProvider {
   async get(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown> {
     const url = new URL(path, "https://fapi.binance.com");
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    let marketHttpStatus: number | undefined;
     try {
       const response = await this.request(url, { redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(this.config.binanceTimeoutMs)]),
         headers: { Accept: "application/json" }, cache: "no-store" });
+      marketHttpStatus = response.status;
       if (response.status === 429 || response.status === 418) {
         const retry = Number(response.headers.get("retry-after"));
-        await response.body?.cancel();
+        await response.body?.cancel().catch(() => {});
         throw new AppError("BINANCE_RATE_LIMITED", "币安限制请求，请等待后重试。", 503, Number.isFinite(retry) && retry > 0 ? Math.min(Math.ceil(retry), 600) : 60);
       }
       if (!response.ok) {
-        await response.body?.cancel();
+        await response.body?.cancel().catch(() => {});
         throw new AppError("BINANCE_UNAVAILABLE", "币安行情请求失败，请检查新加坡函数公网连接及接口可用性。", 502);
       }
       return await boundedJson(response, (path === "/fapi/v1/exchangeInfo" ? 4 : 0.5) * 1024 * 1024, "INVALID_MARKET_DATA");
     } catch (error) {
-      if (error instanceof AppError) throw error;
-      throw new AppError("BINANCE_TIMEOUT", "币安行情请求超时或连接中断。", 504);
+      if (error instanceof AppError) {
+        error.marketEndpoint = path;
+        error.marketHttpStatus = marketHttpStatus;
+        throw error;
+      }
+      throw new AppError("BINANCE_TIMEOUT", "币安行情请求超时或连接中断。", 504, undefined, undefined, {
+        cause: error, marketEndpoint: path, marketHttpStatus,
+      });
     }
   }
   async serverTime(signal: AbortSignal): Promise<number> {
