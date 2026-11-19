@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import type { OrderConfig } from "./order-auth.js";
+import type { loadOssConfig } from "./oss-config.js";
 import { AppError } from "./errors.js";
 import { boundedJson, boundedJsonLines } from "./http.js";
 
@@ -11,7 +11,7 @@ export interface OrderStore {
   removeLock(path: string): Promise<void>;
 }
 
-type OssConfig = Pick<OrderConfig, "region" | "bucket" | "ossHost" | "prefix" | "ossKey" | "ossSecret">;
+type OssConfig = ReturnType<typeof loadOssConfig> & { prefix: string };
 
 export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore & {
   appendJsonLine(path: string, value: unknown): Promise<void>;

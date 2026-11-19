@@ -1,16 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { makeAuthorizer } from "../build/auth.js";
+import { gatewayClaims } from "../build/auth.js";
 import { loadConfig } from "../build/config.js";
 import { env, jwt, NOW } from "./fixtures.mjs";
 
 test("FC-only authorizer accepts the existing shared sync ticket without JWT environment settings", () => {
-  const auth = makeAuthorizer();
-  assert.equal(auth(jwt(), NOW / 1000), "owner");
-  // FC owns issuer/audience/scope policy. No per-function override is applied.
-  assert.equal(auth(jwt({ aud: "shared-domain", scope: "trading:sync" }), NOW / 1000), "owner");
+  assert.equal(gatewayClaims(jwt(), NOW / 1000).sub, "owner");
+  assert.equal(gatewayClaims(jwt({ aud: "shared-domain", scope: "trading:sync" }), NOW / 1000).sub, "owner");
   for (const value of [undefined, "Basic abc", "Bearer malformed", jwt() + ", extra", jwt({ sub: "" }), jwt({ exp: NOW / 1000 })]) {
-    assert.throws(() => auth(value, NOW / 1000), { code: "UNAUTHORIZED" });
+    assert.throws(() => gatewayClaims(value, NOW / 1000), { code: "UNAUTHORIZED" });
   }
 });
 

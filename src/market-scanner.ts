@@ -3,6 +3,7 @@ import type { Env } from "./config.js";
 import { limited } from "./http.js";
 import { frame, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { makeOrderStore } from "./order-oss.js";
+import { loadOssConfig } from "./oss-config.js";
 import { effectiveKind } from "./price-zones.js";
 import { SOURCE_COMMIT } from "./version.js";
 import type { Candle, Frame, PriceZone } from "./types.js";
@@ -92,20 +93,6 @@ export function scanRules(short: Frame, hourly: Frame, background: Frame): Rule[
 }
 
 const scanError = (code: string, message: string, status = 400) => new AppError(code, message, status);
-function storageConfig(env: Env) {
-  const value = (name: string, raw: string | undefined, pattern: RegExp) => {
-    const field = raw?.trim() || "";
-    if (!pattern.test(field)) throw scanError("SCAN_STORAGE_CONFIGURATION", `请检查扫描存储配置 ${name}。`, 503);
-    return field;
-  };
-  const bucket = value("SIGNAL_SCANNER_OSS_BUCKET", env.SIGNAL_SCANNER_OSS_BUCKET ?? env.SIGNAL_ORDER_OSS_BUCKET, /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/);
-  const region = value("SIGNAL_SCANNER_OSS_REGION", env.SIGNAL_SCANNER_OSS_REGION ?? env.SIGNAL_ORDER_OSS_REGION, /^[a-z]{2}(?:-[a-z0-9]+)+$/);
-  const network = value("SIGNAL_SCANNER_OSS_NETWORK", env.SIGNAL_SCANNER_OSS_NETWORK ?? env.SIGNAL_ORDER_OSS_NETWORK ?? "public", /^(public|internal)$/);
-  return { bucket, region, ossHost: `${bucket}.oss-${region}${network === "internal" ? "-internal" : ""}.aliyuncs.com`,
-    prefix: "private/market-signal-scanner/v1",
-    ossKey: value("ACCESS_KEY_ID", env.ACCESS_KEY_ID, /^[A-Za-z0-9_-]{8,128}$/),
-    ossSecret: value("ACCESS_KEY_SECRET", env.ACCESS_KEY_SECRET, /^[A-Za-z0-9_+/=-]{16,200}$/) };
-}
 const hourFor = (time: number) => Math.floor(time / hour) * hour;
 const slotFor = (time: number) => Math.floor(time / interval) * interval;
 const legacyKey = (slot: number) => `${symbol}/${slot}.json`;
@@ -123,7 +110,7 @@ const asObject = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
 export function makeMarketScanner(env: Env, now: () => number, request: typeof fetch = fetch) {
-  const store = makeOrderStore(storageConfig(env), now, request, "SCAN");
+  const store = makeOrderStore({ ...loadOssConfig(env, "SCAN"), prefix: "private/market-signal-scanner/v1" }, now, request, "SCAN");
   async function listLegacy(input: Record<string, unknown>) {
     const latest = slotFor(now());
     const oldest = latest - historyDays * 24 * hour;

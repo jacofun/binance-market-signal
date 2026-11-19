@@ -115,7 +115,7 @@ const rowsAt = (app, time = NOW) => {
 };
 
 test("every invocation scans the latest available closed data and produces a separate row even for the same candle", async t => {
-  const app = await server(t);
+  const app = await server(t, { OSS_BUCKET: "scan-test", OSS_REGION: "cn-hangzhou", SIGNAL_ORDER_OSS_BUCKET: "other-legacy-bucket" });
   assert.equal((await app.post("/trade/api/signal/scans", { version: 2 })).status, 401);
   assert.equal(app.calls.length, 0);
   const scan = await app.invoke();
@@ -201,7 +201,11 @@ test("scan history includes legacy rows and paginates concurrent records with th
 
 test("missing scanner credentials leave existing model analysis independent", async t => {
   const app = await server(t, { ...env, SIGNAL_ORDER_OSS_BUCKET: "" });
-  assert.equal((await app.invoke()).data.error.code, "SCAN_STORAGE_CONFIGURATION");
+  const failure = await app.invoke();
+  assert.equal(failure.status, 503);
+  assert.equal(failure.data.error.code, "SCAN_STORAGE_CONFIGURATION");
+  assert.equal(JSON.parse(app.logs.at(-1)).configurationField, "SIGNAL_ORDER_OSS_BUCKET");
+  assert.ok(app.logs.every(line => !line.includes("test-oss-secret-key")));
   const analyzed = await app.post("/analyze", { symbol: "BTCUSDT" }, { "X-JWT-Token": jwt() });
   assert.equal(analyzed.status, 200);
   assert.equal(app.modelCalls(), 1);
