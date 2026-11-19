@@ -1,5 +1,7 @@
 import { AppError, type ModelFailureDetails, type ModelOutputDetails } from "./errors.js";
 import { boundedJson } from "./http.js";
+import { effectiveKind } from "./price-zones.js";
+import { hourlyAtr, inside, researchContext, significantObstacle, structureZones, targetObstacles, zoneUsable } from "./research.js";
 import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelResult, Proposal, Snapshot, Style } from "./types.js";
@@ -8,14 +10,24 @@ const text = { type: "string", minLength: 1, maxLength: 600 };
 const list = { type: "array", items: text, maxItems: 8 };
 export const proposalSchema = {
   type: "object", additionalProperties: false,
-  required: ["status", "direction", "title", "summary", "entry", "stopLoss", "targets", "triggerConditions", "invalidationConditions", "evidence", "counterarguments", "validForSeconds"],
+  required: ["status", "direction", "title", "summary", "entry", "stopLoss", "targets", "triggerConditions", "invalidationConditions", "evidence", "counterarguments", "validForSeconds", "research"],
   properties: {
     status: { type: "string", enum: ["candidate", "watch", "none"] }, direction: { type: ["string", "null"], enum: ["long", "short", null] },
     title: text, summary: text,
     entry: { anyOf: [{ type: "null" }, { type: "object", additionalProperties: false, required: ["min", "max"], properties: { min: { type: "number", exclusiveMinimum: 0 }, max: { type: "number", exclusiveMinimum: 0 } } }] },
-    stopLoss: { type: ["number", "null"] }, targets: { type: "array", maxItems: 3, items: { type: "object", additionalProperties: false, required: ["price", "reason"], properties: { price: { type: "number", exclusiveMinimum: 0 }, reason: text } } },
+    stopLoss: { type: ["number", "null"] }, targets: { type: "array", maxItems: 3, items: { type: "object", additionalProperties: false, required: ["price", "reason", "zoneId"], properties: { price: { type: "number", exclusiveMinimum: 0 }, reason: text, zoneId: text } } },
     triggerConditions: list, invalidationConditions: list,
     evidence: { type: "array", maxItems: 8, items: { type: "object", additionalProperties: false, required: ["metric", "reason"], properties: { metric: text, reason: text } } },
+    research: { type: "object", additionalProperties: false,
+      required: ["marketRegime", "scenario", "timeframeAnalysis", "entryZoneId", "stopZoneId", "riskFactors", "researchHorizon"],
+      properties: {
+        marketRegime: { type: "string", enum: ["trend", "range", "transition"] },
+        scenario: { type: "string", enum: ["continuation", "reversal", "none"] },
+        timeframeAnalysis: { type: "object", additionalProperties: false, required: ["4h", "1h", "15m"], properties: { "4h": text, "1h": text, "15m": text } },
+        entryZoneId: { type: ["string", "null"] }, stopZoneId: { type: ["string", "null"] },
+        riskFactors: list, researchHorizon: { type: "integer", enum: [4, 12, 24] },
+      },
+    },
     counterarguments: list, validForSeconds: { type: "integer", minimum: 30, maximum: 300 },
   },
 };
@@ -30,7 +42,9 @@ const volumePriceMetrics = (snapshot: Snapshot) => snapshot.frames
 
 function allowedMetrics(snapshot: Snapshot): string[] {
   return ["quote.price", "quote.indexPrice", "quote.fundingRate", ...(snapshot.openInterest.length ? ["openInterest"] : []),
-    ...snapshot.frames.flatMap(f => ["close", "ema20", "ema50", "atr14", "volumeRatio20", "high20", "low20", "recentCandles", "priceLevels"].map(k => `${f.interval}.${k}`)),
+    ...(researchContext(snapshot).openInterestChanges.length ? ["openInterestChanges"] : []), "trendAlignment",
+    ...structureZones(snapshot).map(z => z.id),
+    ...snapshot.frames.flatMap(f => ["close", "ema20", "ema50", "atr14", "volumeRatio20", "high20", "low20", "recentCandles", "priceLevels", "atrPct", "trend", "volumeWindows", "historicalRanges"].map(k => `${f.interval}.${k}`)),
     ...volumePriceMetrics(snapshot)];
 }
 function schemaForSnapshot(snapshot: Snapshot) {
@@ -90,18 +104,36 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
   if (!Array.isArray(r.targets) || r.targets.length > 3) invalid("schema", "targets");
   if (!Array.isArray(r.evidence) || r.evidence.length > 8) invalid("schema", "evidence");
   const metrics = new Set(allowedMetrics(snapshot));
+  const research = object(r.research, proposalSchema.properties.research.required, "research");
+  const timeframes = object(research.timeframeAnalysis, ["4h", "1h", "15m"], "research.timeframeAnalysis");
+  if (!["trend", "range", "transition"].includes(research.marketRegime as string) ||
+      !["continuation", "reversal", "none"].includes(research.scenario as string) ||
+      ![4, 12, 24].includes(research.researchHorizon as number)) invalid("schema", "research");
   const p: Proposal = {
     status: r.status as Proposal["status"], direction: r.direction as Proposal["direction"], title: string(r.title, "title"), summary: string(r.summary, "summary"),
     entry: r.entry === null ? null : (() => { const e = object(r.entry, ["min", "max"], "entry"); return { min: price(e.min, "entry.min"), max: price(e.max, "entry.max") }; })(),
     stopLoss: r.stopLoss === null ? null : price(r.stopLoss, "stopLoss"),
-    targets: r.targets.map((t, i) => { const f = `targets[${i}]`; const v = object(t, ["price", "reason"], f); return { price: price(v.price, `${f}.price`), reason: string(v.reason, `${f}.reason`) }; }),
+    targets: r.targets.map((t, i) => { const f = `targets[${i}]`; const v = object(t, ["price", "reason", "zoneId"], f); return { price: price(v.price, `${f}.price`), reason: string(v.reason, `${f}.reason`), zoneId: string(v.zoneId, `${f}.zoneId`) }; }),
     triggerConditions: strings(r.triggerConditions, "triggerConditions"), invalidationConditions: strings(r.invalidationConditions, "invalidationConditions"), counterarguments: strings(r.counterarguments, "counterarguments"),
     evidence: r.evidence.map((e, i) => { const f = `evidence[${i}]`; const v = object(e, ["metric", "reason"], f); const metric = string(v.metric, `${f}.metric`); if (!metrics.has(metric)) invalid("unsupported_metric", `${f}.metric`); return { metric, reason: string(v.reason, `${f}.reason`) }; }),
     validForSeconds: Number(r.validForSeconds),
+    research: {
+      marketRegime: research.marketRegime as Proposal["research"]["marketRegime"],
+      scenario: research.scenario as Proposal["research"]["scenario"],
+      researchHorizon: research.researchHorizon as Proposal["research"]["researchHorizon"],
+      timeframeAnalysis: { "4h": string(timeframes["4h"], "research.timeframeAnalysis.4h"),
+        "1h": string(timeframes["1h"], "research.timeframeAnalysis.1h"), "15m": string(timeframes["15m"], "research.timeframeAnalysis.15m") },
+      entryZoneId: research.entryZoneId === null ? null : string(research.entryZoneId, "research.entryZoneId"),
+      stopZoneId: research.stopZoneId === null ? null : string(research.stopZoneId, "research.stopZoneId"),
+      riskFactors: strings(research.riskFactors, "research.riskFactors"),
+    },
   };
-  if (p.status === "none") {
-    if (p.direction !== null || p.entry !== null || p.stopLoss !== null || p.targets.length) invalid("schema", "none");
+  const noPlan = p.direction === null || p.status === "none";
+  if (noPlan) {
+    if (p.status === "candidate" || p.direction !== null || p.entry !== null || p.stopLoss !== null || p.targets.length ||
+        p.research.entryZoneId !== null || p.research.stopZoneId !== null || p.research.scenario !== "none") invalid("schema", "noPlan");
   } else {
+    if (p.research.scenario === "none") invalid("schema", "research.scenario");
     for (const field of ["direction", "entry", "stopLoss", "targets", "triggerConditions", "invalidationConditions", "evidence", "counterarguments"] as const) {
       const value = p[field];
       if (value === null || Array.isArray(value) && !value.length) invalid("schema", field);
@@ -113,14 +145,31 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
     // Reject hallucinated scales and remote, ungrounded price regimes.
     const q = snapshot.quote.price;
     if ([p.entry.min, p.entry.max, p.stopLoss, ...p.targets.map(t => t.price)].some(v => v < q * 0.5 || v > q * 1.5)) invalid("price_scale", "entry/stopLoss/targets");
-    const levels = new Set(snapshot.frames.flatMap(f => p.direction === "long"
-      ? [f.high20, f.priceLevels.high200, ...f.priceLevels.swingHighs]
-      : [f.low20, f.priceLevels.low200, ...f.priceLevels.swingLows]));
-    const direction = p.direction === "long" ? 1 : -1;
+    const prices = [p.entry.min, p.entry.max, p.stopLoss, ...p.targets.map(t => t.price)];
+    if (prices.some(v => {
+      const ticks = v / snapshot.tickSize;
+      return !Number.isFinite(ticks) || ticks > Number.MAX_SAFE_INTEGER / 8 ||
+        Math.abs(Math.round(ticks) - ticks) > Math.min(0.0001, 8 * Number.EPSILON * ticks);
+    })) invalid("price_precision", "entry/stopLoss/targets");
+
+    const zones = structureZones(snapshot);
+    const entryZone = zones.find(z => z.id === p.research.entryZoneId);
+    const stopZone = zones.find(z => z.id === p.research.stopZoneId);
+    const long = p.direction === "long";
+    const direction = long ? 1 : -1;
+    if (!entryZone || !zoneUsable(entryZone) || !inside(p.entry.min, entryZone) || !inside(p.entry.max, entryZone)) invalid("unsupported_zone", "research.entryZoneId");
+    if (!stopZone || !zoneUsable(stopZone) || effectiveKind(stopZone) !== (long ? "support" : "resistance")) invalid("unsupported_zone", "research.stopZoneId");
+    const stopDistance = long ? stopZone.lower - p.stopLoss : p.stopLoss - stopZone.upper;
+    if (stopDistance <= 0 || stopDistance > hourlyAtr(snapshot)) invalid("unsupported_zone", "stopLoss");
     for (const [i, target] of p.targets.entries()) {
       const previous = p.targets[i - 1];
       if (previous && (target.price - previous.price) * direction <= 0) invalid("price_relationship", `targets[${i}].price`);
-      if (!levels.has(target.price)) invalid("unsupported_target", `targets[${i}].price`);
+      const zone = zones.find(z => z.id === target.zoneId);
+      if (!zone || !zoneUsable(zone) || effectiveKind(zone) !== (long ? "resistance" : "support") || !inside(target.price, zone)) {
+        invalid("unsupported_target", `targets[${i}].price`);
+      }
+      if (targetObstacles(zones, p, target.price, zone.id).some(obstacle => significantObstacle(obstacle) &&
+        !p.targets.slice(0, i).some(earlier => inside(earlier.price, obstacle)))) invalid("target_obstacle", `targets[${i}].price`);
     }
     const volumeMetrics = volumePriceMetrics(snapshot);
     if (!p.evidence.some(e => volumeMetrics.includes(e.metric))) invalid("missing_volume_price_evidence", "evidence");
@@ -130,29 +179,24 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
 
 export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal, request: typeof fetch = fetch): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
+  const context = researchContext(snapshot);
   const marketInput = {
     ...snapshot,
+    trendAlignment: context.alignment,
+    openInterestChanges: context.openInterestChanges,
     candleColumns: ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"],
     frames: snapshot.frames.map(({ recentCandles, ...summary }) => ({
       ...summary,
       recentCandles: recentCandles.map(candleRow),
     })),
   };
-  const system = `你是合约行情研究助手。只分析所提供的币安 USDT 永续行情，不使用外部新闻、账户信息或臆造指标。输出严格 JSON，不使用 Markdown。
-这是候选研究机会，不执行交易。允许暂无机会。candidate 仅表示候选价位，不表示自然语言触发条件已经满足；需要未来确认时用 watch。
-按4小时判断趋势和区间，按1小时判断上涨、下跌或回撤结构及关键价位，按15分钟判断触发前的量价表现。按 style 分析；不得把所有行情强行解释成信号。不报告未经校准的胜率或确定性收益。
-recentCandles 按时间从旧到新，每列含义见 candleColumns。K线来自合约成交数据，quote.price 是判断机会当前是否可用的标记价格。
-对比价格涨跌、成交量与此前20根均量的比值，并看主动买量占比及K线收盘位置。区分放量突破后守住、放量冲高后回落、缩量回踩和放量反向；如周期之间冲突，把反向证据写进 counterarguments。volumePrice 是最近5根收盘线的量价摘要，closeChangePct 是相对上一根收盘的百分比，takerBuyShare 是0到1的主动买入量占比。不要把OI或主动买量占比解释为净多头仓位。
-给出入场区间、止损、1至3个目标、触发条件、失效条件、反对理由。candidate/watch 必须至少用一条 <周期>.volumePrice 证据，引用该周期实际涨跌和相对成交量并解释两者关系。量价证据不足时返回 none。
-做多目标从 high20、priceLevels.high200、priceLevels.swingHighs 中按原价选取；做空目标从 low20、priceLevels.low200、priceLevels.swingLows 中按原价选取。结合1小时与15分钟 ATR、沿途支撑阻力和量价表现判断距离是否合理，优先考虑靠近的有效结构。每个目标注明周期、对应结构及为何该位置有依据。目标按交易方向从近到远排列。不得为了凑固定盈亏比跳过明显障碍、外推未提供的价位或硬凑目标；无合理目标时返回 none。
-none 时 direction/entry/stopLoss 为 null，targets 为空。其余状态须给出完整价位、证据和反对理由。
-evidence.metric 必须取自下方枚举；数据不存在时禁止引用。
-validForSeconds 必须为30至300之间的整数。所有价位必须为 JSON 数字，不能用字符串；entry.min <= entry.max。
-做多必须 stopLoss < entry.min <= entry.max < 每个目标价；做空必须 每个目标价 < entry.min <= entry.max < stopLoss。所有价位须在当前 quote.price 的0.5至1.5倍内，否则返回 none。
-candidate/watch 的 targets、triggerConditions、invalidationConditions、evidence、counterarguments 均至少1项。每条 evidence 只能引用1个枚举指标，不得用逗号、斜杠合并多个指标，也不加 snapshot/frames 前缀。
-输出精简：title不超过30字，summary不超过120字，其余说明每项不超过80字，各列表建议1至3项，不添加 Schema 之外的字段。
-缺少或矛盾的数据须明确说明，不得用零代替缺失。按此 JSON Schema 输出：${JSON.stringify(schema)}
-无机会时的完整结构示例：{"status":"none","direction":null,"title":"暂无机会","summary":"当前条件不足，等待确认","entry":null,"stopLoss":null,"targets":[],"triggerConditions":[],"invalidationConditions":[],"evidence":[],"counterarguments":["缺少明确触发条件"],"validForSeconds":120}`;
+  const system = `你是币安 USDT 永续合约行情研究助手。仅使用提供的数据，以 4h 背景、1h 结构、15m 量价组织研究。recentCandles 为依 candleColumns 排列的全部收盘成交 K 线；quote.price 是标记价格。按 style 研究趋势延续、反转或无机会，不强行给出方向，不报告胜率或收益预测。
+volumePrice 最近5根，量比以此前20根均量为分母，CLV 为-1到1收盘位置；volumeWindows 对比等长前一阶段。结合量比、影线、创新高低、趋势一致性、区域的 breakRvol20、closesBeyondBreak 和 lastRetestRvol20，判断放量突破是否守住、缩量回踩或反弹。OI 与主动买量仅描述观测数据。
+research 说明 marketRegime、scenario、三个周期各自结论、风险和 researchHorizon（4、12或24小时）。历史分位数来自不重叠的成交K线窗口，属于历史描述。validForSeconds 在30至300之间，用于短期复核，与研究窗口独立。
+candidate 是待确认触发的候选。watch 可以给出完整计划，也可以与 none 一样清空方向、入场、止损、目标和区域引用，scenario 用 none。证据冲突或缺少结构目标时使用 watch 或 none。
+有计划时，从 frames.zones 引用区域 ID。entry 的两个端点须落在 entryZoneId 区域内。止损须在 stopZoneId 不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标价格在各自 zoneId 的区域内，按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
+所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
+按此 JSON Schema 输出：${JSON.stringify(schema)}`;
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }

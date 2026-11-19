@@ -1,3 +1,5 @@
+import { atrSeries, emaSeries, frameTrend, historicalRanges, volumeBars, volumeWindows } from "./features.js";
+import { confirmedPivots, priceZones, selectZones } from "./price-zones.js";
 import { AppError } from "./errors.js";
 import { boundedJson, limited } from "./http.js";
 import type { Config } from "./config.js";
@@ -37,16 +39,9 @@ export function parseCandles(raw: unknown, interval: Interval, serverTime: numbe
 }
 
 function priceLevels(candles: Candle[]): Frame["priceLevels"] {
-  const swingHighs: number[] = [];
-  const swingLows: number[] = [];
-  // Require two closed bars on either side. For a flat top/bottom, keep its last bar.
-  for (let i = 2; i < candles.length - 2; i++) {
-    const c = candles[i]!;
-    const before = candles.slice(i - 2, i);
-    const after = candles.slice(i + 1, i + 3);
-    if (before.every(b => c.high >= b.high) && after.every(b => c.high > b.high)) swingHighs.push(c.high);
-    if (before.every(b => c.low <= b.low) && after.every(b => c.low < b.low)) swingLows.push(c.low);
-  }
+  const pivots = confirmedPivots(candles);
+  const swingHighs = pivots.filter(p => p.kind === "resistance").map(p => p.price);
+  const swingLows = pivots.filter(p => p.kind === "support").map(p => p.price);
   return {
     high200: Math.max(...candles.map(c => c.high)), low200: Math.min(...candles.map(c => c.low)),
     swingHighs: swingHighs.slice(-8), swingLows: swingLows.slice(-8),
@@ -56,32 +51,33 @@ function priceLevels(candles: Candle[]): Frame["priceLevels"] {
 export function frame(candles: Candle[], interval: Interval): Frame {
   if (candles.length < 60) throw badData();
   candles = candles.slice(-CANDLE_LIMIT);
-  const ema = (period: number) => {
-    let value = candles.slice(0, period).reduce((s, c) => s + c.close, 0) / period;
-    for (const c of candles.slice(period)) value += (c.close - value) * 2 / (period + 1);
-    return value;
-  };
-  const tr = candles.slice(1).map((c, i) => Math.max(c.high - c.low, Math.abs(c.high - candles[i]!.close), Math.abs(c.low - candles[i]!.close)));
-  let atr = tr.slice(0, 14).reduce((s, v) => s + v, 0) / 14;
-  for (const value of tr.slice(14)) atr = (atr * 13 + value) / 14;
+  const atr = atrSeries(candles);
+  const atr14 = atr.at(-1)!;
   const last = candles.at(-1)!;
   const previous20 = candles.slice(-21, -1);
-  const volumePrice = candles.slice(-5).map((c, i) => {
-    const index = candles.length - 5 + i;
-    const previous = candles[index - 1]!;
-    const volumeMean = candles.slice(index - 20, index).reduce((s, b) => s + b.volume, 0) / 20;
-    return { openTime: c.openTime, closeChangePct: (c.close / previous.close - 1) * 100,
-      volumeRatio20: volumeMean > 0 ? c.volume / volumeMean : null,
-      takerBuyShare: c.volume > 0 ? c.takerBuyVolume / c.volume : null };
-  });
-  return { interval, lastCloseTime: last.closeTime, close: last.close, ema20: ema(20), ema50: ema(50), atr14: atr,
-    volumeRatio20: volumePrice.at(-1)!.volumeRatio20,
+  const shortEma = emaSeries(candles, 20);
+  const longEma = emaSeries(candles, 50);
+  const features = volumeBars(candles, shortEma, longEma);
+  const volumePrice = features.slice(-5);
+  const ema20 = shortEma.at(-1)!;
+  const ema50 = longEma.at(-1)!;
+  const atrPct = atr14 / last.close * 100;
+  const baselineAtrPct = atr.slice(-21, -1)
+    .reduce<number>((sum, v, i) => sum + (v ?? 0) / previous20[i]!.close * 100, 0) / 20;
+  const volatilityRatio = baselineAtrPct > 0 ? atrPct / baselineAtrPct : null;
+  const volatility = volatilityRatio === null ? null : volatilityRatio >= 1.25 ? "high" : volatilityRatio <= 0.8 ? "low" : "normal";
+  const trend = frameTrend(last.close, ema20, ema50);
+  const zones = selectZones(priceZones(candles, interval, atr, features), last.close);
+  return { interval, lastCloseTime: last.closeTime, close: last.close, ema20, ema50, atr14, atrPct, volatility, trend,
+    volumeRatio20: volumePrice.at(-1)!.volumeRatio20, volumeWindows: volumeWindows(candles),
     high20: Math.max(...previous20.map(c => c.high)), low20: Math.min(...previous20.map(c => c.low)),
-    recentCandles: candles, volumePrice, priceLevels: priceLevels(candles) };
+    recentCandles: candles, volumePrice, priceLevels: priceLevels(candles), zones,
+    historicalRanges: historicalRanges(candles, INTERVAL_MS[interval]) };
 }
 
 export class RestMarketDataProvider implements MarketDataProvider {
   private offset = 0;
+  private instruments: { expires: number; ticks: Map<string, number> } | undefined;
   constructor(private config: Config, private request: typeof fetch = fetch, private now: () => number = Date.now) {}
   async get(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown> {
     const url = new URL(path, "https://fapi.binance.com");
@@ -98,7 +94,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
         await response.body?.cancel();
         throw new AppError("BINANCE_UNAVAILABLE", "币安行情请求失败，请检查新加坡函数公网连接及接口可用性。", 502);
       }
-      return await boundedJson(response, 512 * 1024, "INVALID_MARKET_DATA");
+      return await boundedJson(response, (path === "/fapi/v1/exchangeInfo" ? 4 : 0.5) * 1024 * 1024, "INVALID_MARKET_DATA");
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError("BINANCE_TIMEOUT", "币安行情请求超时或连接中断。", 504);
@@ -133,7 +129,23 @@ export class RestMarketDataProvider implements MarketDataProvider {
       return row;
     });
     if (rows.some((r, i) => i > 0 && r.time <= rows[i - 1]!.time) || at - rows.at(-1)!.time > 2 * INTERVAL_MS["1h"]) throw badData();
-    return rows;
+    return rows.filter(row => row.time <= at);
+  }
+  private async tickSize(symbol: string, signal: AbortSignal) {
+    if (!this.instruments || this.instruments.expires <= this.now()) {
+      const raw = await this.get("/fapi/v1/exchangeInfo", {}, signal) as { symbols?: { symbol: string; contractType: string; filters: { filterType: string; tickSize: string }[] }[] };
+      if (!Array.isArray(raw?.symbols)) throw badData();
+      const ticks = new Map<string, number>();
+      for (const instrument of raw.symbols) {
+        if (instrument?.contractType !== "PERPETUAL" || !this.config.symbols.includes(instrument.symbol)) continue;
+        const filter = instrument.filters?.find(f => f.filterType === "PRICE_FILTER");
+        ticks.set(instrument.symbol, numeric(filter?.tickSize, true));
+      }
+      this.instruments = { expires: this.now() + 3_600_000, ticks };
+    }
+    const tick = this.instruments.ticks.get(symbol);
+    if (!tick) throw badData();
+    return tick;
   }
   async snapshot(symbol: string, signal: AbortSignal): Promise<Snapshot> {
     const at = await this.serverTime(signal);
@@ -149,9 +161,10 @@ export class RestMarketDataProvider implements MarketDataProvider {
         return [];
       }
     });
+    tasks.push(() => this.tickSize(symbol, signal));
     const values = await limited(tasks);
     return { symbol, asOf: at, receivedAt: this.now(), quote: values[3] as Quote,
-      frames: values.slice(0, 3) as Frame[], openInterest: values[4] as Snapshot["openInterest"], warnings, source: "rest" };
+      frames: values.slice(0, 3) as Frame[], tickSize: values[5] as number, openInterest: values[4] as Snapshot["openInterest"], warnings, source: "rest" };
   }
   close() {}
 }

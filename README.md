@@ -2,7 +2,7 @@
 
 新加坡（`ap-southeast-1`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
 
-一次请求完成：币安公开行情 → 收盘K线/指标 → 百炼分析 → 最新标记价格再次核验 → 返回候选机会详情。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
+一次请求依次获取币安公开行情、计算收盘 K 线特征与价格区域、让百炼模型研究、用程序校验结构和复核标记价格，最后返回 V4 研究结果。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
 
 ## 接口
 
@@ -31,7 +31,7 @@ X-JWT-Token: Bearer <北京现有接口签发的交易JWT>
 - `none`：暂无机会，入场/止损/方向为空。
 - `expired`：分析耗时超限、价格明显偏移，或已越过止损/首个目标。`expiredReasons` 给出原因。
 
-机会包含多空、入场区间、止损、目标、程序重算的盈亏比、触发/失效条件、支持证据和反对理由。不报告未经校准的胜率，不自动下单。盈亏比按入场区间不利端估算，不含手续费、滑点、资金费，也不计算仓位或杠杆。候选目标取自合约成交K线的已知价位，机会状态通过最新**标记价格**复核。此版本是实时研究助手，没有经回测验证的收益承诺。
+机会包含多空、入场区间、止损、目标、程序重算的盈亏比、触发/失效条件、支持证据和反对理由。不报告未经校准的胜率，不自动下单。盈亏比按入场区间不利端估算，不含手续费、滑点、资金费，也不计算仓位或杠杆。候选目标引用由合约成交 K 线计算的结构区域，机会状态通过最新**标记价格**复核。此版本是实时研究助手，没有经回测验证的收益承诺。
 
 `market.chart` 由 `{ interval, candles }` 组成，提供本次分析送给模型的原始收盘 K 线。每行依次为 `[开盘时间戳（毫秒）, 开, 高, 低, 收, 成交量, 主动买量]`，按时间递增。`market.asOf` 是行情快照时间，`market.latestQuote` 是分析后的复核标记价格。
 
@@ -43,7 +43,7 @@ FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证
 {
   "DASHSCOPE_API_KEY": "填写百炼API Key",
   "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "DASHSCOPE_MODEL": "qwen-plus",
+  "DASHSCOPE_MODEL": "kimi-k3.1-pro",
   "SIGNAL_ALLOWED_SYMBOLS": "BTCUSDT",
   "PORT": "9000",
   "MARKET_DATA_MODE": "rest"
@@ -94,12 +94,22 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 | `unsupported_metric` | 引用了不在当前快照指标枚举中的名称，查看 `outputField` |
 | `missing_volume_price_evidence` | 候选或观察机会缺少量价摘要引用 |
 | `price_relationship` / `price_scale` | 止盈止损方向、区间或价格尺度不合规，结果继续拒绝 |
-| `unsupported_target` | 目标价格不在该方向的行情结构价位清单中 |
+| `unsupported_target` | 目标区不存在、方向不符，或目标价不在引用区域内 |
+| `unsupported_zone` | 入场区或失效区无有效依据，或止损超出结构边界允许的距离 |
+| `target_obstacle` | 目标跳过了靠近入场端的重要结构区域 |
+| `price_precision` | 入场、止损或目标价格未对齐合约 PRICE_FILTER 的 tickSize |
 | `finish_reason` / `response_envelope` / `content_too_large` | 结束状态异常、响应封装无效或响应超限 |
 
 按可用情况同时提供 `finishReason`、`outputChars`、`inputTokens`、`outputTokens` 和经过格式检查的 `upstreamRequestId`。`outputField` 由服务端固定字段路径生成，不包含模型返回的字段名或值。例如 `outputReason=unsupported_metric, outputField=evidence[0].metric` 可以定位首条证据的指标引用错误。
 
-`market-research-v3` 提示词按 4h 趋势、1h 结构和 15m 量价触发组织分析。程序为每个周期计算最近5根K线的收盘涨跌幅、相对前20根的量比和主动买量占比，候选和观察机会须引用其中至少一项周期摘要。模型从前20根的极值、输入窗口的极值和最近确认的摆动高低点中选择目标，结合 ATR 和沿途支撑阻力说明目标距离。服务端校验目标是否与当前行情中的备选价位匹配，并按多空方向核对目标次序。Kimi 使用 JSON Mode（`DASHSCOPE_RESPONSE_FORMAT=json_object`），返回内容仍需通过服务端业务校验。
+### V4 数据契约
+
+- `schemaVersion=4`、`model.promptVersion=market-research-v4`。保留 `opportunity`、`market.chart` 和当前 JWT 接口。先更新网站和私有鉴权函数对 V4 的解析及归档，再更新行情分析函数。
+- `market.frames` 保留各周期的趋势、ATR 百分比、波动状态、最近 5 根量价细节及 5/20/50 根阶段统计。RVOL20 以此前 20 根均量为分母，CLV 取值为 −1 到 1。量比达到 1.5 或降至 0.75 时分别标记放量和缩量。OI 按两个相邻整点与 1h 已收盘价格对齐，缺失值保留为空。
+- 每个摆动点等待后两根 K 线收盘确认。新摆动点与同类区域聚类时，中心跨度上限取初次和本次确认 ATR14 的较小值乘 0.5。区域在极值外扩初次确认 ATR 的 0.15，外扩上限为价格的 1%。区间 ID 由周期、原始支阻类型和第一个摆动点的开盘毫秒组成。聚类扩张后，以最后确认时点起跟踪最终边界的突破和回测，保留量比及触达反应。每周期保留每类离最新成交收盘价最近的 6 个区间。区域来自摆动结构，成交量证据为整根 K 线的观察量。
+- 模型从区间 ID 中选择入场、失效和目标依据。止损在失效区不利侧边界外，至边界至多 1 倍 1h ATR。目标按方向排序，较近的有效 4h 区域或触达至少两次的独立区域须优先设目标。全市场 `exchangeInfo` 按实例缓存 1 小时，读取 `PRICE_FILTER.tickSize` 并校验各价位。程序保留模型提交的价位或返回诊断。
+- `research` 包含市场状态、情景、三周期结论、价格区间、风险、目标评估和规则结果。目标距离、1h ATR 倍数和 R 以入场区间的不利端计算；历史波动分位数用快照前不重叠的 1h 成交 K 线窗口计算，并附样本数。4h / 12h / 24h 研究窗口独立于 30–300 秒的 `validForSeconds`。无计划的 `watch` 可与 `none` 一样留空方向和价格。
+
 
 ## HTTP触发器与CDN
 
