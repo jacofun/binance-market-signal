@@ -448,14 +448,45 @@ test("a failed remaining-limit cancellation keeps the lock and protects the obse
     ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
 });
 
-test("live mode does not expose a pending draft, even when a new client requests it", async t => {
-  const app = await start(t, { SIGNAL_ORDER_MODE: "live", BINANCE_BASE_URL: "https://fapi.binance.com", SIGNAL_ORDER_EXECUTE: "true" });
-  assert.equal((await app.recover()).http, 200);
-  const { data } = await app.analyze();
-  const { data: preview } = await app.request({ action: "preview", permit: data.orderPermit, includePending: true }, readToken());
-  assert.ok(entryDraft(preview));
-  assert.ok(preview.options.filter(option => option.kind !== "market").every(option => !option.draft));
-  assert.deepEqual(mutations(app), []);
+test("live research enables both pending entries and protects confirmed live fills", async t => {
+  for (const kind of ["limit", "conditional"]) {
+    const app = await start(t, { SIGNAL_ORDER_MODE: "live", BINANCE_BASE_URL: "https://fapi.binance.com", SIGNAL_ORDER_EXECUTE: "true" });
+    app.state.entryQty = "0";
+    app.state.entryStatus = "NEW";
+    assert.equal((await app.recover()).http, 200);
+    const { data } = await app.analyze();
+    const input = { action: "preview", permit: data.orderPermit };
+    const legacy = (await app.request(input, readToken())).data;
+    assert.ok(entryDraft(legacy));
+    assert.ok(legacy.options.filter(option => option.kind !== "market").every(option => !option.draft));
+    const { data: preview } = await app.request({ ...input, includePending: true }, readToken());
+    assert.equal(preview.mode, "live");
+    const selected = preview.options.find(option => option.kind === kind);
+    assert.ok(selected.draft);
+    assert.deepEqual(mutations(app), []);
+
+    const { data: submitted } = await app.submit(selected.draft);
+    assert.equal(submitted.kind, kind);
+    assert.equal(submitted.protection.state, "pending");
+    assert.equal(mutations(app).length, 1);
+    const entry = app.state.orders.get(submitted.clientId);
+    if (kind === "conditional") {
+      entry.algoStatus = "FINISHED";
+      entry.actualOrderId = "99";
+      app.state.orders.set("child", { symbol: "BTCUSDT", orderId: 99, positionSide: "LONG", side: "BUY",
+        status: "FILLED", executedQty: "0.001", avgPrice: selected.price });
+    } else {
+      entry.status = "FILLED";
+      entry.executedQty = "0.001";
+    }
+    app.state.positions = [{ symbol: "BTCUSDT", positionSide: "LONG", positionAmt: "0.001" }];
+    app.state.clock = NOW + 60000;
+    assert.equal((await app.recover()).data.protection.state, "active");
+    assert.deepEqual(mutations(app).map(call => call.params.get("type")),
+      [kind === "limit" ? "LIMIT" : "STOP", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+    assert.ok(mutations(app).every(call => call.host === "fapi.binance.com"));
+    assert.equal((await app.query(submitted.analysisId)).data.protection.state, "active");
+  }
 });
 
 async function executionFixture(t) {

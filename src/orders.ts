@@ -4,7 +4,7 @@ import { ORDER_ID, ORDER_REFERENCE, digest, loadOrderReference, orderSubject, st
 import { assertQuote, demoOrderPrices, orderOption, type OrderKind } from "./order-rules.js";
 import type { ExchangeOrder, OrderExchange } from "./order-binance.js";
 import type { OrderStore } from "./order-oss.js";
-import { isProtectedIntent, makeProtectedExecution, pendingEntryMs, supportsEntry, supportsExits, type ProtectedDraft } from "./order-execution.js";
+import { isProtectedIntent, makeProtectedExecution, pendingEntryMs, supportsExits, type ProtectedDraft } from "./order-execution.js";
 
 interface Reservation { kind: OrderKind; clientId: string }
 interface Outcome extends ExchangeOrder { checkedAt: number; reason?: string }
@@ -49,7 +49,7 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
     for (const kind of kinds) {
       const option = orderOption(kind, plan, quote, rules, config);
       if (typeof option === "string") unavailable[kind] = option;
-      else if ((kind === "market" || includePending) && supportsEntry(config, kind) &&
+      else if ((kind === "market" || includePending) &&
         (executionAvailable ??= supportsExits(rules) && await execution.ready())) {
         const draft = await storeOrderReference(store, config, "submission", { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft);
         options.push({ ...option, draft, ...(kind === "market" ? {} : { entryWaitingSeconds: pendingEntryMs / 1000 }) });

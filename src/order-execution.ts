@@ -1,7 +1,7 @@
 import { AppError, exceptionChain } from "./errors.js";
 import { digest, object, ORDER_ID, type OrderConfig, type OrderPlan } from "./order-auth.js";
 import type { ExchangeOrder, OrderExchange, PositionSide, ProtectionLeg } from "./order-binance.js";
-import { assertQuote, DECIMAL, orderOption, type OrderKind, type OrderOption, type TradingRules } from "./order-rules.js";
+import { assertQuote, DECIMAL, orderOption, type OrderOption, type TradingRules } from "./order-rules.js";
 import type { OrderStore } from "./order-oss.js";
 
 const activePath = "locks/btcusdt.json";
@@ -27,7 +27,6 @@ const detailedError = (error: unknown) => ({
   error: exceptionChain(error), ...(error instanceof AppError ? error.upstream : {}),
 });
 export const supportsExits = (rules: TradingRules) => ["STOP_MARKET", "TAKE_PROFIT_MARKET"].every(kind => rules.kinds.includes(kind));
-export const supportsEntry = (config: OrderConfig, kind: OrderKind) => kind === "market" || config.mode === "demo";
 
 export function isProtectedIntent(value: unknown): value is Intent {
   return object(value) && (value.version === 2 && value.kind === "market" ||
@@ -167,7 +166,6 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
   return {
     ready,
     async submit(draft: ProtectedDraft) {
-      if (!supportsEntry(config, draft.option.kind)) throw new AppError("ORDER_PENDING_DEMO_ONLY", "限价和条件限价提交仅在测试网开放。", 409);
       if (!await ready()) throw new AppError("ORDER_RECOVERY_NOT_READY", "订单保护恢复任务未就绪，暂时禁止开仓。", 503);
       const { plan, quantity } = draft;
       if (quantity !== config.quantity || draft.expiresAt <= now()) {
@@ -219,7 +217,9 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       // The recovery task can query a filled order using its persisted client ID.
       // Give the stop request priority over persisting any post-trade receipt.
       if (entry.state === "rejected") await rememberEntry(intent, entry);
-      const until = intent.version === 3 ? issuedAt + 35000 : intent.openingUntil + retryMs;
+      // The timer may take over after this deadline. Keep both submit paths
+      // in the same window when reconciling fills and placing protection.
+      const until = intent.openingUntil + retryMs;
       entry = await reconcileEntry(intent, entry, until);
       const outcome = await settle(intent, entry, true, until);
       if (entry.state !== "rejected") await rememberEntry(intent, entry);
