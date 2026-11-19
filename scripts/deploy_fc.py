@@ -136,10 +136,11 @@ def _jwt_policy(auth_type, auth_config):
                 raise ValueError()
         else:
             lookup = _object(lookup)
-            if (lookup.get("readposition", "").lower() != "header" or lookup.get("parametername", "").lower() != "x-jwt-token"
+            if (set(lookup) != {"readposition", "parametername", "prefix"}
+                    or lookup.get("readposition", "").lower() != "header" or lookup.get("parametername", "").lower() != "x-jwt-token"
                     or lookup.get("prefix", "").strip() != "Bearer"):
                 raise ValueError()
-        # All analysis aliases must be protected; only exact health exceptions are safe.
+        # All business aliases must be protected; only exact health exceptions are safe.
         if policy.get("blacklist"):
             raise ValueError()
         whitelist = policy.get("whitelist") or []
@@ -158,7 +159,7 @@ def _jwt_policy(auth_type, auth_config):
             fields = sorted(_object(auth_config))
         except (ValueError, TypeError, AttributeError):
             fields = []
-        raise DeployError("FC ingress must enforce RS256 JWT from X-JWT-Token for all analysis paths; policy fields: " + ", ".join(fields)) from None
+        raise DeployError("FC ingress must enforce RS256 JWT from X-JWT-Token for all business paths; policy fields: " + ", ".join(fields)) from None
 
 
 def audit_native_jwt(client, target):
@@ -172,12 +173,16 @@ def audit_native_jwt(client, target):
                 continue
             trigger = client.get_trigger(target["functionName"], trigger.trigger_name).body
             config = _object(trigger.trigger_config)
-            if config.get("disableurlinternet") is True:
-                continue
-            # The default function URL may be RAM-signature protected while the
-            # CDN origin custom domain uses JWT. This is not an anonymous bypass.
             if config.get("authtype") == "function":
-                policies.append({"type": "ram-trigger", "name": trigger.trigger_name, "policy": {"authType": "function"}})
+                # The Internet switch only disables the public default URL.
+                # A signed HTTP trigger must not accept business POSTs on any URL.
+                methods = config.get("methods")
+                if (not isinstance(methods, list) or not methods or
+                        any(not isinstance(method, str) or method.upper() not in ("GET", "HEAD", "OPTIONS") for method in methods)):
+                    raise DeployError("FC RAM-signed HTTP trigger must allow only GET, HEAD or OPTIONS, or use native JWT for POST. "
+                                      "Check trigger '" + trigger.trigger_name + "'. InvokeFunction events are separate.")
+                policies.append({"type": "ram-trigger", "name": trigger.trigger_name,
+                                 "policy": {"authType": "function", "methods": sorted(method.upper() for method in methods)}})
                 continue
             try:
                 policy = _jwt_policy(config.get("authtype"), config.get("authconfig"))

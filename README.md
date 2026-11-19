@@ -58,7 +58,7 @@ FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证
 
 签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。业务鉴权不要求 `x-fc-control-path`、`x-fc-function-name` 或 `x-fc-request-id`；这些运行时元数据不构成密码学证明，缺失或取值不同不会拦截分析请求。信任边界是 FC 原生 JWT 入口，部署前后继续审计入口鉴权。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
 
-CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的FC自定义域名，确认业务JWT入口使用RS256公钥、唯一的 `X-JWT-Token` 来源，且全部分析路径受到JWT保护。默认函数URL可保留RAM签名鉴权，它是受IAM权限约束的管理调用入口；不接受匿名入口。跨地域迁移时，允许先在仅有RAM签名保护的默认函数URL后部署代码；工作流会标记 `jwtIngressReady=false`。切换CDN流量前，再配置受JWT保护的自定义域名。匿名入口仍会阻止部署。不接受会绕过业务路径鉴权的白名单/黑名单策略，只允许精确的健康检查路径例外；配置无法确认时停止部署。读取的JWKS只在CI内存中检查，不写入环境变量、部署包或日志，工作流不会修改任何鉴权配置。
+CI 在写入前和部署后审计所有 HTTP 触发器以及指向该函数的 FC 自定义域名。分析、扫描列表和订单的 POST 请求须经 FC 原生 JWT 验签，唯一票据来源为 `X-JWT-Token`。默认函数 URL 如继续使用 RAM 签名，HTTP 触发器的方法只能包含 GET、HEAD 或 OPTIONS。如果该触发器当前允许 POST，请在 FC 控制台将其也配置为原生 JWT，或移除该触发器的 POST 方法并由 JWT 自定义域名接收业务流量。关闭默认公网 URL 也会检查方法配置。定时任务和 CI 的 `InvokeFunction` 健康检查经独立的 `/invoke` 事件入口调用。CI 只读鉴权配置，发现匿名入口、业务路径免鉴权或 RAM HTTP 触发器可接收 POST 时停止部署。精确的健康检查路径可作为例外。
 
 网站复用 `POST /api/private-auth/trading/binance/token`，沿用现有 `BINANCE_SYNC_*` 签名配置以及 `aud=binance-trade-sync, scope=trading:sync`，不需要新增签名接口或环境变量。交易日志页的“分析交易机会”获取短期凭证后直接请求 `/trade/api/signal/analyze`；北京不代理行情和模型调用。凭证仅驻留当前请求内存，不落浏览器存储。同一交易凭证授权这个域名内的同步与分析两项能力，签发接口继续限制 owner、登录态、Origin 和 CSRF。
 
@@ -123,7 +123,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 
 将 `/trade/api/signal/*` 回源本函数，`/trade/api/sync/*` 仍回源原同步函数。业务方法 POST，允许 OPTIONS 预检，使用 HTTPS 回源、禁止缓存、原样透传 `X-JWT-Token`/JSON请求体，不通过重定向切换接口。CDN/浏览器等待预算需覆盖函数的默认65秒分析预算；平台不支持该等待时间时需要调整预算或另行实现流式/异步协议。
 
-沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC 必须保持原生 JWT 启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。分析沿用同步凭证和原生域名鉴权。订单接口还会独立校验网站签发的订单 JWT。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
+沿用 `X-JWT-Token: Bearer <JWT>`。FC 在该请求头验签，票据提取前缀配置为 `Bearer `。函数读取同一个请求头的声明。订单另外验证签发方、受众、操作范围、时效、草稿绑定和归属。验签公钥只在 FC 原生 JWT 的 JWKS 中维护，环境变量 `SIGNAL_ORDER_JWT_PUBLIC_KEY` 和本地验签用的 `BINANCE_SYNC_KEY_ID` 可以从本函数移除。签发端继续使用已有签名配置。由网关处理无 JWT 的 OPTIONS 预检，CORS 仅允许 `https://yanxiao.me` 和 `https://www.yanxiao.me`。
 
 ## 小规格实例的实现
 
@@ -162,6 +162,14 @@ RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:Invo
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
 
+## 扫描和订单共用 OSS
+
+使用 `OSS_BUCKET`、`OSS_REGION`、`ACCESS_KEY_ID` 和 `ACCESS_KEY_SECRET`。地域填 Bucket 的地域 ID，比如 `cn-hangzhou`，Bucket 变量填桶名。`OSS_NETWORK` 可选，默认 `public`，使用 OSS 内网域名时填 `internal`。
+
+已有的 `SIGNAL_ORDER_OSS_BUCKET` / `SIGNAL_ORDER_OSS_REGION` 可以直接沿用，其次兼容旧的 `SIGNAL_SCANNER_OSS_BUCKET` / `SIGNAL_SCANNER_OSS_REGION`。新 `OSS_*` 配置优先。Bucket 和地域须来自同一组。订单与扫描各用原有的对象前缀。两者之前分桶时，默认沿用订单桶以保留订单记录和在途锁。原扫描记录仍留在旧桶，需要回查时可将扫描前缀的历史文件迁入共用桶并保持对象键名。不要在有在途或持仓订单时切换订单桶。
+
+遇到 `SCAN_STORAGE_CONFIGURATION` 时，在 `market_scan_request_failed` 日志查看 `configurationField`，按变量名检查值。日志不包含变量值。
+
 ## BTCUSDT 开仓、止盈和止损
 
 市场处于候选状态时，市价草稿展示入场参考价、止盈和止损。止盈使用研究的首个目标，止损使用研究失效价。程序复核价格步长、方向、入场范围、最新标记价格及计划价差风险。回踩限价和条件限价继续供预览。计划风险估算未计手续费、滑点和资金费。
@@ -179,7 +187,9 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 | `BINANCE_API_KEY`、`BINANCE_API_SECRET` | 对应环境的 Binance HMAC 密钥。预览和查单使用合约读取权限。执行需开通合约交易权限并限制来源 IP。 |
 | `SIGNAL_ORDER_QUANTITY` | BTC 数量，默认 `0.001`。交易所步长或最低名义额不满足时拦截，保留配置数量。 |
 | `SIGNAL_ORDER_MAX_RISK_USDT` | 入场参考价至止损价的计划价差风险上限，默认 `1`，单位 USDT。 |
-| `SIGNAL_ORDER_JWT_PUBLIC_KEY` | 北京私有鉴权函数配置 `BINANCE_ORDER_TICKETS_ENABLED=true`。它签发只读票据和绑定具体草稿的 30 秒提交票据。CDN 将 `/trade/api/signal/orders` 转发至信号函数，保留路径或改写为 `/orders`，透传 JWT 及请求体并关闭缓存与自动重试。行情分析不读取 OSS 或下单接口。
+| `SIGNAL_ORDER_SIGNING_SECRET` | 签封研究凭据与订单草稿的 64 位十六进制密钥，沿用现有值。 |
+
+北京私有鉴权函数配置 `BINANCE_ORDER_TICKETS_ENABLED=true` 才会签发订单预览和提交票据。CDN 透传 `X-JWT-Token` 与请求体，保留订单路径或统一改写成 `/orders`，关闭缓存与自动重试。
 
 启用执行前，在信号函数上配置 FC 定时触发器 `market-order-protection`，调度 `0 * * * * *`，触发消息值使用 `SIGNAL_ORDER_RECOVERY_SECRET` 的值。事件走 FC 的 `POST /invoke`，无需配置公开的恢复路由。等待日志 `order_protection_recovery` 出现后再打开执行开关。恢复心跳超过 90 秒时拒绝新开仓。关闭执行开关后定时任务仍继续处理现有仓位，保留密钥和触发器直到仓位结束。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
 
@@ -193,7 +203,7 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 - **假突破回收**要求盘中穿过边缘且重新收进区间，随后一根收盘向回收方向继续移动。确认后检查与区间边缘的距离和到反向区的空间。两类规则都用形态开始前已知的 1h 区域。找不到下一个反向区时记录为数据不足。
 - 通过、待确认、过滤、无触发及行情失败都会记录。每次执行分别记录扫描时间和 K 线收盘时间，通过 OSS AppendObject 追加到 `private/market-signal-scanner/v1/BTCUSDT/runs/<utcHourEpochMs>.ndjson`。同一根 K 线可对应多条记录。交易日志 v2 列表按扫描时间倒序，每页最多 16 条，在最多四小时的窗口内翻页，可回看最近 30 天。原按收盘时段保存的 JSON 记录继续可查，扫描时间显示为空。通过初筛只代表规则命中。
 
-扫描使用函数已有的 `ACCESS_KEY_ID`、`ACCESS_KEY_SECRET`。配置 `SIGNAL_SCANNER_OSS_BUCKET`、`SIGNAL_SCANNER_OSS_REGION` 和可选的 `SIGNAL_SCANNER_OSS_NETWORK`（`public` 或 `internal`），未设置时分别复用 `SIGNAL_ORDER_OSS_BUCKET`、`SIGNAL_ORDER_OSS_REGION`、`SIGNAL_ORDER_OSS_NETWORK`，网络最终缺省为 `public`。授予扫描前缀 `oss:GetObject` 和 `oss:PutObject`。记录使用 OSS 追加位置校验处理并发，需要 Bucket 的保留策略允许追加。读取和写入仍使用原有扫描前缀，无需列桶权限。
+授予共用 OSS 凭证扫描前缀的 `oss:GetObject` 和 `oss:PutObject`。记录使用 OSS 追加位置校验处理并发，Bucket 的保留策略须允许追加对象。扫描列表无需列桶权限。
 
 CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` 可以原路径转发或改写为 `/scans`，透传原有 JWT 到 FC。列表复用站点所有者的短期交易凭证。扫描日志可按 `market_scan_recorded` 和 `market_scan_request_failed` 检索。扫描不访问百炼、不会生成下单草稿。
 

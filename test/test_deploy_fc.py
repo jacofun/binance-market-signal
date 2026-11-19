@@ -153,9 +153,18 @@ class DeployTests(unittest.TestCase):
         self.assertTrue(module.audit_native_jwt(FakeClient(domain_policy=native_config()), self.target))
 
     def test_ram_signed_default_url_with_jwt_custom_domain_is_protected(self):
-        signed_trigger = {"authType": "function", "methods": ["POST"]}
+        signed_trigger = {"authType": "function", "methods": ["GET", "HEAD", "OPTIONS"]}
         self.assertTrue(module.audit_native_jwt(FakeClient(policy=signed_trigger, domain_policy=native_config()), self.target))
         self.assertTrue(module.audit_native_jwt(FakeClient(policy=signed_trigger), self.target))
+
+    def test_signed_http_post_and_unknown_methods_fail_before_writing_even_with_jwt_domain(self):
+        for methods in (None, ["get", "post"], ["ANY"], []):
+            for public_url_disabled in (False, True):
+                signed_trigger = {"authType": "function", "methods": methods, "disableURLInternet": public_url_disabled}
+                client = FakeClient(policy=signed_trigger, domain_policy=native_config())
+                with self.assertRaisesRegex(module.DeployError, "RAM-signed HTTP trigger.*only GET"):
+                    module.deploy(client, self.target, b"zip")
+                self.assertIsNone(client.request)
 
 
 def native_config():

@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import { AppError, exceptionChain, publicError } from "./errors.js";
-import { makeAuthorizer, TOKEN_HEADER } from "./auth.js";
+import { gatewayClaims, TOKEN_HEADER } from "./auth.js";
 import { loadConfig, type Config, type Env } from "./config.js";
 import { RestMarketDataProvider } from "./market.js";
 import { WebSocketMarketDataProvider } from "./websocket-market.js";
@@ -43,7 +43,6 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
   env?: Env; provider?: MarketDataProvider; model?: Model; now?: () => number;
   logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch; scannerFetch?: typeof fetch;
 } = {}) {
-  const authorize = makeAuthorizer();
   let config: Config | undefined;
   let orderConfig: OrderConfig | undefined;
   const ordersConfig = () => orderConfig ??= loadOrderConfig(env);
@@ -133,7 +132,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         send(200, { requestId, ...result });
         return;
       }
-      const sub = authorize(token, Math.floor(now() / 1000));
+      const { sub } = gatewayClaims(token, Math.floor(now() / 1000));
       const input = await body(req);
       if (scanAction === "list") {
         const result = await makeMarketScanner(env, now, scannerFetch).list(input);
@@ -167,7 +166,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         } catch (error) {
           logger.info(JSON.stringify({ event: "order_permit_unavailable", requestId,
             code: error instanceof AppError ? error.code : "INTERNAL_ERROR",
-            ...(error instanceof AppError && error.code === "ORDER_CONFIGURATION" ? { configuration: error.message } : {}),
+            configurationField: error instanceof AppError ? error.configurationField : undefined,
           }));
         }
       }
@@ -182,12 +181,14 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const original = error instanceof AppError ? error : undefined;
       if (scanAction) {
         logger.error(JSON.stringify({ event: "market_scan_request_failed", requestId, action: scanAction, code: safe.code,
-          httpStatus: safe.status, elapsedMs: now() - startedAt, ...original?.upstream, exception: exceptionChain(error) }));
+          httpStatus: safe.status, elapsedMs: now() - startedAt, configurationField: original?.configurationField,
+          ...original?.upstream, exception: exceptionChain(error) }));
         return;
       }
       if (isOrder) {
         logger.error(JSON.stringify({ event: "order_request_failed", requestId, action: orderAction, code: safe.code,
-          httpStatus: safe.status, elapsedMs: now() - startedAt, ...original?.upstream, exception: exceptionChain(error) }));
+          httpStatus: safe.status, elapsedMs: now() - startedAt, configurationField: original?.configurationField,
+          ...original?.upstream, exception: exceptionChain(error) }));
         return;
       }
       logger.error(JSON.stringify({ event: "analysis_failed", requestId, ...trace,

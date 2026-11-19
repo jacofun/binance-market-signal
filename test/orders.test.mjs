@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, verify } from "node:crypto";
 import { once } from "node:events";
+import { loadOrderConfig } from "../build/order-auth.js";
+import { loadOssConfig } from "../build/oss-config.js";
 import { orderOption } from "../build/order-rules.js";
 import { makeServer } from "../build/server.js";
 import { env, jwt, NOW, provider, modelResult, publicKey } from "./fixtures.mjs";
@@ -11,8 +13,7 @@ const settings = {
   ...env, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: "https://demo-fapi.binance.com",
   BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret",
   ACCESS_KEY_ID: "test-oss-key", ACCESS_KEY_SECRET: "test-oss-secret-123",
-  SIGNAL_ORDER_OSS_BUCKET: "orders-bucket", SIGNAL_ORDER_OSS_REGION: "cn-hangzhou",
-  SIGNAL_ORDER_JWT_PUBLIC_KEY: publicKey.export({ type: "spki", format: "pem" }),
+  OSS_BUCKET: "orders-bucket", OSS_REGION: "cn-hangzhou",
   SIGNAL_ORDER_SIGNING_SECRET: "b".repeat(64), SIGNAL_ORDER_RECOVERY_SECRET: recoverySecret,
 };
 const digest = text => createHash("sha256").update(text).digest("hex");
@@ -20,6 +21,10 @@ const readToken = (sub = "owner", at = NOW) => jwt({ scope: "trading:orders:read
   iat: Math.floor(at / 1000), exp: Math.floor(at / 1000) + 120 });
 const submitToken = (draft, at = NOW) => jwt({ scope: "trading:orders:submit-protected",
   iat: Math.floor(at / 1000), exp: Math.floor(at / 1000) + 30, intent: digest(draft) });
+function verifiedByMockFc(token) {
+  const [header, claims, signature] = (token || "").replace(/^Bearer /, "").split(".");
+  return Boolean(signature && verify("RSA-SHA256", Buffer.from(`${header}.${claims}`), publicKey, Buffer.from(signature, "base64url")));
+}
 const grid = { minQty: "0.001", maxQty: "20", stepSize: "0.001" };
 function symbolRules(notional = "5", tickSize = "0.1") {
   return { symbols: [{
@@ -123,6 +128,7 @@ async function start(t, override = {}) {
   await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
   const request = async (data, token, path = "/trade/api/signal/orders", extraHeaders = {}) => {
+    if (path !== "/invoke" && !verifiedByMockFc(token)) return { http: 401, data: { error: { code: "FC_JWT_REJECTED" } } };
     const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`, { method: "POST",
       headers: { "content-type": "application/json", ...(token ? { "X-JWT-Token": token } : {}), ...extraHeaders }, body: JSON.stringify(data) });
     return { http: response.status, data: await response.json() };
@@ -143,12 +149,11 @@ async function start(t, override = {}) {
 }
 
 
-test("analysis succeeds with feature disabled, incomplete configuration or an unverifiable order identity", async t => {
+test("analysis succeeds with orders disabled, incomplete configuration or a non-order research scope", async t => {
   for (const [settings, token] of [
     [{ SIGNAL_ORDER_MODE: "off" }, jwt()],
-    [{ SIGNAL_ORDER_OSS_BUCKET: "" }, jwt()],
+    [{ OSS_BUCKET: "" }, jwt()],
     [{}, jwt({ scope: "forged" })],
-    [{}, jwt().replace(/\.[^.]+$/, ".forged")],
   ]) {
     const app = await start(t, settings);
     const result = await app.analyze(token);
@@ -157,6 +162,37 @@ test("analysis succeeds with feature disabled, incomplete configuration or an un
     assert.equal(result.data.status, "candidate");
     assert.deepEqual(app.calls, []);
   }
+});
+
+test("FC verifies signatures and order routes still require exact claims and scope", async t => {
+  const app = await start(t);
+  const action = { action: "status", analysisId: "db5b5377-aa3f-4ea2-8558-3797632181cd" };
+  const forged = readToken().replace(/\.[^.]+$/, ".forged");
+  assert.equal((await app.request(action, forged)).data.error.code, "FC_JWT_REJECTED");
+  for (const delta of [{ scope: "trading:sync" }, { scope: "trading:orders:read", iat: NOW / 1000 - 1 },
+    { scope: "trading:orders:read", iss: "https://another.example" }, { scope: "trading:orders:read", aud: "other" },
+    { scope: "trading:orders:read", exp: NOW / 1000 }]) {
+    assert.equal((await app.request(action, jwt(delta))).data.error.code, "ORDER_UNAUTHORIZED");
+  }
+  assert.equal((await app.request(action, readToken(), "/invoke", { "x-fc-request-id": "ram-test" })).http, 404);
+  assert.equal((await app.request(action, undefined, "/invoke", { "x-fc-request-id": "ram-test" })).http, 401);
+  assert.deepEqual(app.calls, []);
+});
+
+test("scanner and orders share one bucket and preserve existing order storage across an upgrade", () => {
+  const shared = { ...settings, OSS_BUCKET: "", OSS_REGION: "", SIGNAL_ORDER_OSS_BUCKET: "orders-bucket",
+    SIGNAL_ORDER_OSS_REGION: "cn-hangzhou", SIGNAL_SCANNER_OSS_BUCKET: "old-scans", SIGNAL_SCANNER_OSS_REGION: "cn-beijing" };
+  for (const values of [shared, { ...shared, OSS_BUCKET: "orders-bucket", OSS_REGION: "cn-hangzhou", OSS_NETWORK: "internal" }]) {
+    const order = loadOrderConfig(values);
+    const scanner = loadOssConfig(values, "SCAN");
+    assert.equal(order.bucket, "orders-bucket");
+    assert.equal(order.prefix, "private/market-signal-orders/v1/demo");
+    assert.equal(order.ossHost, scanner.ossHost);
+  }
+  const legacyScanner = { ...shared, SIGNAL_ORDER_OSS_BUCKET: "", SIGNAL_ORDER_OSS_REGION: "" };
+  assert.equal(loadOrderConfig(legacyScanner).bucket, "old-scans");
+  assert.throws(() => loadOssConfig({ ...shared, OSS_BUCKET: "private-value" }, "SCAN"),
+    { code: "SCAN_STORAGE_CONFIGURATION", configurationField: "OSS_REGION" });
 });
 
 test("candidate previews fix both protective levels and issue no executable draft", async t => {

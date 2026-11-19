@@ -45,12 +45,14 @@ export interface ValidationDetails {
 }
 
 interface ErrorOptionsForLogs extends ErrorOptions {
+  configurationField?: string;
   validation?: ValidationDetails;
   marketEndpoint?: string;
   marketHttpStatus?: number;
 }
 
 export class AppError extends Error {
+  configurationField?: string;
   validation?: ValidationDetails;
   marketEndpoint?: string;
   marketHttpStatus?: number;
@@ -59,6 +61,7 @@ export class AppError extends Error {
     public upstream?: ModelFailureDetails | ModelOutputDetails, options?: ErrorOptionsForLogs) {
     super(message, options);
     this.name = "AppError";
+    this.configurationField = options?.configurationField;
     this.validation = options?.validation;
     this.marketEndpoint = options?.marketEndpoint;
     this.marketHttpStatus = options?.marketHttpStatus;
@@ -84,7 +87,7 @@ export function exceptionChain(error: unknown) {
     // Native errors and JSON parser errors can embed upstream data in their text.
     const frames = (typeof error.stack === "string" ? error.stack : "").split("\n").slice(1, 20).flatMap(line => {
       if (!/^\s+at /.test(line)) return [];
-      const match = /\/build\/((?:analysis|auth|config|errors|features|http|market|market-scanner|model|order-auth|order-binance|order-execution|order-oss|order-rules|orders|price-zones|research|server|websocket-market)\.js:\d{1,7}:\d{1,5})\)?$/.exec(line);
+      const match = /\/build\/((?:analysis|auth|config|errors|features|http|market|market-scanner|model|order-auth|order-binance|order-execution|order-oss|order-rules|orders|oss-config|price-zones|research|server|websocket-market)\.js:\d{1,7}:\d{1,5})\)?$/.exec(line);
       return match ? [match[1]!] : [];
     }).slice(0, 4);
     chain.push({
