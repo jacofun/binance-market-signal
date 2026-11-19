@@ -78,7 +78,7 @@ export function frame(candles: Candle[], interval: Interval): Frame {
 export class RestMarketDataProvider implements MarketDataProvider {
   private offset = 0;
   private instruments: { expires: number; ticks: Map<string, number> } | undefined;
-  constructor(private config: Config, private request: typeof fetch = fetch, private now: () => number = Date.now) {}
+  constructor(private config: Pick<Config, "binanceTimeoutMs" | "maxPriceAgeMs" | "symbols">, private request: typeof fetch = fetch, private now: () => number = Date.now) {}
   async get(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown> {
     const url = new URL(path, "https://fapi.binance.com");
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);

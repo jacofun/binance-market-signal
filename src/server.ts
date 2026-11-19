@@ -13,11 +13,13 @@ import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
+import { makeMarketScanner, scanSlot, SCANNER_TRIGGER } from "./market-scanner.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
 const ANALYSIS_PATHS = new Set(["/", "/analyze", "/trade/api/signal", "/trade/api/signal/analyze"]);
 const ORDER_PATHS = new Set(["/orders", "/trade/api/signal/orders"]);
+const SCAN_PATHS = new Set(["/scans", "/trade/api/signal/scans"]);
 const HEALTH_PATHS = new Set(["/", "/health", "/trade/api/signal", "/trade/api/signal/health"]);
 async function body(req: IncomingMessage, ramProbe = false): Promise<Record<string, unknown>> {
   const type = req.headers["content-type"] || "";
@@ -37,9 +39,9 @@ async function body(req: IncomingMessage, ramProbe = false): Promise<Record<stri
   } catch (error) { throw new AppError("INVALID_REQUEST", "请求体必须为 JSON 对象。", 400, undefined, undefined, { cause: error }); }
 }
 function health() { return { status: "ok", service: "binance-market-signal", codeVersion: SOURCE_COMMIT, nodeMajor: Number(process.versions.node.split(".")[0]) }; }
-export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console, orderFetch = fetch }: {
+export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console, orderFetch = fetch, scannerFetch = fetch }: {
   env?: Env; provider?: MarketDataProvider; model?: Model; now?: () => number;
-  logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch;
+  logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch; scannerFetch?: typeof fetch;
 } = {}) {
   const authorize = makeAuthorizer();
   let config: Config | undefined;
@@ -59,6 +61,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
     let isOrder = false;
+    let scanAction: "list" | "run" | undefined;
     let orderAction: string | undefined;
     let acquired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -73,9 +76,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const url = new URL(req.url || "/", "http://localhost");
       const path = url.pathname.length > 1 ? url.pathname.replace(/\/$/, "") : url.pathname;
       isOrder = ORDER_PATHS.has(path);
+      if (SCAN_PATHS.has(path)) scanAction = "list";
       if (url.search) throw new AppError("INVALID_REQUEST", "接口不接受查询参数。", 400);
       if (HEALTH_PATHS.has(path) && (req.method === "GET" || req.method === "HEAD")) { send(200, req.method === "HEAD" ? null : health()); return; }
-      if (!isOrder && !ANALYSIS_PATHS.has(path) && path !== "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
+      if (!isOrder && !scanAction && !ANALYSIS_PATHS.has(path) && path !== "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
       if (req.method === "OPTIONS") {
         if (!origin || !ORIGINS.has(origin) || req.headers["access-control-request-method"] !== "POST" ||
           String(req.headers["access-control-request-headers"] || "").split(",").filter(Boolean).some(v => !ALLOWED_HEADERS.has(v.trim().toLowerCase()))) {
@@ -83,13 +87,24 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         }
         send(204, null, { "Access-Control-Allow-Methods": "POST", "Access-Control-Allow-Headers": `${TOKEN_HEADER}, Content-Type, Accept` }); return;
       }
-      if (req.method !== "POST") throw new AppError("METHOD_NOT_ALLOWED", isOrder ? "订单接口仅支持 POST。" : "分析接口仅支持 POST。", 405);
+      if (req.method !== "POST") throw new AppError("METHOD_NOT_ALLOWED", isOrder ? "订单接口仅支持 POST。" : scanAction ? "扫描记录接口仅支持 POST。" : "分析接口仅支持 POST。", 405);
       if (origin && !ORIGINS.has(origin)) throw new AppError("CORS_FORBIDDEN", "来源不受信任。", 403);
       // A harmless RAM-invoked boot probe. No model/market configuration is read.
       // The ordinary HTTP /health endpoint serves the same minimal information.
       if ((path === "/" || path === "/invoke") && req.headers["x-fc-request-id"] && !req.headers[TOKEN_HEADER.toLowerCase()]) {
         const input = await body(req, true);
         if (Object.keys(input).length === 1 && input.action === "health") { send(200, health()); return; }
+        // The timer is routed by FC's event invocation endpoint. Public HTTP
+        // ingress remains subject to the existing JWT policy audited by CI.
+        if (path === "/invoke" && !origin && input.triggerName === SCANNER_TRIGGER) {
+          scanAction = "run";
+          const slot = scanSlot(input, now());
+          const result = await makeMarketScanner(env, now, scannerFetch).run(slot);
+          const log = { event: "market_scan_recorded", requestId, ...result, elapsedMs: now() - startedAt };
+          if ("errorCode" in result) logger.error(JSON.stringify(log));
+          else logger.info(JSON.stringify(log));
+          send(200, { requestId, ...result }); return;
+        }
         if (path === "/invoke" && !origin && input.triggerName === "market-order-protection") {
           isOrder = true;
           orderAction = "recover";
@@ -120,6 +135,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       }
       const sub = authorize(token, Math.floor(now() / 1000));
       const input = await body(req);
+      if (scanAction === "list") {
+        const result = await makeMarketScanner(env, now, scannerFetch).list(input);
+        send(200, { requestId, ...result }); return;
+      }
       if (Object.keys(input).some(k => !["symbol", "style"].includes(k)) || typeof input.symbol !== "string" ||
         (input.style !== undefined && !["trend", "reversal", "neutral"].includes(String(input.style)))) {
         throw new AppError("INVALID_REQUEST", "只接受 symbol 和可选 style（trend/reversal/neutral）。", 400);
@@ -161,6 +180,11 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const safe = abort.signal.aborted ? new AppError("REQUEST_TIMEOUT", "分析已取消或超时，请重新获取行情。", 504) : publicError(error);
       send(safe.status, { requestId, error: { code: safe.code, message: safe.message, ...safe.upstream } }, safe.retryAfter ? { "Retry-After": String(safe.retryAfter) } : {});
       const original = error instanceof AppError ? error : undefined;
+      if (scanAction) {
+        logger.error(JSON.stringify({ event: "market_scan_request_failed", requestId, action: scanAction, code: safe.code,
+          httpStatus: safe.status, elapsedMs: now() - startedAt, ...original?.upstream, exception: exceptionChain(error) }));
+        return;
+      }
       if (isOrder) {
         logger.error(JSON.stringify({ event: "order_request_failed", requestId, action: orderAction, code: safe.code,
           httpStatus: safe.status, elapsedMs: now() - startedAt, ...original?.upstream, exception: exceptionChain(error) }));

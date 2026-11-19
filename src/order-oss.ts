@@ -11,7 +11,11 @@ export interface OrderStore {
   removeLock(path: string): Promise<void>;
 }
 
-export function makeOrderStore(config: OrderConfig, now: () => number, fetchImpl = fetch): OrderStore {
+type OssConfig = Pick<OrderConfig, "region" | "bucket" | "ossHost" | "prefix" | "ossKey" | "ossSecret">;
+
+export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore {
+  const storageCode = `${domain}_STORAGE_UNAVAILABLE`;
+  const label = domain === "SCAN" ? "扫描记录" : "订单";
   async function request(method: string, path = "", value?: unknown, query = "", overwrite = false) {
     const body = value === undefined ? undefined : JSON.stringify(value);
     const date = new Date(now()).toISOString().replace(/[-:]|\.\d{3}/g, "");
@@ -36,13 +40,13 @@ export function makeOrderStore(config: OrderConfig, now: () => number, fetchImpl
         method, body, headers, redirect: "error", signal: AbortSignal.timeout(3500),
       });
     } catch (cause) {
-      throw new AppError("ORDER_STORAGE_UNAVAILABLE", "订单存储连接失败。", 503, undefined, undefined, { cause });
+      throw new AppError(storageCode, `${label}存储连接失败。`, 503, undefined, undefined, { cause });
     }
   }
   function unavailable(response: Response) {
     const status = response.status;
     const requestId = response.headers.get("x-oss-request-id") || "";
-    return new AppError("ORDER_STORAGE_UNAVAILABLE", "订单存储操作失败，请使用请求编号查看函数日志。", 503, undefined, { upstreamStatus: status, ...(/^[a-zA-Z0-9-]{8,100}$/.test(requestId) ? { upstreamRequestId: requestId } : {}) });
+    return new AppError(storageCode, `${label}存储操作失败，请使用请求编号查看函数日志。`, 503, undefined, { upstreamStatus: status, ...(/^[a-zA-Z0-9-]{8,100}$/.test(requestId) ? { upstreamRequestId: requestId } : {}) });
   }
   return {
     async assertAtomicWrites() {
@@ -72,7 +76,7 @@ export function makeOrderStore(config: OrderConfig, now: () => number, fetchImpl
         if (response.status === 404 && response.headers.get("x-oss-request-id")) return null;
         throw unavailable(response);
       }
-      return boundedJson(response, 8192, "ORDER_STORAGE_UNAVAILABLE");
+      return boundedJson(response, 8192, storageCode);
     },
     async removeLock(path) {
       const response = await request("DELETE", path);
