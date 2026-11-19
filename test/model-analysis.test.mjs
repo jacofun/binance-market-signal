@@ -8,7 +8,7 @@ import { env, NOW, snapshot, proposal, modelResult, provider, quote, marketFetch
 
 test("model JSON is validated beyond syntax, and invented metrics/confidence are rejected", () => {
   assert.equal(validateProposal(proposal(), snapshot()).direction, "long");
-  for (const delta of [{ confidence: 0.99 }, { stopLoss: 11000 }, { entry: { min: 11000, max: 10000 } }, { targets: [{ price: 9800, reason: "wrong" }] }, { evidence: [{ metric: "news", reason: "invented" }] }, { evidence: [{ metric: "openInterest", reason: "absent" }] }, { counterarguments: [] }, { validForSeconds: 9999 }]) assert.throws(() => validateProposal(proposal(delta), snapshot()), { code: "INVALID_MODEL_OUTPUT" });
+  for (const delta of [{ confidence: 0.99 }, { stopLoss: 11000 }, { entry: { min: 11000, max: 10000 } }, { targets: [{ price: 9800, reason: "wrong", zoneId: "up" }] }, { evidence: [{ metric: "news", reason: "invented" }] }, { evidence: [{ metric: "openInterest", reason: "absent" }] }, { counterarguments: [] }, { validForSeconds: 9999 }]) assert.throws(() => validateProposal(proposal(delta), snapshot()), { code: "INVALID_MODEL_OUTPUT" });
   const none = proposal({ status: "none", direction: null, entry: null, stopLoss: null, targets: [] });
   assert.equal(validateProposal(none, snapshot()).status, "none");
   assert.throws(() => validateProposal({ ...none, direction: "long" }, snapshot()));
@@ -16,7 +16,7 @@ test("model JSON is validated beyond syntax, and invented metrics/confidence are
 
 test("short targets use observed lows in order, and missing volume data permits no opportunity", () => {
   const short = proposal({ direction: "short", stopLoss: 10100, targets: [
-    { price: 9700, reason: "前20根低点" }, { price: 9500, reason: "区间低点" },
+    { price: 9700, reason: "前20根低点", zoneId: "down" }, { price: 9500, reason: "区间低点", zoneId: "lower" },
   ] });
   const market = snapshot();
   assert.deepEqual(validateProposal(short, market).targets, short.targets);
@@ -74,8 +74,8 @@ test("invalid output diagnostics distinguish truncation, JSON, schema, metrics a
     ["stop", JSON.stringify(proposal({ stopLoss: 11000 })), "price_relationship", "stopLoss/targets"],
     ["stop", JSON.stringify(proposal({ entry: { min: "9990", max: 10010 } })), "schema", "entry.min"],
     ["stop", JSON.stringify(proposal({ counterarguments: [] })), "schema", "counterarguments"],
-    ["stop", JSON.stringify(proposal({ targets: [{ price: 20000, reason: "private-output" }] })), "price_scale", "entry/stopLoss/targets"],
-    ["stop", JSON.stringify(proposal({ targets: [{ price: 10150, reason: "private-output" }] })), "unsupported_target", "targets[0].price"],
+    ["stop", JSON.stringify(proposal({ targets: [{ price: 20000, reason: "private-output", zoneId: "up" }] })), "price_scale", "entry/stopLoss/targets"],
+    ["stop", JSON.stringify(proposal({ targets: [{ price: 10150, reason: "private-output", zoneId: "up" }] })), "unsupported_target", "targets[0].price"],
     ["stop", JSON.stringify(proposal({ evidence: [{ metric: "1h.ema20", reason: "private-output" }] })), "missing_volume_price_evidence", "evidence"],
     ["stop", JSON.stringify(proposal({ privateField: "private-output" })), "schema", "proposal"],
   ];
@@ -152,12 +152,12 @@ test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps 
       assert.equal(f.volumePrice.length, 5);
       assert.equal(f.priceLevels.high200, 10100);
     }
-    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal({ targets: [{ price: 10100, reason: "1小时区间前高" }] })) } }] }));
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal({ status: "none", direction: null, entry: null, stopLoss: null, targets: [] })) } }] }));
   };
   const market = provider({ snapshot: async () => input });
   const result = await analyze(config, market, "BTCUSDT", "trend", AbortSignal.timeout(1000),
     (...args) => analyzeWithModel(...args, request), () => NOW);
-  assert.equal(result.status, "candidate");
+  assert.equal(result.status, "none");
   assert.deepEqual(result.market.chart, modelFrames.map(f => ({ interval: f.interval, candles: f.recentCandles })));
   assert.equal(calls, 1);
 });

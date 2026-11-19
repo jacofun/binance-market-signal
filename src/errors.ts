@@ -5,7 +5,7 @@ export interface ModelFailureDetails {
 }
 
 export interface ModelOutputDetails {
-  outputReason: "response_envelope" | "truncated" | "finish_reason" | "empty_content" | "content_too_large" | "invalid_json" | "schema" | "unsupported_metric" | "missing_volume_price_evidence" | "price_relationship" | "price_scale" | "unsupported_target";
+  outputReason: "response_envelope" | "truncated" | "finish_reason" | "empty_content" | "content_too_large" | "invalid_json" | "schema" | "unsupported_metric" | "missing_volume_price_evidence" | "price_relationship" | "price_scale" | "unsupported_target" | "unsupported_zone" | "target_obstacle" | "price_precision";
   outputField?: string;
   upstreamStatus?: number;
   upstreamRequestId?: string;
