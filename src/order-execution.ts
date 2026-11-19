@@ -1,7 +1,7 @@
 import { AppError, exceptionChain } from "./errors.js";
 import { digest, object, ORDER_ID, type OrderConfig, type OrderPlan } from "./order-auth.js";
 import type { ExchangeOrder, OrderExchange, PositionSide, ProtectionLeg } from "./order-binance.js";
-import { assertQuote, DECIMAL, orderOption, type OrderOption, type TradingRules } from "./order-rules.js";
+import { assertQuote, DECIMAL, orderOption, type OrderKind, type OrderOption, type TradingRules } from "./order-rules.js";
 import type { OrderStore } from "./order-oss.js";
 
 const activePath = "locks/btcusdt.json";
@@ -10,32 +10,38 @@ const legs = ["stop", "target"] as const;
 const maxProtectionAttempts = 4;
 const retryMs = 10000;
 const recoverySlotMs = 60000;
-const terminalEntry = new Set(["FILLED", "CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"]);
+const terminalEntry = new Set(["FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"]);
+export const pendingEntryMs = 120000;
 const terminalProtection = new Set(["FINISHED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"]);
 type ProtectionState = "pending" | "active" | "attention" | "closed" | "not_required";
 
 export interface ProtectedDraft {
   plan: OrderPlan; option: OrderOption; quantity: string; expiresAt: number;
 }
-interface Intent {
-  version: 2; analysisId: string; owner: string; kind: "market"; clientId: string;
+type Intent = {
+  analysisId: string; owner: string; clientId: string;
   apiKeyHash: string; side: PositionSide; quantity: string; stop: string; target: string; openingUntil: number;
-}
+} & ({ version: 2; kind: "market" } | { version: 3; kind: "limit" | "conditional"; entryExpiresAt: number });
 const orderPath = (owner: string, id: string) => `attempts/${owner}/${id}`;
 const detailedError = (error: unknown) => ({
   error: exceptionChain(error), ...(error instanceof AppError ? error.upstream : {}),
 });
 export const supportsExits = (rules: TradingRules) => ["STOP_MARKET", "TAKE_PROFIT_MARKET"].every(kind => rules.kinds.includes(kind));
+export const supportsEntry = (config: OrderConfig, kind: OrderKind) => kind === "market" || config.mode === "demo";
 
 export function isProtectedIntent(value: unknown): value is Intent {
-  return object(value) && value.version === 2 && typeof value.analysisId === "string" && ORDER_ID.test(value.analysisId) &&
-    typeof value.owner === "string" && /^[a-f0-9]{64}$/.test(value.owner) && value.kind === "market" &&
+  return object(value) && (value.version === 2 && value.kind === "market" ||
+    value.version === 3 && (value.kind === "limit" || value.kind === "conditional") &&
+    typeof value.entryExpiresAt === "number" && Number.isSafeInteger(value.entryExpiresAt) && value.entryExpiresAt > Number(value.openingUntil)) &&
+    typeof value.analysisId === "string" && ORDER_ID.test(value.analysisId) &&
+    typeof value.owner === "string" && /^[a-f0-9]{64}$/.test(value.owner) &&
     typeof value.clientId === "string" && /^ms[e][a-f0-9]{30}$/.test(value.clientId) &&
     typeof value.apiKeyHash === "string" && /^[a-f0-9]{64}$/.test(value.apiKeyHash) &&
     (value.side === "LONG" || value.side === "SHORT") && [value.quantity, value.stop, value.target].every(
       field => typeof field === "string" && DECIMAL.test(field) && Number(field) > 0) && Number.isSafeInteger(value.openingUntil);
 }
-const hasFinalFill = (entry: ExchangeOrder) => terminalEntry.has(entry.exchangeStatus ?? "") && entry.executedQty !== undefined;
+const hasFinalFill = (entry: ExchangeOrder) =>
+  terminalEntry.has(entry.childStatus ?? entry.exchangeStatus ?? "") && entry.executedQty !== undefined;
 const legId = (intent: Intent, leg: ProtectionLeg) => `ms${leg === "stop" ? "s" : "t"}${intent.clientId.slice(3)}`;
 
 export function makeProtectedExecution(config: OrderConfig, store: OrderStore, exchange: OrderExchange, now: () => number,
@@ -51,6 +57,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
   });
   const result = (intent: Intent, protection: ReturnType<typeof protectedStatus>, entry?: ExchangeOrder | null) => ({
     mode: config.mode, ...context(intent), kind: intent.kind, ...(entry ?? { state: "unknown" as const }), protection,
+    ...(intent.version === 3 ? { entryExpiresAt: intent.entryExpiresAt } : {}),
   });
   async function rememberEntry(intent: Intent, entry: ExchangeOrder) {
     if (!hasFinalFill(entry) && entry.state !== "rejected") return;
@@ -139,13 +146,28 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     } catch (error) {
       report({ event: "order_protection_incomplete", ...context(intent), leg: stop === "NEW" ? "target" : "stop", ...detailedError(error) });
     }
-    const state = stop === "NEW" && target === "NEW" ? "active" : "attention";
+    const state = stop === "NEW" && target === "NEW" && (intent.kind === "market" || terminal) ? "active" : "attention";
     if (state === "attention") report({ event: "order_protection_requires_attention", ...context(intent), stop, target });
     return result(intent, protectedStatus(intent, state, stop, target), entry);
+  }
+  async function reconcileEntry(intent: Intent, entry: ExchangeOrder, until: number) {
+    if (intent.version !== 3 || entry.state === "rejected" || hasFinalFill(entry) ||
+      (!Number(entry.executedQty) && now() < intent.entryExpiresAt) || now() + 8500 >= until) return entry;
+    // Stop releasing new fills after the first observed fill or the waiting deadline.
+    // Re-read Binance because a fill can race a cancellation.
+    try {
+      await exchange.cancelEntry(intent.kind, intent.clientId, entry);
+      const checked = await exchange.findEntry(intent.kind, intent.clientId);
+      if (checked && (!Number(entry.executedQty) || Number(checked.executedQty) >= Number(entry.executedQty))) return checked;
+    } catch (error) {
+      report({ event: "order_entry_cancel_unconfirmed", ...context(intent), ...detailedError(error) });
+    }
+    return entry;
   }
   return {
     ready,
     async submit(draft: ProtectedDraft) {
+      if (!supportsEntry(config, draft.option.kind)) throw new AppError("ORDER_PENDING_DEMO_ONLY", "限价和条件限价提交仅在测试网开放。", 409);
       if (!await ready()) throw new AppError("ORDER_RECOVERY_NOT_READY", "订单保护恢复任务未就绪，暂时禁止开仓。", 503);
       const { plan, quantity } = draft;
       if (quantity !== config.quantity || draft.expiresAt <= now()) {
@@ -157,15 +179,18 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       const [rules] = await Promise.all([exchange.rules(), exchange.assertFlat(), store.assertAtomicWrites()]);
       const quote = await exchange.quote();
       assertQuote(plan, quote, now());
-      const option = orderOption("market", plan, quote, rules, config);
+      const option = orderOption(draft.option.kind, plan, quote, rules, config);
       if (!supportsExits(rules) || typeof option === "string" ||
         option.stopLossPrice !== draft.option.stopLossPrice || option.takeProfitPrice !== draft.option.takeProfitPrice) {
         throw new AppError("ORDER_RULE_CHANGED", typeof option === "string" ? option : "止盈或止损未通过复核。", 409);
       }
-      if (Math.abs(Number(option.price) - Number(draft.option.price)) / Number(draft.option.price) > 0.003) {
+      if (option.kind === "market" ? Math.abs(Number(option.price) - Number(draft.option.price)) / Number(draft.option.price) > 0.003 :
+        option.price !== draft.option.price || option.triggerPrice !== draft.option.triggerPrice) {
         throw new AppError("ORDER_QUOTE_CHANGED", "盘口相较确认草稿变化过大，请刷新。", 409);
       }
-      const intent: Intent = { version: 2, analysisId: plan.id, owner: plan.owner, kind: "market",
+      const intent: Intent = { ...(option.kind === "market" ? { version: 2, kind: "market" } :
+        { version: 3, kind: option.kind, entryExpiresAt: now() + pendingEntryMs }),
+        analysisId: plan.id, owner: plan.owner,
         clientId: `mse${digest(`${config.mode}/${plan.owner}/${plan.id}`).slice(0, 30)}`,
         apiKeyHash: credentials, side: plan.direction === "long" ? "LONG" : "SHORT", quantity,
         stop: option.stopLossPrice, target: option.takeProfitPrice,
@@ -185,7 +210,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       if (issuedAt + 3000 >= intent.openingUntil || issuedAt - Math.min(quote.bookTime, quote.markTime) > 5000) {
         entry = { state: "rejected", reason: "ORDER_DRAFT_EXPIRED" };
       } else {
-        try { entry = await exchange.enter(intent.side, quantity, intent.clientId, issuedAt); }
+        try { entry = await exchange.enter(intent.side, quantity, intent.clientId, issuedAt, option); }
         catch (error) {
           report({ event: "order_entry_unknown", ...context(intent), ...detailedError(error) });
           return result(intent, protectedStatus(intent, "pending"));
@@ -194,7 +219,9 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       // The recovery task can query a filled order using its persisted client ID.
       // Give the stop request priority over persisting any post-trade receipt.
       if (entry.state === "rejected") await rememberEntry(intent, entry);
-      const outcome = await settle(intent, entry, true, intent.openingUntil + retryMs);
+      const until = intent.version === 3 ? issuedAt + 35000 : intent.openingUntil + retryMs;
+      entry = await reconcileEntry(intent, entry, until);
+      const outcome = await settle(intent, entry, true, until);
       if (entry.state !== "rejected") await rememberEntry(intent, entry);
       report({ event: "order_execution_completed", ...context(intent), entry: entry.state,
         executedQty: entry.executedQty, protection: outcome.protection.state });
@@ -208,8 +235,9 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       if (finalState && cached) return result(intent, protectedStatus(intent, finalState), cached);
       if (intent.apiKeyHash !== credentials) return { ...result(intent, protectedStatus(intent, "attention")), lookupUnavailable: true };
       try {
-        const [entry, stop, target] = await Promise.all([exchange.findEntry(intent.clientId), findLeg(intent, "stop"), findLeg(intent, "target")]);
-        const state = finalState ?? (stop === "NEW" && target === "NEW" ? "active" : Number(entry?.executedQty) > 0 ? "attention" : "pending");
+        const [entry, stop, target] = await Promise.all([exchange.findEntry(intent.kind, intent.clientId), findLeg(intent, "stop"), findLeg(intent, "target")]);
+        const active = stop === "NEW" && target === "NEW" && (intent.kind === "market" || entry !== null && hasFinalFill(entry));
+        const state = finalState ?? (active ? "active" : Number(entry?.executedQty) > 0 ? "attention" : "pending");
         return result(intent, protectedStatus(intent, state, stop, target), entry ?? cached);
       } catch (error) {
         report({ event: "order_protection_lookup_failed", ...context(intent), ...detailedError(error) });
@@ -244,11 +272,12 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
         throw new AppError("ORDER_RECOVERY_STATE", "恢复队列与确认的订单计划不一致。", 409);
       }
       const cached = await knownOrder(intent);
-      const entry = cached ?? await exchange.findEntry(intent.clientId);
+      let entry = cached ?? await exchange.findEntry(intent.kind, intent.clientId);
       if (!entry) {
         report({ event: "order_entry_unresolved", ...context(intent) });
         return { recovered: false, ...context(intent), reason: "entry_unknown" };
       }
+      entry = await reconcileEntry(intent, entry, until);
       const outcome = await settle(intent, entry, false, until);
       if (!cached) await rememberEntry(intent, entry);
       await store.write(heartbeatPath, { at: now(), apiKeyHash: credentials });

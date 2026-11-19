@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import { object, type OrderConfig } from "./order-auth.js";
 import { AppError } from "./errors.js";
 import { boundedJson } from "./http.js";
-import { DECIMAL, type Grid, type OrderKind, type Quote, type TradingRules } from "./order-rules.js";
+import { DECIMAL, type Grid, type OrderKind, type OrderOption, type Quote, type TradingRules } from "./order-rules.js";
 
 const SYMBOL = "BTCUSDT";
 export type PositionSide = "LONG" | "SHORT";
@@ -12,15 +12,17 @@ const closingSide = (side: PositionSide) => side === "LONG" ? "SELL" : "BUY";
 const protectionType = (leg: ProtectionLeg) => leg === "stop" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET";
 export interface ExchangeOrder {
   state: "accepted" | "rejected" | "unknown";
-  exchangeStatus?: string; childStatus?: string; executedQty?: string; avgPrice?: string; exchangeCode?: number; upstreamStatus?: number; reason?: string;
+  exchangeStatus?: string; childStatus?: string; childOrderId?: string; executedQty?: string; avgPrice?: string;
+  exchangeCode?: number; upstreamStatus?: number; reason?: string;
 }
 export interface OrderExchange {
   rules(): Promise<TradingRules>;
   quote(): Promise<Quote>;
   assertFlat(): Promise<void>;
   position(side: PositionSide, maxQuantity: string): Promise<number>;
-  enter(side: PositionSide, quantity: string, clientId: string, issuedAt: number): Promise<ExchangeOrder>;
-  findEntry(clientId: string): Promise<ExchangeOrder | null>;
+  enter(side: PositionSide, quantity: string, clientId: string, issuedAt: number, option: OrderOption): Promise<ExchangeOrder>;
+  findEntry(kind: OrderKind, clientId: string): Promise<ExchangeOrder | null>;
+  cancelEntry(kind: "limit" | "conditional", clientId: string, entry: ExchangeOrder): Promise<void>;
   protect(side: PositionSide, leg: ProtectionLeg, trigger: string, clientId: string, issuedAt: number): Promise<string>;
   findProtection(side: PositionSide, leg: ProtectionLeg, trigger: string, clientId: string): Promise<string | null>;
   cancelProtection(clientId: string): Promise<void>;
@@ -33,13 +35,14 @@ function decimal(value: unknown, allowZero = false): value is string {
   return typeof value === "string" && DECIMAL.test(value) && (allowZero || Number(value) > 0);
 }
 const invalid = () => new AppError("ORDER_BINANCE_RESPONSE", "币安返回的委托校验数据不完整。", 502);
+const untriggeredTerminal = new Set(["CANCELED", "CANCELLED", "EXPIRED", "REJECTED"]);
 function parseOrder(data: unknown, clientId: string, algo: boolean): ExchangeOrder {
   if (!object(data) || data[algo ? "clientAlgoId" : "clientOrderId"] !== clientId || data.symbol !== SYMBOL ||
     !id(data[algo ? "algoId" : "orderId"])) throw invalid();
   const exchangeStatus = status(data[algo ? "algoStatus" : "status"]);
   if (!exchangeStatus) throw invalid();
-  return { state: "accepted", exchangeStatus, ...(decimal(data.executedQty, true) ? { executedQty: data.executedQty } : {}),
-    ...(decimal(data.avgPrice, true) ? { avgPrice: data.avgPrice } : {}) };
+  return { state: "accepted", exchangeStatus, ...(!algo && decimal(data.executedQty, true) ? { executedQty: data.executedQty } : {}),
+    ...(!algo && decimal(data.avgPrice, true) ? { avgPrice: data.avgPrice } : {}) };
 }
 
 export function makeOrderExchange(config: OrderConfig, now: () => number, fetchImpl = fetch): OrderExchange {
@@ -147,21 +150,41 @@ export function makeOrderExchange(config: OrderConfig, now: () => number, fetchI
       }
       return qty;
     },
-    async enter(side, quantity, clientId, issuedAt) {
+    async enter(side, quantity, clientId, issuedAt, option) {
       try {
-        const data = await call("/fapi/v1/order", { ...bySymbol, side: openingSide(side), positionSide: side, quantity,
-          type: "MARKET", newOrderRespType: "RESULT", newClientOrderId: clientId }, true, "POST", issuedAt);
-        if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) || !decimal(data.executedQty, true)) throw invalid();
+        const common = { ...bySymbol, side: openingSide(side), positionSide: side, quantity };
+        if (option.kind === "conditional") {
+          if (!option.triggerPrice) throw invalid();
+          const data = await call("/fapi/v1/algoOrder", { ...common, type: "STOP", algoType: "CONDITIONAL", timeInForce: "GTC",
+            clientAlgoId: clientId, price: option.price, triggerPrice: option.triggerPrice, workingType: "MARK_PRICE" }, true, "POST", issuedAt);
+          if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) || data.orderType !== "STOP") throw invalid();
+          return parseOrder(data, clientId, true);
+        }
+        const params: Record<string, string> = option.kind === "market" ? { type: "MARKET", newOrderRespType: "RESULT" } :
+          { type: "LIMIT", timeInForce: "GTX", price: option.price, newOrderRespType: "ACK" };
+        const data = await call("/fapi/v1/order", { ...common, ...params, newClientOrderId: clientId }, true, "POST", issuedAt);
+        if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) ||
+          option.kind === "market" && !decimal(data.executedQty, true)) throw invalid();
         return parseOrder(data, clientId, false);
       } catch (error) {
-        if (!hasCode(error, -1013, -1021, -1022, -1100, -1102, -1111, -1116, -1121, -2019, -4061, -4164)) throw error;
+        if (!hasCode(error, -1013, -1021, -1022, -1100, -1102, -1111, -1116, -1121, -2019, -2021, -4061, -4164, -5022)) throw error;
         const upstream = (error as AppError).upstream;
         return { state: "rejected", exchangeCode: Number(upstream && "upstreamCode" in upstream ? upstream.upstreamCode : undefined) };
       }
     },
-    async findEntry(clientId) {
-      try { return await this.query("market", clientId); }
+    async findEntry(kind, clientId) {
+      try { return await this.query(kind, clientId); }
       catch (error) { if (hasCode(error, -2013)) return null; throw error; }
+    },
+    async cancelEntry(kind, clientId, entry) {
+      try {
+        if (kind === "limit") await call("/fapi/v1/order", { ...bySymbol, origClientOrderId: clientId }, true, "DELETE");
+        if (kind === "conditional" && entry.childOrderId) {
+          await call("/fapi/v1/order", { ...bySymbol, orderId: entry.childOrderId }, true, "DELETE");
+        } else if (kind === "conditional" && entry.exchangeStatus === "NEW") {
+          await call("/fapi/v1/algoOrder", { clientAlgoId: clientId }, true, "DELETE");
+        }
+      } catch (error) { if (!hasCode(error, -2013, -2011)) throw error; }
     },
     async protect(side, leg, trigger, clientId, issuedAt) {
       const data = await call("/fapi/v1/algoOrder", { ...bySymbol, side: closingSide(side), positionSide: side, algoType: "CONDITIONAL",
@@ -183,12 +206,20 @@ export function makeOrderExchange(config: OrderConfig, now: () => number, fetchI
       const data = await call(algo ? "/fapi/v1/algoOrder" : "/fapi/v1/order", algo ? { clientAlgoId: clientId } :
         { symbol: SYMBOL, origClientOrderId: clientId }, true);
       const order = parseOrder(data, clientId, algo);
-      if (algo && object(data) && id(data.actualOrderId)) {
-        const child = await call("/fapi/v1/order", { symbol: SYMBOL, orderId: id(data.actualOrderId)! }, true)
-          .catch(() => null);
-        if (object(child) && String(child.orderId) === String(data.actualOrderId) && child.symbol === SYMBOL &&
-          status(child.status) && decimal(child.executedQty, true) && decimal(child.avgPrice, true)) {
-          return { ...order, childStatus: child.status as string, executedQty: child.executedQty, avgPrice: child.avgPrice };
+      if (algo && object(data)) {
+        const childOrderId = id(data.actualOrderId);
+        if (childOrderId) {
+          const child = await call("/fapi/v1/order", { symbol: SYMBOL, orderId: childOrderId }, true)
+            .catch(error => { if (hasCode(error, -2013)) return null; throw error; });
+          if (!child) return { ...order, childOrderId };
+          if (!object(child) || id(child.orderId) !== childOrderId || child.symbol !== SYMBOL ||
+            child.side !== data.side || child.positionSide !== data.positionSide ||
+            !status(child.status) || !decimal(child.executedQty, true)) throw invalid();
+          return { ...order, childOrderId, childStatus: child.status as string, executedQty: child.executedQty,
+            ...(decimal(child.avgPrice, true) ? { avgPrice: child.avgPrice } : {}) };
+        }
+        if (data.actualOrderId === "" && Number(data.triggerTime) === 0 && untriggeredTerminal.has(order.exchangeStatus!)) {
+          return { ...order, executedQty: "0" };
         }
       }
       return order;

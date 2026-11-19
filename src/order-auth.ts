@@ -77,9 +77,11 @@ export function validateRecoveryTimer(input: Record<string, unknown>, now: numbe
   }
 }
 
-type ReferenceKind = "research" | "market";
+type ReferenceKind = "research" | "submission";
 function referencePath(config: OrderConfig, kind: ReferenceKind, token: string) {
-  return `temporary/${digest(`${config.base}/${config.apiKey}`)}/${kind}/${digest(token)}.json`;
+  // "market" was the original storage path for all executable drafts.
+  const namespace = kind === "submission" ? "market" : kind;
+  return `temporary/${digest(`${config.base}/${config.apiKey}`)}/${namespace}/${digest(token)}.json`;
 }
 export async function storeOrderReference(store: OrderStore, config: OrderConfig, kind: ReferenceKind, value: unknown) {
   // Keep the public token format accepted by the website's ticket endpoint.

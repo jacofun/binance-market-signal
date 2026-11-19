@@ -4,7 +4,7 @@ import { ORDER_ID, ORDER_REFERENCE, digest, loadOrderReference, orderSubject, st
 import { assertQuote, demoOrderPrices, orderOption, type OrderKind } from "./order-rules.js";
 import type { ExchangeOrder, OrderExchange } from "./order-binance.js";
 import type { OrderStore } from "./order-oss.js";
-import { isProtectedIntent, makeProtectedExecution, supportsExits, type ProtectedDraft } from "./order-execution.js";
+import { isProtectedIntent, makeProtectedExecution, pendingEntryMs, supportsEntry, supportsExits, type ProtectedDraft } from "./order-execution.js";
 
 interface Reservation { kind: OrderKind; clientId: string }
 interface Outcome extends ExchangeOrder { checkedAt: number; reason?: string }
@@ -36,30 +36,30 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
       return { ...base, ...(outcome ?? { state: "unknown" }), lookupUnavailable: true };
     }
   }
-  async function preview(plan: OrderPlan) {
+  async function preview(plan: OrderPlan, includePending: boolean) {
     if (plan.expiresAt <= now()) throw new AppError("ORDER_DRAFT_EXPIRED", "机会已过期，请重新分析。", 409);
     if (await store.read(`${path(plan.owner, plan.id)}/intent.json`)) throw alreadySent();
     const rules = await exchange.rules();
     const quote = await exchange.quote();
     assertQuote(plan, quote, now());
-    let enabled = false;
     const expiresAt = Math.min(plan.expiresAt, now() + 30000);
-    const options = [];
+    const options: (Exclude<ReturnType<typeof orderOption>, string> & { draft?: string; entryWaitingSeconds?: number })[] = [];
     const unavailable: Record<string, string> = {};
+    let executionAvailable: boolean | undefined;
     for (const kind of kinds) {
       const option = orderOption(kind, plan, quote, rules, config);
       if (typeof option === "string") unavailable[kind] = option;
-      else if (kind === "market" && supportsExits(rules) && await execution.ready()) {
-        enabled = true;
-        options.push({ ...option,
-          draft: await storeOrderReference(store, config, "market", { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft) });
-      }
-      else options.push(option);
+      else if ((kind === "market" || includePending) && supportsEntry(config, kind) &&
+        (executionAvailable ??= supportsExits(rules) && await execution.ready())) {
+        const draft = await storeOrderReference(store, config, "submission", { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft);
+        options.push({ ...option, draft, ...(kind === "market" ? {} : { entryWaitingSeconds: pendingEntryMs / 1000 }) });
+      } else options.push(option);
     }
+    const enabled = options.some(option => !!option.draft);
     return { mode: config.mode, symbol, analysisId: plan.id, direction: plan.direction, quantity: config.quantity, stop: plan.stop,
       target: plan.target, riskCap: config.maxRisk, markPrice: quote.mark, expiresAt, options, unavailable, submission: enabled ? { state: "enabled" as const } :
-        { state: "blocked" as const, reason: options.some(option => option.kind === "market")
-          ? "执行开关、保护恢复任务或交易所条件单尚未就绪，当前仅可预览。" : "本次研究暂无符合条件的市价方案。" } };
+        { state: "blocked" as const, reason: executionAvailable === false
+          ? "执行开关、保护恢复任务或交易所条件单尚未就绪，当前仅可预览。" : "本次研究暂无可提交的方案。" } };
   }
   return async (input: Record<string, unknown>, token: string) => {
     if (input.action === "demo-plan" && Object.keys(input).length === 2 && (input.direction === "long" || input.direction === "short")) {
@@ -78,16 +78,18 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
       const owner = digest(orderSubject(token, config, "trading:orders:read", now()));
       return status(owner, input.analysisId);
     }
-    if (input.action === "preview" && Object.keys(input).length === 2) {
+    if (input.action === "preview" && typeof input.permit === "string" &&
+      Object.keys(input).every(key => key === "action" || key === "permit" || key === "includePending") &&
+      (input.includePending === undefined || typeof input.includePending === "boolean")) {
       const owner = digest(orderSubject(token, config, "trading:orders:read", now()));
       const plan = await loadOrderReference<OrderPlan>(store, config, "research", input.permit);
       if (plan.owner !== owner) throw invalidRequest();
-      return preview(plan);
+      return preview(plan, input.includePending === true);
     }
     if (input.action === "submit" && Object.keys(input).length === 2 && typeof input.draft === "string" && ORDER_REFERENCE.test(input.draft)) {
       const owner = digest(orderSubject(token, config, "trading:orders:submit-protected", now(), digest(input.draft)));
-      const draft = await loadOrderReference<ProtectedDraft>(store, config, "market", input.draft);
-      if (draft.plan?.owner !== owner || draft.option?.kind !== "market") throw invalidRequest();
+      const draft = await loadOrderReference<ProtectedDraft>(store, config, "submission", input.draft);
+      if (draft.plan?.owner !== owner || !draft.option || !kinds.includes(draft.option.kind)) throw invalidRequest();
       return execution.submit(draft);
     }
     throw invalidRequest();

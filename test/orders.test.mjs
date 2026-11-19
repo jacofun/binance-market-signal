@@ -41,7 +41,8 @@ const makeMock = () => {
   const objects = new Map();
   const calls = [];
   const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, tickSize: "0.1", orders: new Map(),
-    positions: [], entryQty: "0.001", entryStatus: "FILLED", entryFault: "", stopFault: "", targetFault: "", versioning: "", failIntent: false, failTemporary: false };
+    positions: [], entryQty: "0.001", entryStatus: "FILLED", entryFault: "", stopFault: "", targetFault: "", versioning: "",
+    failIntent: false, failTemporary: false, failEntryCancel: false };
   async function mockFetch(url, options) {
     const u = new URL(url);
     const { headers, method } = options;
@@ -89,11 +90,11 @@ const makeMock = () => {
     if (method === "POST") {
       if (algo) {
         const clientAlgoId = params.get("clientAlgoId");
-        const fault = params.get("type") === "STOP_MARKET" ? state.stopFault : state.targetFault;
+        const fault = params.get("type") === "STOP" ? state.entryFault : params.get("type") === "STOP_MARKET" ? state.stopFault : state.targetFault;
         if (fault === "rejected") return Response.json({ code: -2021 }, { status: 400 });
         const order = { symbol: "BTCUSDT", algoId: 52, clientAlgoId, algoStatus: "NEW", orderType: params.get("type"),
           positionSide: params.get("positionSide"), side: params.get("side"), workingType: params.get("workingType"),
-          closePosition: params.get("closePosition") === "true", triggerPrice: params.get("triggerPrice") };
+          closePosition: params.get("closePosition") === "true", triggerPrice: params.get("triggerPrice"), actualOrderId: "", triggerTime: 0 };
         state.orders.set(clientAlgoId, order);
         if (fault === "unknown") return Response.json({ code: -1007 }, { status: 503 });
         return Response.json(order);
@@ -108,13 +109,16 @@ const makeMock = () => {
       if (state.entryFault === "unknown") return Response.json({ code: -1007 }, { status: 503 });
       return Response.json(entry);
     }
-    if (method === "DELETE") {
-      const pending = state.orders.get(params.get("clientAlgoId"));
-      assert.equal(pending.algoStatus, "NEW");
-      pending.algoStatus = "CANCELED";
+    const orderId = params.get("orderId");
+    const order = orderId ? [...state.orders.values()].find(order => String(order.orderId) === orderId) :
+      state.orders.get(params.get(algo ? "clientAlgoId" : "origClientOrderId"));
+    if (method === "DELETE" && order) {
+      if (state.failEntryCancel && (!algo || order.orderType === "STOP")) return Response.json({ code: -1007 }, { status: 503 });
+      const field = algo ? "algoStatus" : "status";
+      assert.ok(["NEW", "PARTIALLY_FILLED"].includes(order[field]));
+      order[field] = "CANCELED";
       return Response.json({ code: "200" });
     }
-    const order = state.orders.get(params.get(algo ? "clientAlgoId" : "origClientOrderId"));
     return order ? Response.json(order) : Response.json({ code: -2013 }, { status: 400 });
   }
   return { state, mockFetch, calls, objects };
@@ -360,6 +364,98 @@ test("test plans reject live mode and invalid prices before an order can be crea
   assert.equal((await demo.request(request, readToken())).data.error.code, "ORDER_DEMO_PRICE_RANGE");
   assert.deepEqual(mutations(demo), []);
   assert.equal(demo.objects.size, 0);
+});
+
+async function pendingFixture(t, kind, direction = "long") {
+  const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });
+  app.state.entryQty = "0";
+  app.state.entryStatus = "NEW";
+  assert.equal((await app.recover()).http, 200);
+  const { data: plan } = await app.request({ action: "demo-plan", direction }, readToken());
+  const { data: preview } = await app.request({ action: "preview", permit: plan.orderPermit, includePending: true }, readToken());
+  const option = preview.options.find(option => option.kind === kind);
+  assert.match(option.draft, /^v3\./);
+  assert.equal(option.entryWaitingSeconds, 120);
+  const submission = await app.submit(option.draft);
+  assert.equal(submission.http, 200, JSON.stringify(submission.data));
+  assert.equal(submission.data.kind, kind);
+  assert.equal(submission.data.protection.state, "pending");
+  assert.equal(submission.data.entryExpiresAt, NOW + 120000);
+  assert.ok(!mutations(app).some(call => ["STOP_MARKET", "TAKE_PROFIT_MARKET"].includes(call.params.get("type"))));
+  return { app, option, order: submission.data };
+}
+
+test("pending post-only and untriggered conditional orders time out with no protection orders", async t => {
+  for (const kind of ["limit", "conditional"]) {
+    const { app, option, order } = await pendingFixture(t, kind);
+    const call = mutations(app)[0];
+    assert.equal(call.params.get("type"), kind === "limit" ? "LIMIT" : "STOP");
+    assert.equal(call.params.get("timeInForce"), kind === "limit" ? "GTX" : "GTC");
+    assert.equal(call.params.get("price"), option.price);
+    assert.equal(call.params.get("triggerPrice"), option.triggerPrice ?? null);
+    assert.equal(call.params.get("workingType"), kind === "conditional" ? "MARK_PRICE" : null);
+    assert.equal((await app.submit(option.draft)).data.error.code, "ORDER_ALREADY_RESERVED");
+    app.state.clock = NOW + 60000;
+    assert.equal((await app.recover()).data.protection.state, "pending");
+    assert.equal(mutations(app).length, 1);
+    app.state.clock = NOW + 120000;
+    const { data } = await app.recover();
+    assert.equal(data.exchangeStatus, "CANCELED");
+    assert.equal(data.protection.state, "not_required");
+    assert.equal((await app.query(order.analysisId)).data.protection.state, "not_required");
+    assert.deepEqual(mutations(app).map(call => call.method), ["POST", "DELETE"]);
+    assert.equal(app.objects.has("/private/market-signal-orders/v1/demo/locks/btcusdt.json"), false);
+  }
+});
+
+test("a triggered conditional order is tracked by child ID, cancels the remainder and protects a partial fill", async t => {
+  const { app, order } = await pendingFixture(t, "conditional", "short");
+  const parent = app.state.orders.get(order.clientId);
+  parent.algoStatus = "FINISHED";
+  parent.actualOrderId = "99";
+  app.state.clock = NOW + 60000;
+  assert.equal((await app.recover()).data.protection.state, "pending");
+  assert.equal(mutations(app).length, 1);
+  assert.equal(app.objects.has("/private/market-signal-orders/v1/demo/locks/btcusdt.json"), true);
+  app.state.orders.set("conditional-child", { symbol: "BTCUSDT", orderId: 99, positionSide: "SHORT", side: "SELL",
+    status: "PARTIALLY_FILLED", executedQty: "0.0005", avgPrice: "9996" });
+  app.state.positions = [{ symbol: "BTCUSDT", positionSide: "SHORT", positionAmt: "-0.0005" }];
+  app.state.clock = NOW + 120000;
+  const { data } = await app.recover();
+  assert.equal(data.childStatus, "CANCELED");
+  assert.equal(data.executedQty, "0.0005");
+  assert.equal(data.protection.state, "active");
+  assert.equal(mutations(app)[1].path, "/fapi/v1/order");
+  assert.equal(mutations(app)[1].params.get("orderId"), "99");
+  assert.deepEqual(mutations(app).slice(2).map(call => call.params.get("type")), ["STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+});
+
+test("a failed remaining-limit cancellation keeps the lock and protects the observed fill", async t => {
+  const { app, order } = await pendingFixture(t, "limit");
+  const entry = app.state.orders.get(order.clientId);
+  entry.status = "PARTIALLY_FILLED";
+  entry.executedQty = "0.0005";
+  app.state.positions = [{ symbol: "BTCUSDT", positionSide: "LONG", positionAmt: "0.0005" }];
+  app.state.failEntryCancel = true;
+  app.state.clock = NOW + 60000;
+  assert.equal((await app.recover()).data.protection.state, "attention");
+  assert.equal(app.objects.has("/private/market-signal-orders/v1/demo/locks/btcusdt.json"), true);
+  assert.ok(app.logs.some(line => line.includes("order_entry_cancel_unconfirmed")));
+  app.state.failEntryCancel = false;
+  app.state.clock = NOW + 120000;
+  assert.equal((await app.recover()).data.protection.state, "active");
+  assert.deepEqual(mutations(app).filter(call => call.method === "POST").map(call => call.params.get("type")),
+    ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+});
+
+test("live mode does not expose a pending draft, even when a new client requests it", async t => {
+  const app = await start(t, { SIGNAL_ORDER_MODE: "live", BINANCE_BASE_URL: "https://fapi.binance.com", SIGNAL_ORDER_EXECUTE: "true" });
+  assert.equal((await app.recover()).http, 200);
+  const { data } = await app.analyze();
+  const { data: preview } = await app.request({ action: "preview", permit: data.orderPermit, includePending: true }, readToken());
+  assert.ok(entryDraft(preview));
+  assert.ok(preview.options.filter(option => option.kind !== "market").every(option => !option.draft));
+  assert.deepEqual(mutations(app), []);
 });
 
 async function executionFixture(t) {
