@@ -12,7 +12,7 @@
 | POST | `/trade/api/signal/analyze` | 分析一个交易对 |
 | OPTIONS | `/trade/api/signal/analyze` | 不带 JWT 的 CORS 预检 |
 
-也支持 CDN 去除 `/trade/api/signal` 前缀后回源 `/analyze`、`/health`；POST `/` 和 `/trade/api/signal/` 是分析别名。其他业务路径返回 404。仅支持 HTTPS 上的业务调用；本地服务器 HTTP 由 FC/CDN 终止 TLS。
+也支持 CDN 去除 `/trade/api/signal` 前缀后回源 `/analyze`、`/health`；POST `/` 和 `/trade/api/signal/` 是分析别名。下单功能使用独立的 POST `/trade/api/signal/orders`（或回源 `/orders`）。仅支持 HTTPS 上的业务调用；本地服务器 HTTP 由 FC/CDN 终止 TLS。
 
 ```http
 POST https://yanxiao.me/trade/api/signal/analyze
@@ -79,7 +79,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 | `SIGNAL_MAX_PRICE_DRIFT_BPS` | `30` | 分析期间最大允许价格偏移，30基点=0.3%，可配置1–500 |
 | `SIGNAL_COOLDOWN_SECONDS` | `10` | 同一 subject 在单实例内的分析间隔，范围0–300 |
 
-没有 OSS 或币安账户密钥环境变量。百炼 Key 只放 FC 环境变量，不需要放 GitHub Secrets。`GET /health` 成功只说明服务启动成功，不说明密钥、模型权限或币安行情已经验证。
+行情分析无需配置 OSS 或币安账户密钥。百炼 Key 只放 FC 环境变量，不需要放 GitHub Secrets。`GET /health` 成功只说明服务启动成功，不说明密钥、模型权限或币安行情已经验证。
 
 ### 排查 INVALID_MODEL_OUTPUT
 
@@ -123,7 +123,7 @@ CI 在写入前和部署后读取所有公开HTTP触发器及指向该函数的F
 
 将 `/trade/api/signal/*` 回源本函数，`/trade/api/sync/*` 仍回源原同步函数。业务方法 POST，允许 OPTIONS 预检，使用 HTTPS 回源、禁止缓存、原样透传 `X-JWT-Token`/JSON请求体，不通过重定向切换接口。CDN/浏览器等待预算需覆盖函数的默认65秒分析预算；平台不支持该等待时间时需要调整预算或另行实现流式/异步协议。
 
-沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC 必须保持原生 JWT 启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。函数不再配置单独的用途或公钥，沿用同步凭证和原生域名鉴权。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
+沿用 JWT Header 名称 `X-JWT-Token`，值为 `Bearer <JWT>`；不要使用会被 CDN OSS 回源鉴权占用的 Authorization。FC 必须保持原生 JWT 启用，控制台保留公钥与 `X-JWT-Token` 读取位置，去掉 `Bearer ` 前缀。分析沿用同步凭证和原生域名鉴权。订单接口还会独立校验网站签发的订单 JWT。确保无JWT的 OPTIONS 由网关直接处理；不能将分析路径加入免鉴权名单。CORS 仅允许 `https://yanxiao.me`、`https://www.yanxiao.me`，不携带网站 Cookie。此工作流不修改 HTTP 触发器、CDN 或原生JWT策略。
 
 ## 小规格实例的实现
 
@@ -161,6 +161,32 @@ RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:Invo
 部署前核对现有 `binance-market-signal`：`ap-southeast-1`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
+
+## 人工确认 BTCUSDT 委托
+
+网站在新分析返回有效方向和价位时自动取委托草稿。候选状态可显示市价、只挂单（GTX）回踩限价和标记价格触发的条件限价。方向明确的观望状态只显示后两种，且价格必须通过同样的预检。观望且无价位、无机会、已过期及其他交易对均无委托草稿。所有委托使用服务端签名草稿。市场规则、盘口、账户和挂单在提交时重新检查。盘口价差风险上限只用于下单前的估算，实际成交和亏损取决于交易所撮合及后续处置。
+
+网站所有者必须选择一张草稿、确认说明并点击发送。一个研究最多提交一次。仓位方向固定为 BTCUSDT 双向持仓模式下的 LONG / SHORT 开仓，同交易对已有持仓、普通挂单或条件挂单时中止。市价以盘口给出参考价。条件限价使用入场区边缘作为触发价与限价，只有标记价格条件由币安执行。市场定性条件由用户核对。委托在研究到期后仍可能有效，止盈、止损和撤单须在币安端管理。委托状态可按分析编号查询，条件单区分交易所受理、触发和实际撮合。
+
+| FC 环境变量 | 用途 |
+| --- | --- |
+| `SIGNAL_ORDER_MODE` | 默认关闭。使用 `demo` 联调，`live` 启用真实委托。 |
+| `BINANCE_BASE_URL` | 对应币安 USDT-M HTTPS 根地址。实盘只接受 `https://fapi.binance.com`，测试只接受 `https://demo-fapi.binance.com` 或 `https://testnet.binancefuture.com`。 |
+| `BINANCE_API_KEY`、`BINANCE_API_SECRET` | 对应环境的 Binance HMAC 密钥。开通合约读取和交易权限，限制来源 IP，关闭提现等其他权限。 |
+| `SIGNAL_ORDER_QUANTITY` | BTC 数量，默认 `0.001`。交易所步长或最低名义额不满足时拦截，保留配置数量。 |
+| `SIGNAL_ORDER_MAX_RISK_USDT` | 入场参考价至研究失效价的计划价差风险上限，默认 `1`，单位 USDT。 |
+| `SIGNAL_ORDER_JWT_PUBLIC_KEY` | 北京私有鉴权函数 `BINANCE_SYNC_PRIVATE_KEY` 对应的 RSA 公钥 PEM。 |
+| `BINANCE_SYNC_KEY_ID`、`BINANCE_SYNC_ISSUER`、`BINANCE_SYNC_AUDIENCE` | 网站签发配置若有改动，信号函数填相同值。默认沿用 `trade-sync-v1`、`https://www.yanxiao.me`、`binance-trade-sync`。 |
+| `SIGNAL_ORDER_SIGNING_SECRET` | 服务端草稿签名密钥，用 `openssl rand -hex 32` 单独生成。 |
+| `ACCESS_KEY_ID`、`ACCESS_KEY_SECRET` | OSS RAM 访问密钥。 |
+| `SIGNAL_ORDER_OSS_BUCKET`、`SIGNAL_ORDER_OSS_REGION` | 私有订单桶及 region ID，例如 `ap-southeast-1`。桶应从未启用版本控制。 |
+| `SIGNAL_ORDER_OSS_NETWORK`、`SIGNAL_ORDER_OSS_PREFIX` | 默认公网 `public`，同地域可设 `internal`。默认前缀 `private/market-signal-orders/v1`，服务按 `demo` 和 `live` 分目录。 |
+
+北京私有鉴权函数需配置 `BINANCE_ORDER_TICKETS_ENABLED=true`。保持 JWT 自定义域名校验原有签名、公钥、issuer 和 audience。网站新增的 `/api/private-auth/trading/binance/order-token` 用原私有鉴权入口。CDN 下单路径 `/trade/api/signal/orders` 使用与分析相同的 HTTPS、POST、OPTIONS、JWT 透传和关闭缓存规则，回源时保留原路径或映射为 `/orders`，关闭自动重试。订单函数额外验证签名、用途和草稿摘要。行情分析只会本地生成可选签名，任何订单配置错误都不阻塞分析响应。
+
+OSS RAM 权限包含桶级 `oss:GetBucketVersioning`、订单前缀下的 `oss:GetObject` 和 `oss:PutObject`，以及仅对订单前缀各模式 `locks/btcusdt.json` 的 `oss:DeleteObject`。前缀应排除 CDN 对外访问与自动生命周期删除。同一账户、模式的所有 FC 实例使用相同桶和前缀。此功能使用独立的订单审计记录，无须迁移研究归档。防覆盖要求适用于版本控制从未启用的桶。版本控制已启用或已暂停的桶应另建私有桶。
+
+若发生网络超时、币安结果不明或 OSS 写回失败，保留 `<prefix>/<mode>/locks/btcusdt.json`。用锁内的分析编号、客户端订单编号和 `requestId` 查 `order_submission_outcome`、`order_lookup_failed`、`order_outcome_write_failed` 或 `order_lock_release_failed`。先在币安核对委托、条件单及持仓，并确认对应 FC 请求已经结束。核对后才由运营人员删除该锁；保留 `attempts/<ownerSha256>/<analysisId>/intent.json` 和 `result.json`。关闭 `SIGNAL_ORDER_MODE` 可立即停用站内入口，已发出的委托继续由币安管理。部署时先启用 demo，完成账号、OSS 权限和真实回源联调后再决定是否启用 live。
 
 ## 本地验证
 

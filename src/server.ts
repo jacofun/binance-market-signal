@@ -8,10 +8,15 @@ import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
+import { loadOrderConfig, makeOrderPermit, orderSubject, type OrderConfig } from "./order-auth.js";
+import { makeOrderStore } from "./order-oss.js";
+import { makeOrderExchange } from "./order-binance.js";
+import { makeOrders } from "./orders.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
 const ANALYSIS_PATHS = new Set(["/", "/analyze", "/trade/api/signal", "/trade/api/signal/analyze"]);
+const ORDER_PATHS = new Set(["/orders", "/trade/api/signal/orders"]);
 const HEALTH_PATHS = new Set(["/", "/health", "/trade/api/signal", "/trade/api/signal/health"]);
 async function body(req: IncomingMessage, ramProbe = false): Promise<Record<string, unknown>> {
   const type = req.headers["content-type"] || "";
@@ -31,12 +36,14 @@ async function body(req: IncomingMessage, ramProbe = false): Promise<Record<stri
   } catch (error) { throw new AppError("INVALID_REQUEST", "请求体必须为 JSON 对象。", 400, undefined, undefined, { cause: error }); }
 }
 function health() { return { status: "ok", service: "binance-market-signal", codeVersion: SOURCE_COMMIT, nodeMajor: Number(process.versions.node.split(".")[0]) }; }
-export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console }: {
+export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console, orderFetch = fetch }: {
   env?: Env; provider?: MarketDataProvider; model?: Model; now?: () => number;
-  logger?: Pick<Console, "info" | "error">;
+  logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch;
 } = {}) {
   const authorize = makeAuthorizer();
   let config: Config | undefined;
+  let orderConfig: OrderConfig | undefined;
+  const ordersConfig = () => orderConfig ??= loadOrderConfig(env);
   let market = provider;
   let active = false;
   const cooldowns = new Map<string, number>();
@@ -50,6 +57,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
     const send = (status: number, value: unknown, extra: Record<string, string> = {}) => {
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
+    let isOrder = false;
+    let orderAction: string | undefined;
     let acquired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const abort = new AbortController();
@@ -62,9 +71,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
     try {
       const url = new URL(req.url || "/", "http://localhost");
       const path = url.pathname.length > 1 ? url.pathname.replace(/\/$/, "") : url.pathname;
+      isOrder = ORDER_PATHS.has(path);
       if (url.search) throw new AppError("INVALID_REQUEST", "接口不接受查询参数。", 400);
       if (HEALTH_PATHS.has(path) && (req.method === "GET" || req.method === "HEAD")) { send(200, req.method === "HEAD" ? null : health()); return; }
-      if (!ANALYSIS_PATHS.has(path) && path !== "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
+      if (!isOrder && !ANALYSIS_PATHS.has(path) && path !== "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
       if (req.method === "OPTIONS") {
         if (!origin || !ORIGINS.has(origin) || req.headers["access-control-request-method"] !== "POST" ||
           String(req.headers["access-control-request-headers"] || "").split(",").filter(Boolean).some(v => !ALLOWED_HEADERS.has(v.trim().toLowerCase()))) {
@@ -72,7 +82,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         }
         send(204, null, { "Access-Control-Allow-Methods": "POST", "Access-Control-Allow-Headers": `${TOKEN_HEADER}, Content-Type, Accept` }); return;
       }
-      if (req.method !== "POST") throw new AppError("METHOD_NOT_ALLOWED", "分析接口仅支持 POST。", 405);
+      if (req.method !== "POST") throw new AppError("METHOD_NOT_ALLOWED", isOrder ? "订单接口仅支持 POST。" : "分析接口仅支持 POST。", 405);
       if (origin && !ORIGINS.has(origin)) throw new AppError("CORS_FORBIDDEN", "来源不受信任。", 403);
       // A harmless RAM-invoked boot probe. No model/market configuration is read.
       // The ordinary HTTP /health endpoint serves the same minimal information.
@@ -85,7 +95,18 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (req.rawHeaders.filter((_, i) => i % 2 === 0 && req.rawHeaders[i]!.toLowerCase() === TOKEN_HEADER.toLowerCase()).length !== 1) {
         throw new AppError("UNAUTHORIZED", "请提供唯一的 X-JWT-Token。", 401);
       }
-      const sub = authorize(req.headers[TOKEN_HEADER.toLowerCase()] as string | undefined, Math.floor(now() / 1000));
+      const token = req.headers[TOKEN_HEADER.toLowerCase()] as string;
+      if (isOrder) {
+        const settings = ordersConfig();
+        const input = await body(req);
+        if (input.action === "preview" || input.action === "submit" || input.action === "status") orderAction = input.action;
+        const orders = makeOrders(settings, makeOrderStore(settings, now, orderFetch), makeOrderExchange(settings, now, orderFetch),
+          now, event => logger.info(JSON.stringify({ requestId, ...event })));
+        const result = await orders(input, token);
+        send(200, { requestId, ...result });
+        return;
+      }
+      const sub = authorize(token, Math.floor(now() / 1000));
       const input = await body(req);
       if (Object.keys(input).some(k => !["symbol", "style"].includes(k)) || typeof input.symbol !== "string" ||
         (input.style !== undefined && !["trend", "reversal", "neutral"].includes(String(input.style)))) {
@@ -105,7 +126,21 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       req.on("aborted", disconnected); res.on("close", disconnected);
       timer = setTimeout(() => cancel("request_deadline"), config.requestTimeoutMs); timer.unref();
       const result = await analyze(config, market, trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
-      send(200, { requestId, ...result });
+      let orderPermit: string | undefined;
+      if ((env.SIGNAL_ORDER_MODE === "demo" || env.SIGNAL_ORDER_MODE === "live") &&
+          result.symbol === "BTCUSDT" && result.opportunity.direction && (result.status === "candidate" || result.status === "watch")) {
+        try {
+          const settings = ordersConfig();
+          const owner = orderSubject(token, settings, "trading:sync", now());
+          orderPermit = makeOrderPermit(result, settings, owner, now());
+        } catch (error) {
+          logger.info(JSON.stringify({ event: "order_permit_unavailable", requestId,
+            code: error instanceof AppError ? error.code : "INTERNAL_ERROR",
+            ...(error instanceof AppError && error.code === "ORDER_CONFIGURATION" ? { configuration: error.message } : {}),
+          }));
+        }
+      }
+      send(200, { requestId, ...result, ...(orderPermit ? { orderPermit } : {}) });
       logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId,
         symbol: trace.symbol, style: trace.style, status: result.status, codeVersion: SOURCE_COMMIT,
         marketMs: result.timing.marketMs, modelMs: result.timing.modelMs, verificationMs: result.timing.verificationMs, totalMs: result.timing.totalMs,
@@ -114,6 +149,11 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const safe = abort.signal.aborted ? new AppError("REQUEST_TIMEOUT", "分析已取消或超时，请重新获取行情。", 504) : publicError(error);
       send(safe.status, { requestId, error: { code: safe.code, message: safe.message, ...safe.upstream } }, safe.retryAfter ? { "Retry-After": String(safe.retryAfter) } : {});
       const original = error instanceof AppError ? error : undefined;
+      if (isOrder) {
+        logger.error(JSON.stringify({ event: "order_request_failed", requestId, action: orderAction, code: safe.code,
+          httpStatus: safe.status, elapsedMs: now() - startedAt, ...original?.upstream, exception: exceptionChain(error) }));
+        return;
+      }
       logger.error(JSON.stringify({ event: "analysis_failed", requestId, ...trace,
         stage: original?.validation ? "proposal_validation" : trace.stage,
         codeVersion: SOURCE_COMMIT, elapsedMs: now() - startedAt, code: safe.code, httpStatus: safe.status, cancellation,
