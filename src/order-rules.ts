@@ -11,7 +11,7 @@ export interface TradingRules {
   notional: string; multiplierUp: string; multiplierDown: string;
 }
 export interface OrderOption {
-  kind: OrderKind; price: string; triggerPrice?: string; risk: number; notional: number;
+  kind: OrderKind; price: string; triggerPrice?: string; stopLossPrice: string; takeProfitPrice: string; risk: number; notional: number;
 }
 export const DECIMAL = /^\d{1,16}(?:\.\d{1,12})?$/;
 // Normalize to exchange decimal units to keep filter checks exact.
@@ -20,6 +20,7 @@ function units(value: string) {
   return BigInt(whole + fraction.padEnd(12, "0"));
 }
 function onGrid(value: string, limits: Grid) {
+  if (!DECIMAL.test(value)) return false;
   const v = units(value), min = units(limits.min), max = units(limits.max), step = units(limits.step);
   return v > 0n && (min === 0n || v >= min) && (max === 0n || v <= max) && (step === 0n || v % step === 0n);
 }
@@ -28,7 +29,7 @@ function priceText(value: number) {
 }
 const allowedDrift = 30;
 const drift = (price: number, reference: number) => Math.abs(price - reference) / reference * 10000;
-export const TYPES: Record<OrderKind, string> = { market: "MARKET", limit: "LIMIT", conditional: "STOP" };
+const TYPES: Record<OrderKind, string> = { market: "MARKET", limit: "LIMIT", conditional: "STOP" };
 
 export function assertQuote(plan: OrderPlan, quote: Quote, now: number) {
   const mark = Number(quote.mark);
@@ -41,7 +42,7 @@ export function assertQuote(plan: OrderPlan, quote: Quote, now: number) {
 }
 
 export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rules: TradingRules,
-  config: OrderConfig, fixed?: OrderOption): OrderOption | string {
+  config: OrderConfig): OrderOption | string {
   const buy = plan.direction === "long";
   const mark = Number(quote.mark);
   const higher = Number(quote.ask);
@@ -50,16 +51,21 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   const market = kind === "market";
   const conditional = kind === "conditional";
   if (market && plan.status !== "candidate") return "观望状态仅提供价格条件或回踩限价草稿。";
-  const triggerPrice = conditional ? fixed?.triggerPrice ?? priceText(bound) : undefined;
+  const triggerPrice = conditional ? priceText(bound) : undefined;
   const price = market ? (buy ? quote.ask : quote.bid) :
-    fixed?.price ?? priceText(conditional ? bound : buy ? plan.min : plan.max);
+    priceText(conditional ? bound : buy ? plan.min : plan.max);
   const reference = Number(price);
   const quantity = Number(config.quantity);
+  const stopLossPrice = priceText(plan.stop);
+  const takeProfitPrice = priceText(plan.target);
+  const exitsOnSides = buy ? plan.stop < reference && reference < plan.target : plan.target < reference && reference < plan.stop;
+  if (!exitsOnSides) return "止盈和止损须位于预计入场价的两侧，且符合开仓方向。";
+  if (!onGrid(stopLossPrice, rules.price) || !onGrid(takeProfitPrice, rules.price)) return "止盈或止损价格不符合交易所价格步长与上下限。";
   const risk = Math.abs(reference - plan.stop) * quantity;
   const notional = reference * quantity;
   if (!rules.kinds.includes(TYPES[kind]) || (!market && !rules.times.includes(conditional ? "GTC" : "GTX"))) return "交易所未开放此委托类型。";
   if (reference < plan.min || reference > plan.max || (market && (mark < plan.min || mark > plan.max))) return "预计入场价格须在研究入场区内。";
-  if (market && (Number(buy ? quote.askQty : quote.bidQty) < quantity || (fixed && drift(reference, Number(fixed.price)) > allowedDrift))) {
+  if (market && Number(buy ? quote.askQty : quote.bidQty) < quantity) {
     return "盘口深度不足或盘口价格已变化。";
   }
   if (kind === "limit" && (buy ? reference >= higher : reference <= lower)) return "限价已经跨过对手价，无法提交只挂单委托。";
@@ -70,5 +76,5 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   if ((!market && (reference > mark * Number(rules.multiplierUp) || reference < mark * Number(rules.multiplierDown))) ||
     (market ? mark * quantity : notional) + 1e-9 < Number(rules.notional)) return "价格或名义金额不符合交易所过滤器。";
   if (risk > config.maxRisk + 1e-9) return "按研究失效价估算的价差风险超过配置上限。";
-  return { kind, price, ...(triggerPrice ? { triggerPrice } : {}), risk, notional };
+  return { kind, price, ...(triggerPrice ? { triggerPrice } : {}), stopLossPrice, takeProfitPrice, risk, notional };
 }

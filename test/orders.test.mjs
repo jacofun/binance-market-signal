@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac } from "node:crypto";
 import { once } from "node:events";
+import { orderOption } from "../build/order-rules.js";
 import { makeServer } from "../build/server.js";
 import { env, jwt, NOW, provider, modelResult, publicKey } from "./fixtures.mjs";
 
@@ -18,12 +19,12 @@ const readToken = (sub = "owner") => jwt({ scope: "trading:orders:read", sub });
 const submitToken = (draft, at = NOW) => jwt({ scope: "trading:orders:submit",
   iat: Math.floor(at / 1000), exp: Math.floor(at / 1000) + 30, intent: digest(draft) });
 const grid = { minQty: "0.001", maxQty: "20", stepSize: "0.001" };
-function symbolRules(notional = "5") {
+function symbolRules(notional = "5", tickSize = "0.1") {
   return { symbols: [{
     symbol: "BTCUSDT", baseAsset: "BTC", quoteAsset: "USDT", status: "TRADING", contractType: "PERPETUAL",
     orderTypes: ["MARKET", "LIMIT", "STOP"], timeInForce: ["GTC", "GTX"],
     filters: [
-      { filterType: "PRICE_FILTER", minPrice: "1", maxPrice: "1000000", tickSize: "0.1" },
+      { filterType: "PRICE_FILTER", minPrice: "1", maxPrice: "1000000", tickSize },
       { filterType: "LOT_SIZE", ...grid }, { filterType: "MARKET_LOT_SIZE", ...grid },
       { filterType: "MIN_NOTIONAL", notional }, { filterType: "PERCENT_PRICE", multiplierUp: "1.1", multiplierDown: "0.9" },
     ],
@@ -33,29 +34,20 @@ const ossHeader = { "x-oss-request-id": "test-object-request-id" };
 const makeMock = () => {
   const objects = new Map();
   const calls = [];
-  const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, positions: [],
-    hedge: true, versioning: "", post: "accepted", failStoreWrite: false, orders: new Map() };
+  const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, tickSize: "0.1", orders: new Map() };
   async function mockFetch(url, options) {
     const u = new URL(url);
-    const { headers, method, body } = options;
-    calls.push({ host: u.hostname, path: u.pathname, method, params: new URLSearchParams(method === "POST" ? body : u.search) });
+    const { headers, method } = options;
+    calls.push({ host: u.hostname, path: u.pathname, method, params: u.searchParams });
+    assert.equal(method, "GET");
     assert.equal(options.redirect, "error");
     if (u.hostname.endsWith(".aliyuncs.com")) {
       assert.equal(u.hostname, "orders-bucket.oss-cn-hangzhou.aliyuncs.com");
       assert.match(headers.authorization, /^OSS4-HMAC-SHA256 Credential=test-oss-key\/20261118\/cn-hangzhou\/oss\/aliyun_v4_request,Signature=[a-f0-9]{64}$/);
-      if (u.search === "?versioning") return new Response(`<VersioningConfiguration>${state.versioning}</VersioningConfiguration>`);
-      if (method === "GET") return objects.has(u.pathname) ? Response.json(objects.get(u.pathname), { headers: ossHeader }) : new Response(null, { status: 404, headers: ossHeader });
-      if (method === "PUT") {
-        assert.equal(headers["x-oss-forbid-overwrite"], "true");
-        if (state.failStoreWrite && u.pathname.endsWith("/intent.json")) return new Response(null, { status: 403, headers: ossHeader });
-        if (objects.has(u.pathname)) return new Response(null, { status: 409, headers: ossHeader });
-        objects.set(u.pathname, JSON.parse(body));
-        return new Response(null);
-      }
-      if (method === "DELETE") { objects.delete(u.pathname); return new Response(null, { status: 204 }); }
-      throw new Error("Unexpected OSS request");
+      return objects.has(u.pathname) ? Response.json(objects.get(u.pathname), { headers: ossHeader }) :
+        new Response(null, { status: 404, headers: ossHeader });
     }
-    assert.equal(u.hostname, "demo-fapi.binance.com");
+    assert.ok(["demo-fapi.binance.com", "fapi.binance.com"].includes(u.hostname));
     const params = calls.at(-1).params;
     if (headers["X-MBX-APIKEY"]) {
       assert.equal(headers["X-MBX-APIKEY"], settings.BINANCE_API_KEY);
@@ -65,24 +57,12 @@ const makeMock = () => {
       signed.delete("signature");
       assert.equal(createHmac("sha256", settings.BINANCE_API_SECRET).update(signed.toString()).digest("hex"), signature);
     }
-    if (u.pathname.endsWith("/exchangeInfo")) return Response.json(symbolRules(state.notional));
+    if (u.pathname.endsWith("/exchangeInfo")) return Response.json(symbolRules(state.notional, state.tickSize));
     if (u.pathname.endsWith("/premiumIndex")) return Response.json({ symbol: "BTCUSDT", markPrice: state.markPrice, time: state.clock - state.quoteAge });
     if (u.pathname.endsWith("/bookTicker")) return Response.json({ symbol: "BTCUSDT", bidPrice: "9999.9", askPrice: "10000.1",
       askQty: "0.50", bidQty: "0.50", time: state.clock - state.quoteAge });
-    if (u.pathname.endsWith("/dual")) return Response.json({ dualSidePosition: state.hedge });
-    if (u.pathname.endsWith("/positionRisk")) return Response.json(state.positions);
-    if (u.pathname.endsWith("/openOrders") || u.pathname.endsWith("/openAlgoOrders")) return Response.json([]);
     const algo = u.pathname.endsWith("/algoOrder");
     assert.ok(algo || u.pathname.endsWith("/order"));
-    if (method === "POST") {
-      if (state.post === "rejected") return Response.json({ code: -2019, msg: "must never log raw API data" }, { status: 400 });
-      const clientId = params.get(algo ? "clientAlgoId" : "newClientOrderId");
-      const order = algo ? { symbol: "BTCUSDT", algoId: 44, clientAlgoId: clientId, algoStatus: "NEW" } :
-        { symbol: "BTCUSDT", orderId: 45, clientOrderId: clientId, status: "FILLED", executedQty: "0.001", avgPrice: "10000.1" };
-      state.orders.set(clientId, order);
-      if (state.post === "unknown") return Response.json({ code: -1007, msg: "must never log raw API data" }, { status: 503 });
-      return Response.json(order);
-    }
     const order = state.orders.get(params.get(algo ? "clientAlgoId" : "origClientOrderId"));
     return order ? Response.json(order) : Response.json({ code: -2013 }, { status: 400 });
   }
@@ -109,11 +89,11 @@ async function start(t, override = {}) {
     assert.equal(result.http, 200, JSON.stringify(result.data));
     return result.data;
   };
-  const submit = (option, token = submitToken(option.draft, mock.state.clock)) => request({ action: "submit", draft: option.draft }, token, "/orders");
+  const submit = (draft, token = submitToken(draft, mock.state.clock), route = "/orders") => request({ action: "submit", draft }, token, route);
   const query = (analysisId, subject) => request({ action: "status", analysisId }, readToken(subject));
   return { ...mock, analyze, request, preview, submit, query, logs };
 }
-const posts = app => app.calls.filter(call => call.method === "POST" && call.path.startsWith("/fapi/"));
+
 
 test("analysis succeeds with feature disabled, incomplete configuration or an unverifiable order identity", async t => {
   for (const [settings, token] of [
@@ -131,103 +111,91 @@ test("analysis succeeds with feature disabled, incomplete configuration or an un
   }
 });
 
-test("preview lists choices without signed Binance requests or storage writes, and check-only tickets cannot submit", async t => {
+test("candidate previews fix both protective levels and issue no executable draft", async t => {
   const app = await start(t);
   const preview = await app.preview();
   assert.equal(preview.quantity, "0.001");
   assert.equal(preview.mode, "demo");
-  const [market, limit, conditional] = preview.options;
-  assert.deepEqual(preview.options.map(o => o.kind), ["market", "limit", "conditional"]);
-  assert.equal(market.price, "10000.1");
-  assert.equal(limit.price, "9990");
-  assert.equal(conditional.triggerPrice, "10010");
+  assert.deepEqual(preview.options.map(o => [o.kind, o.price, o.triggerPrice]), [
+    ["market", "10000.1", undefined], ["limit", "9990", undefined], ["conditional", "10010", "10010"],
+  ]);
+  for (const option of preview.options) {
+    assert.equal(option.stopLossPrice, "9900");
+    assert.equal(option.takeProfitPrice, "10200");
+    assert.equal(option.draft, undefined);
+  }
+  assert.equal(preview.submission.state, "blocked");
+  assert.equal(preview.submission.code, "ORDER_PROTECTION_UNAVAILABLE");
   assert.ok(app.calls.every(call => call.method === "GET" && !call.params.has("signature")));
-  assert.equal((await app.submit(market, readToken())).http, 401);
-  assert.equal((await app.submit(market, submitToken(limit.draft))).http, 401);
-  const tampered = { draft: market.draft.replace(/^./, "X") };
-  assert.equal((await app.submit(tampered)).data.error.code, "INVALID_ORDER_DRAFT");
   const permit = (await app.analyze()).data.orderPermit;
   assert.equal((await app.request({ action: "preview", permit }, readToken("another-owner"))).http, 400);
-  assert.deepEqual(posts(app), []);
 });
 
-test("concurrent confirmation of different choices can create only one Binance order", async t => {
-  const app = await start(t);
-  const preview = await app.preview();
-  const results = await Promise.all(preview.options.map(option => app.submit(option)));
-  const accepted = results.find(result => result.data.state === "accepted");
-  assert.ok(accepted);
-  assert.equal(results.filter(r => r.http === 409).length, 2);
-  assert.equal(posts(app).length, 1);
-  assert.equal((await app.submit(preview.options[0])).data.error.code, "ORDER_ALREADY_RESERVED");
-  assert.equal((await app.query(preview.analysisId)).data.clientId, accepted.data.clientId);
-  assert.equal((await app.query(preview.analysisId, "other-owner")).data.state, "not_recorded");
-  assert.equal([...app.objects.keys()].filter(path => path.endsWith("/locks/btcusdt.json")).length, 0);
-  assert.equal(posts(app)[0].params.get("positionSide"), "LONG");
-  assert.equal(posts(app)[0].params.get("quantity"), "0.001");
-  assert.equal(posts(app)[0].params.has("closePosition"), false);
-});
-
-test("a conditional uses the signed algo endpoint and market execution stays separate", async t => {
-  const app = await start(t, { SIGNAL_ORDER_QUANTITY: "0.002" });
-  const preview = await app.preview();
-  const result = await app.submit(preview.options.find(option => option.kind === "conditional"));
-  assert.equal(result.data.exchangeStatus, "NEW");
-  const [call] = posts(app);
-  assert.equal(call.path, "/fapi/v1/algoOrder");
-  assert.equal(call.params.get("triggerPrice"), "10010");
-  assert.equal(call.params.get("price"), "10010");
-  assert.equal(call.params.get("workingType"), "MARK_PRICE");
-  assert.equal(call.params.get("algoType"), "CONDITIONAL");
-  assert.equal(call.params.get("timeInForce"), "GTC");
-  assert.equal(call.params.get("quantity"), "0.002");
-  assert.equal((await app.query(preview.analysisId)).data.exchangeStatus, "NEW");
-});
-
-test("failed prechecks never send orders and preserve analysis behavior", async t => {
-  const scenarios = [
-    [{ hedge: false }, "ORDER_HEDGE_MODE_REQUIRED"],
-    [{ positions: [{ symbol: "BTCUSDT", positionAmt: "0.001" }] }, "ORDER_ACCOUNT_BUSY"],
-    [{ markPrice: "10200" }, "ORDER_QUOTE_CHANGED"],
-    [{ quoteAge: 5001 }, "ORDER_QUOTE_CHANGED"],
-    [{ notional: "50" }, "ORDER_RULE_CHANGED"],
-    [{ clock: NOW + 30000 }, "ORDER_DRAFT_EXPIRED"],
-    [{ versioning: "<Status>Suspended</Status>" }, "ORDER_STORAGE_VERSIONING"],
-    [{ failStoreWrite: true }, "ORDER_STORAGE_UNAVAILABLE"],
-  ];
-  for (const [update, expected] of scenarios) {
-    const app = await start(t);
-    const preview = await app.preview();
-    Object.assign(app.state, update);
-    const result = await app.submit(preview.options[0]);
-    assert.equal(result.data.error?.code, expected, JSON.stringify(result));
-    assert.deepEqual(posts(app), []);
+test("valid legacy submission tickets are blocked in both modes and route aliases before touching OSS or Binance", async t => {
+  const oldDraft = `legacy.${"a".repeat(43)}`;
+  for (const override of [{}, { SIGNAL_ORDER_MODE: "live", BINANCE_BASE_URL: "https://fapi.binance.com" }]) {
+    const app = await start(t, override);
+    assert.equal((await app.submit(oldDraft, readToken())).http, 401);
+    assert.equal((await app.submit(oldDraft, submitToken(oldDraft + "x"))).http, 401);
+    const results = await Promise.all(["/orders", "/trade/api/signal/orders"].map(route =>
+      app.submit(oldDraft, submitToken(oldDraft), route)));
+    for (const result of results) {
+      assert.equal(result.http, 409);
+      assert.equal(result.data.error.code, "ORDER_PROTECTION_UNAVAILABLE");
+    }
     assert.equal((await app.analyze()).http, 200);
+    assert.deepEqual(app.calls, []);
+    assert.equal(app.objects.size, 0);
   }
 });
 
-test("ambiguous transmission leaves an OSS lock and status queries can find the accepted order without reposting", async t => {
+test("invalid protective ticks, filters and stale quotes still fail preview without mutating exchange state", async t => {
   const app = await start(t);
-  const preview = await app.preview();
-  app.state.post = "unknown";
-  const first = await app.submit(preview.options[0]);
-  assert.equal(first.data.state, "unknown");
-  assert.equal(first.data.exchangeCode, -1007);
-  assert.equal(first.data.reconciliationRequired, true);
-  assert.equal((await app.query(preview.analysisId)).data.exchangeStatus, "FILLED");
-  const next = await app.preview();
-  assert.equal((await app.submit(next.options[0])).data.error.code, "ORDER_SUBMISSION_LOCKED");
-  assert.equal(posts(app).length, 1);
-  assert.doesNotMatch(app.logs.join(""), /test-binance|test-oss|must never log/);
+  const permit = (await app.analyze()).data.orderPermit;
+  const preview = () => app.request({ action: "preview", permit }, readToken());
+  app.state.tickSize = "7";
+  const offTick = await preview();
+  assert.deepEqual(offTick.data.options, []);
+  assert.match(offTick.data.unavailable.market, /止盈或止损价格/);
+  app.state.tickSize = "0.1";
+  app.state.notional = "50";
+  const lowNotional = await preview();
+  assert.deepEqual(lowNotional.data.options, []);
+  assert.match(lowNotional.data.unavailable.market, /名义金额/);
+  app.state.quoteAge = 5001;
+  assert.equal((await preview()).data.error.code, "ORDER_QUOTE_CHANGED");
+  assert.ok(app.calls.every(call => call.method === "GET"));
 });
 
-test("explicit rejection is durable and does not block another analysis", async t => {
+test("protective levels must straddle the actual preview entry for both directions", () => {
+  const quote = { mark: "10000", bid: "9999.9", ask: "10000.1", bidQty: "1", askQty: "1" };
+  const lot = { min: "0.001", max: "20", step: "0.001" };
+  const rules = { kinds: ["MARKET", "LIMIT", "STOP"], times: ["GTX", "GTC"], lot, marketLot: lot,
+    price: { min: "1", max: "1000000", step: "0.1" }, notional: "5", multiplierUp: "1.1", multiplierDown: "0.9" };
+  const config = { quantity: "0.001", maxRisk: 1 };
+  const plan = { status: "candidate", min: 9990, max: 10010 };
+  assert.equal(orderOption("market", { ...plan, direction: "short", stop: 10100, target: 9800 }, quote, rules, config).takeProfitPrice, "9800");
+  assert.match(orderOption("market", { ...plan, direction: "long", stop: 9900, target: 10000.1 }, quote, rules, config), /两侧/);
+  assert.match(orderOption("market", { ...plan, direction: "short", stop: 9999.8, target: 9800 }, quote, rules, config), /两侧/);
+  assert.match(orderOption("conditional", { ...plan, direction: "long", stop: 9900, target: 10009 }, quote, rules, config), /两侧/);
+});
+
+test("legacy accepted, uncertain and rejected records remain readable only by their owner", async t => {
   const app = await start(t);
-  app.state.post = "rejected";
   const preview = await app.preview();
-  assert.equal((await app.submit(preview.options[0])).data.state, "rejected");
+  const key = `/private/market-signal-orders/v1/demo/attempts/${digest("owner")}/${preview.analysisId}`;
+  const clientId = "legacy-entry-id";
+  app.objects.set(`${key}/intent.json`, { kind: "market", clientId });
+  app.objects.set(`${key}/result.json`, { state: "unknown", checkedAt: NOW, exchangeCode: -1007 });
+  const pending = await app.query(preview.analysisId);
+  assert.equal(pending.data.state, "unknown");
+  assert.equal(pending.data.lookupUnavailable, true);
+  app.state.orders.set(clientId, { symbol: "BTCUSDT", orderId: 45, clientOrderId: clientId,
+    status: "FILLED", executedQty: "0.001", avgPrice: "10000.1" });
+  assert.equal((await app.query(preview.analysisId)).data.exchangeStatus, "FILLED");
+  assert.equal((await app.query(preview.analysisId, "other-owner")).data.state, "not_recorded");
+  app.objects.set(`${key}/result.json`, { state: "rejected", checkedAt: NOW, exchangeCode: -2019 });
   assert.equal((await app.query(preview.analysisId)).data.exchangeCode, -2019);
-  const next = await app.preview();
-  app.state.post = "accepted";
-  assert.equal((await app.submit(next.options[0])).data.exchangeStatus, "FILLED");
+  assert.ok(app.calls.every(call => call.method === "GET"));
+  assert.doesNotMatch(app.logs.join(""), /test-binance|test-oss/);
 });
