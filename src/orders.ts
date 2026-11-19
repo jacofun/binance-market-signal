@@ -1,5 +1,5 @@
 import { AppError, exceptionChain } from "./errors.js";
-import { ORDER_ID, SEALED, digest, object, orderSubject, seal, unseal, type OrderConfig, type OrderPlan } from "./order-auth.js";
+import { ORDER_ID, ORDER_REFERENCE, digest, loadOrderReference, orderSubject, storeOrderReference, type OrderConfig, type OrderPlan } from "./order-auth.js";
 import { assertQuote, orderOption, type OrderKind } from "./order-rules.js";
 import type { ExchangeOrder, OrderExchange } from "./order-binance.js";
 import type { OrderStore } from "./order-oss.js";
@@ -8,7 +8,6 @@ import { isProtectedIntent, makeProtectedExecution, supportsExits, type Protecte
 interface Reservation { kind: OrderKind; clientId: string }
 interface Outcome extends ExchangeOrder { checkedAt: number; reason?: string }
 
-const protectedDraftPurpose = "submit-protected-v2";
 const symbol = "BTCUSDT";
 const kinds: OrderKind[] = ["market", "limit", "conditional"];
 const alreadySent = () => new AppError("ORDER_ALREADY_RESERVED", "本次研究已有提交记录，请查询订单。", 409);
@@ -52,7 +51,7 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
       else if (kind === "market" && supportsExits(rules) && await execution.ready()) {
         enabled = true;
         options.push({ ...option,
-          draft: seal(config, protectedDraftPurpose, { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft) });
+          draft: await storeOrderReference(store, config, "market", { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft) });
       }
       else options.push(option);
     }
@@ -68,14 +67,14 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
     }
     if (input.action === "preview" && Object.keys(input).length === 2) {
       const owner = digest(orderSubject(token, config, "trading:orders:read", now()));
-      const plan = unseal<OrderPlan>(config, "research", input.permit);
-      if (!object(plan) || plan.owner !== owner) throw invalidRequest();
+      const plan = await loadOrderReference<OrderPlan>(store, config, "research", input.permit);
+      if (plan.owner !== owner) throw invalidRequest();
       return preview(plan);
     }
-    if (input.action === "submit" && Object.keys(input).length === 2 && typeof input.draft === "string" && SEALED.test(input.draft)) {
+    if (input.action === "submit" && Object.keys(input).length === 2 && typeof input.draft === "string" && ORDER_REFERENCE.test(input.draft)) {
       const owner = digest(orderSubject(token, config, "trading:orders:submit-protected", now(), digest(input.draft)));
-      const draft = unseal<ProtectedDraft>(config, protectedDraftPurpose, input.draft);
-      if (!object(draft) || draft.plan?.owner !== owner || draft.option?.kind !== "market") throw invalidRequest();
+      const draft = await loadOrderReference<ProtectedDraft>(store, config, "market", input.draft);
+      if (draft.plan?.owner !== owner || draft.option?.kind !== "market") throw invalidRequest();
       return execution.submit(draft);
     }
     throw invalidRequest();

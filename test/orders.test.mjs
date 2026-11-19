@@ -2,19 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, createHmac, verify } from "node:crypto";
 import { once } from "node:events";
+import { request as httpRequest } from "node:http";
 import { loadOrderConfig } from "../build/order-auth.js";
 import { loadOssConfig } from "../build/oss-config.js";
 import { orderOption } from "../build/order-rules.js";
 import { makeServer } from "../build/server.js";
 import { env, jwt, NOW, provider, modelResult, publicKey } from "./fixtures.mjs";
 
-const recoverySecret = "a".repeat(64);
 const settings = {
   ...env, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: "https://demo-fapi.binance.com",
   BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret",
   ACCESS_KEY_ID: "test-oss-key", ACCESS_KEY_SECRET: "test-oss-secret-123",
   OSS_BUCKET: "orders-bucket", OSS_REGION: "cn-hangzhou",
-  SIGNAL_ORDER_SIGNING_SECRET: "b".repeat(64), SIGNAL_ORDER_RECOVERY_SECRET: recoverySecret,
 };
 const digest = text => createHash("sha256").update(text).digest("hex");
 const readToken = (sub = "owner", at = NOW) => jwt({ scope: "trading:orders:read", sub,
@@ -42,7 +41,7 @@ const makeMock = () => {
   const objects = new Map();
   const calls = [];
   const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, tickSize: "0.1", orders: new Map(),
-    positions: [], entryQty: "0.001", entryStatus: "FILLED", entryFault: "", stopFault: "", targetFault: "", versioning: "", failIntent: false };
+    positions: [], entryQty: "0.001", entryStatus: "FILLED", entryFault: "", stopFault: "", targetFault: "", versioning: "", failIntent: false, failTemporary: false };
   async function mockFetch(url, options) {
     const u = new URL(url);
     const { headers, method } = options;
@@ -54,6 +53,7 @@ const makeMock = () => {
       if (u.search === "?versioning") return new Response(`<VersioningConfiguration>${state.versioning}</VersioningConfiguration>`);
       if (method === "PUT") {
         if (state.failIntent && u.pathname.endsWith("/intent.json")) return new Response(null, { status: 503, headers: ossHeader });
+        if (state.failTemporary && u.pathname.includes("/temporary/")) return new Response(null, { status: 503, headers: ossHeader });
         if (headers["x-oss-forbid-overwrite"] === "true" && objects.has(u.pathname)) return new Response(null, { status: 409, headers: ossHeader });
         objects.set(u.pathname, JSON.parse(options.body));
         return new Response(null);
@@ -133,6 +133,16 @@ async function start(t, override = {}) {
       headers: { "content-type": "application/json", ...(token ? { "X-JWT-Token": token } : {}), ...extraHeaders }, body: JSON.stringify(data) });
     return { http: response.status, data: await response.json() };
   };
+  const directOrder = async (data, token) => {
+    // Fetch can override Host. Use the HTTP client to model the gateway's raw request.
+    const req = httpRequest(`http://127.0.0.1:${server.address().port}/orders`, { method: "POST",
+      headers: { Host: "default.ap-southeast-1.fcapp.run", "X-JWT-Token": token, "content-type": "application/json" } });
+    req.end(JSON.stringify(data));
+    const [response] = await once(req, "response");
+    const chunks = [];
+    for await (const chunk of response) chunks.push(chunk);
+    return { http: response.statusCode, data: JSON.parse(Buffer.concat(chunks).toString()) };
+  };
   const analyze = (token = jwt()) => request({ symbol: "BTCUSDT" }, token, "/trade/api/signal/analyze");
   const preview = async () => {
     const { data } = await analyze();
@@ -143,9 +153,10 @@ async function start(t, override = {}) {
   };
   const submit = (draft, token = submitToken(draft, mock.state.clock), route = "/orders") => request({ action: "submit", draft }, token, route);
   const query = (analysisId, subject) => request({ action: "status", analysisId }, readToken(subject, mock.state.clock));
-  const recover = (secret = recoverySecret) => request({ triggerName: "market-order-protection",
-    triggerTime: new Date(mock.state.clock).toISOString(), payload: secret }, undefined, "/invoke", { "x-fc-request-id": "fc-test" });
-  return { ...mock, analyze, request, preview, submit, query, logs, recover };
+  const recover = (triggerTime = new Date(mock.state.clock).toISOString(), controlPath = "/invoke") =>
+    request({ triggerName: "market-order-protection", triggerTime }, undefined, "/invoke",
+      { "x-fc-request-id": "fc-test", "x-fc-control-path": controlPath });
+  return { ...mock, analyze, request, preview, submit, query, logs, recover, directOrder };
 }
 
 
@@ -176,7 +187,30 @@ test("FC verifies signatures and order routes still require exact claims and sco
   }
   assert.equal((await app.request(action, readToken(), "/invoke", { "x-fc-request-id": "ram-test" })).http, 404);
   assert.equal((await app.request(action, undefined, "/invoke", { "x-fc-request-id": "ram-test" })).http, 401);
+  assert.equal((await app.directOrder(action, readToken())).data.error.code, "CUSTOM_DOMAIN_REQUIRED");
   assert.deepEqual(app.calls, []);
+});
+
+test("orders use opaque, owner-bound OSS references and research survives an OSS write error", async t => {
+  const app = await start(t);
+  const { data: analysis } = await app.analyze();
+  const permit = analysis.orderPermit;
+  assert.match(permit, /^v3\.[A-Za-z0-9_-]{43}$/);
+  const key = [...app.objects.keys()].find(p => p.endsWith(`/research/${digest(permit)}.json`));
+  assert.equal(app.objects.get(key).id, analysis.analysisId);
+  assert.equal(app.objects.get(key).owner, digest("owner"));
+  assert.equal((await app.request({ action: "preview", permit }, readToken("another"))).http, 400);
+
+  app.state.clock = analysis.timing.validUntil + 1;
+  const expired = await app.request({ action: "preview", permit }, readToken("owner", app.state.clock));
+  assert.equal(expired.data.error.code, "ORDER_DRAFT_EXPIRED");
+  app.state.clock = NOW;
+  app.state.failTemporary = true;
+  const { http, data } = await app.analyze();
+  assert.equal(http, 200);
+  assert.equal(data.orderPermit, undefined);
+  assert.ok(app.logs.some(line => line.includes("order_permit_unavailable") && line.includes("ORDER_STORAGE_UNAVAILABLE")));
+  assert.deepEqual(mutations(app), []);
 });
 
 test("scanner and orders share one bucket and preserve existing order storage across an upgrade", () => {
@@ -209,7 +243,7 @@ test("candidate previews fix both protective levels and issue no executable draf
     assert.equal(option.draft, undefined);
   }
   assert.equal(preview.submission.state, "blocked");
-  assert.ok(app.calls.every(call => call.method === "GET" && !call.params.has("signature")));
+  assert.ok(app.calls.filter(call => call.path.startsWith("/fapi/")).every(call => call.method === "GET" && !call.params.has("signature")));
   const permit = (await app.analyze()).data.orderPermit;
   assert.equal((await app.request({ action: "preview", permit }, readToken("another-owner"))).http, 400);
 });
@@ -226,9 +260,9 @@ test("valid legacy submission tickets are blocked in both modes and route aliase
       assert.equal(result.http, 400);
       assert.equal(result.data.error.code, "INVALID_ORDER_DRAFT");
     }
-    assert.equal((await app.analyze()).http, 200);
     assert.deepEqual(app.calls, []);
     assert.equal(app.objects.size, 0);
+    assert.equal((await app.analyze()).http, 200);
   }
 });
 
@@ -247,7 +281,7 @@ test("invalid protective ticks, filters and stale quotes still fail preview with
   assert.match(lowNotional.data.unavailable.market, /名义金额/);
   app.state.quoteAge = 5001;
   assert.equal((await preview()).data.error.code, "ORDER_QUOTE_CHANGED");
-  assert.ok(app.calls.every(call => call.method === "GET"));
+  assert.ok(app.calls.filter(call => call.path.startsWith("/fapi/")).every(call => call.method === "GET"));
 });
 
 test("protective levels must straddle the actual preview entry for both directions", () => {
@@ -279,7 +313,7 @@ test("legacy accepted, uncertain and rejected records remain readable only by th
   assert.equal((await app.query(preview.analysisId, "other-owner")).data.state, "not_recorded");
   app.objects.set(`${key}/result.json`, { state: "rejected", checkedAt: NOW, exchangeCode: -2019 });
   assert.equal((await app.query(preview.analysisId)).data.exchangeCode, -2019);
-  assert.ok(app.calls.every(call => call.method === "GET"));
+  assert.ok(app.calls.filter(call => call.path.startsWith("/fapi/")).every(call => call.method === "GET"));
   assert.doesNotMatch(app.logs.join(""), /test-binance|test-oss/);
 });
 
@@ -288,7 +322,8 @@ const entryDraft = preview => preview.options.find(option => option.kind === "ma
 
 async function executionFixture(t) {
   const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });
-  assert.equal((await app.recover("c".repeat(64))).http, 401);
+  assert.equal((await app.recover(undefined, "/http-invoke")).http, 401);
+  assert.equal((await app.recover("not-a-time")).data.error.code, "INVALID_ORDER_RECOVERY_TIMER");
   assert.equal(app.calls.length, 0);
   assert.equal((await app.preview()).submission.state, "blocked");
   assert.equal((await app.recover()).http, 200);
@@ -303,7 +338,8 @@ test("owner-confirmed entry runs once and attaches stop then take profit to the 
   const { app, preview, draft } = await executionFixture(t);
   assert.equal((await app.submit(draft, jwt({ scope: "trading:orders:submit", exp: NOW / 1000 + 30, intent: digest(draft) }))).http, 401);
   assert.equal((await app.submit(draft, readToken())).http, 401);
-  assert.equal((await app.submit("X" + draft.slice(1))).data.error.code, "INVALID_ORDER_DRAFT");
+  const badReference = draft.replace(/^v3\.[A-Za-z0-9_-]/, draft.startsWith("v3.A") ? "v3.B" : "v3.A");
+  assert.equal((await app.submit(badReference)).data.error.code, "INVALID_ORDER_DRAFT");
   app.state.entryQty = "0.0005";
   app.state.entryStatus = "EXPIRED";
   const responses = await Promise.all([app.submit(draft), app.submit(draft)]);

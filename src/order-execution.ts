@@ -58,7 +58,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     catch (error) { report({ event: "order_entry_receipt_write_failed", ...context(intent), ...detailedError(error) }); }
   }
   async function ready() {
-    if (!config.executionEnabled || !config.recoverySecret) return false;
+    if (!config.executionEnabled) return false;
     const pulse = await store.read(heartbeatPath);
     return object(pulse) && pulse.apiKeyHash === credentials && Number.isSafeInteger(pulse.at) &&
       Number(pulse.at) <= now() + 3000 && now() - Number(pulse.at) <= 90000;

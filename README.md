@@ -2,7 +2,7 @@
 
 新加坡（`ap-southeast-1`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
 
-一次请求依次获取币安公开行情、计算收盘 K 线特征与价格区域、让百炼模型研究、用程序校验结构和复核标记价格，最后返回 V4 研究结果。原始行情、提示词和分析结果均不写 OSS、数据库或本地磁盘。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
+一次请求依次获取币安公开行情、计算收盘 K 线特征与价格区域、让百炼模型研究、用程序校验结构和复核标记价格，最后返回 V4 研究结果。函数不保存原始行情、提示词或完整分析结果。开启订单功能且生成有效候选时，只将交易计划所需字段暂存到私有 OSS。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
 
 ## 接口
 
@@ -56,9 +56,9 @@ FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证
 
 模型失败时，HTTP 错误响应和 `analysis_failed` 日志保留 `upstreamStatus`，并按可用情况提供 `upstreamCode`、`upstreamRequestId`。上游错误正文只进行最多 8 KiB 的有界读取，代码仅允许已知错误码和 UUID/32位十六进制请求编号进入诊断字段；原始错误消息、未知字段和 HTML 不记录或透传。不自动重试。`MODEL_UNAVAILABLE` 加 `upstreamStatus=400` 应优先检查参数；404 检查模型 ID、开通状态和地域；5xx 根据上游请求编号排查服务异常。
 
-签名公钥、issuer/audience 等策略只保留在 FC 实际回源入口。函数读取平台已验证 JWT 的 sub 和过期时间，不再重复验签，也不单独限制 market:analyze。业务鉴权不要求 `x-fc-control-path`、`x-fc-function-name` 或 `x-fc-request-id`；这些运行时元数据不构成密码学证明，缺失或取值不同不会拦截分析请求。信任边界是 FC 原生 JWT 入口，部署前后继续审计入口鉴权。禁止在无验签网关的普通 HTTP 服务器上公开这个处理器。
+函数的 HTTP 请求由 FC 自定义域名上的原生 JWT 策略验签，函数读取 `X-JWT-Token` 里的声明。分析使用 `sub` 和 `exp`，HTTP 业务请求无需附带 `x-fc-*` 元数据。信任边界是 FC 的原生 JWT 入口，默认 FC 域名的业务 POST 会被拒绝。
 
-CI 在写入前和部署后审计所有 HTTP 触发器以及指向该函数的 FC 自定义域名。分析、扫描列表和订单的 POST 请求须经 FC 原生 JWT 验签，唯一票据来源为 `X-JWT-Token`。默认函数 URL 如继续使用 RAM 签名，HTTP 触发器的方法只能包含 GET、HEAD 或 OPTIONS。如果该触发器当前允许 POST，请在 FC 控制台将其也配置为原生 JWT，或移除该触发器的 POST 方法并由 JWT 自定义域名接收业务流量。关闭默认公网 URL 也会检查方法配置。定时任务和 CI 的 `InvokeFunction` 健康检查经独立的 `/invoke` 事件入口调用。CI 只读鉴权配置，发现匿名入口、业务路径免鉴权或 RAM HTTP 触发器可接收 POST 时停止部署。精确的健康检查路径可作为例外。
+CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定义域名回源。CI 仅更新并验证函数代码、运行时、版本及健康状态，FC 控制台负责维护自定义域名和鉴权策略。定时任务经独立的 `/invoke` 事件入口调用，运行时要求 FC 标记的事件类型。
 
 网站复用 `POST /api/private-auth/trading/binance/token`，沿用现有 `BINANCE_SYNC_*` 签名配置以及 `aud=binance-trade-sync, scope=trading:sync`，不需要新增签名接口或环境变量。交易日志页的“分析交易机会”获取短期凭证后直接请求 `/trade/api/signal/analyze`；北京不代理行情和模型调用。凭证仅驻留当前请求内存，不落浏览器存储。同一交易凭证授权这个域名内的同步与分析两项能力，签发接口继续限制 owner、登录态、Origin 和 CSRF。
 
@@ -156,7 +156,7 @@ MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 - `ALIYUN_FC_ACCESS_KEY_ID`
 - `ALIYUN_FC_ACCESS_KEY_SECRET`
 
-RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:InvokeFunction`，以及只读鉴权审计的 `fc:ListTriggers`、`fc:GetTrigger`、`fc:ListCustomDomains`、`fc:GetCustomDomain`。不需要OSS或镜像仓库权限。
+部署 RAM 身份只需目标函数的 `fc:GetFunction`、`fc:UpdateFunction` 和 `fc:InvokeFunction`。
 
 部署前核对现有 `binance-market-signal`：`ap-southeast-1`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
 
@@ -182,18 +182,18 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 | --- | --- |
 | `SIGNAL_ORDER_MODE` | 默认关闭。`demo` 使用测试网行情，`live` 使用生产行情。需要单独启用执行。 |
 | `SIGNAL_ORDER_EXECUTE` | 执行开关，默认关闭。设为 `true` 且保护恢复任务就绪才允许新开仓。 |
-| `SIGNAL_ORDER_RECOVERY_SECRET` | 用 `openssl rand -hex 32` 生成的 64 位小写十六进制密钥，对应 FC 定时触发器消息。 |
 | `BINANCE_BASE_URL` | 对应币安 USDT-M HTTPS 根地址。实盘只接受 `https://fapi.binance.com`，测试只接受 `https://demo-fapi.binance.com` 或 `https://testnet.binancefuture.com`。 |
 | `BINANCE_API_KEY`、`BINANCE_API_SECRET` | 对应环境的 Binance HMAC 密钥。预览和查单使用合约读取权限。执行需开通合约交易权限并限制来源 IP。 |
 | `SIGNAL_ORDER_QUANTITY` | BTC 数量，默认 `0.001`。交易所步长或最低名义额不满足时拦截，保留配置数量。 |
 | `SIGNAL_ORDER_MAX_RISK_USDT` | 入场参考价至止损价的计划价差风险上限，默认 `1`，单位 USDT。 |
-| `SIGNAL_ORDER_SIGNING_SECRET` | 签封研究凭据与订单草稿的 64 位十六进制密钥，沿用现有值。 |
 
 北京私有鉴权函数配置 `BINANCE_ORDER_TICKETS_ENABLED=true` 才会签发订单预览和提交票据。CDN 透传 `X-JWT-Token` 与请求体，保留订单路径或统一改写成 `/orders`，关闭缓存与自动重试。
 
-启用执行前，在信号函数上配置 FC 定时触发器 `market-order-protection`，调度 `0 * * * * *`，触发消息值使用 `SIGNAL_ORDER_RECOVERY_SECRET` 的值。事件走 FC 的 `POST /invoke`，无需配置公开的恢复路由。等待日志 `order_protection_recovery` 出现后再打开执行开关。恢复心跳超过 90 秒时拒绝新开仓。关闭执行开关后定时任务仍继续处理现有仓位，保留密钥和触发器直到仓位结束。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
+启用执行前，在信号函数上配置 FC 定时触发器 `market-order-protection`，调度 `0 * * * * *`，触发消息可以留空。事件走 FC 的 `POST /invoke`。等待日志 `order_protection_recovery` 出现后再打开执行开关。恢复心跳超过 90 秒时拒绝新开仓。关闭执行开关后定时任务仍继续处理现有仓位，保留触发器和币安凭证直到仓位结束。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
 
-预览与历史查单需 `oss:GetObject`。执行还需桶级 `oss:GetBucketVersioning`、订单前缀下 `oss:PutObject` 和对 `locks/btcusdt.json` 的 `oss:DeleteObject`。同一账户和模式的所有实例使用相同 OSS 桶和前缀。保留激活锁及执行记录，持仓期间不要更换币安 API Key、模式或前缀。遇到 `order_entry_unresolved`、`order_protection_requires_attention` 或 `ORDER_RECOVERY_RELEASE`，按分析编号及客户端订单编号核对成交、持仓和保护单。仅在停用新执行、确认无在途请求与未处置仓位后清理孤立锁。先使用测试网验证 FC、OSS 和币安链路，再启用实盘。
+研究订单引用和市价草稿由共用私有 OSS 按随机引用保存，客户端继续使用原有字段和票据流程。订单前缀下的 `<mode>/temporary/` 存放短时凭据，程序按有效期拒绝过期请求，可以在 OSS 对该精确前缀设一天的生命周期删除。部署后旧版待确认草稿需要重新分析生成，已提交订单和在途保护记录保持原路径。可从 FC 环境变量删除 `SIGNAL_ORDER_SIGNING_SECRET` 和 `SIGNAL_ORDER_RECOVERY_SECRET`。
+
+预览需要 `oss:GetObject` 和 `oss:PutObject` 读取及写入短时凭据，历史查单使用 `oss:GetObject`。执行还需桶级 `oss:GetBucketVersioning`、订单前缀下 `oss:PutObject` 和对 `locks/btcusdt.json` 的 `oss:DeleteObject`。同一账户和模式的所有实例使用相同 OSS 桶和前缀。保留激活锁及执行记录，持仓期间不要更换币安 API Key、模式或前缀。遇到 `order_entry_unresolved`、`order_protection_requires_attention` 或 `ORDER_RECOVERY_RELEASE`，按分析编号及客户端订单编号核对成交、持仓和保护单。仅在停用新执行、确认无在途请求与未处置仓位后清理孤立锁。先使用测试网验证 FC、OSS 和币安链路，再启用实盘。
 
 ## BTCUSDT 自动扫描
 

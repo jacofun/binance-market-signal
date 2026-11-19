@@ -8,7 +8,7 @@ import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
-import { authorizeRecovery, loadOrderConfig, makeOrderPermit, orderSubject, type OrderConfig } from "./order-auth.js";
+import { loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
 import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
@@ -21,6 +21,7 @@ const ANALYSIS_PATHS = new Set(["/", "/analyze", "/trade/api/signal", "/trade/ap
 const ORDER_PATHS = new Set(["/orders", "/trade/api/signal/orders"]);
 const SCAN_PATHS = new Set(["/scans", "/trade/api/signal/scans"]);
 const HEALTH_PATHS = new Set(["/", "/health", "/trade/api/signal", "/trade/api/signal/health"]);
+const DEFAULT_FC_HOST = /\.(?:fcapp\.run|aliyuncs\.com)(?:\.)?(?::\d+)?$/i;
 async function body(req: IncomingMessage, ramProbe = false): Promise<Record<string, unknown>> {
   const type = req.headers["content-type"] || "";
   if (!/^application\/json(?:\s*;|$)/i.test(type) && !(ramProbe && /^application\/octet-stream(?:\s*;|$)/i.test(type))) throw new AppError("UNSUPPORTED_MEDIA_TYPE", "请使用 application/json。", 415);
@@ -93,9 +94,9 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if ((path === "/" || path === "/invoke") && req.headers["x-fc-request-id"] && !req.headers[TOKEN_HEADER.toLowerCase()]) {
         const input = await body(req, true);
         if (Object.keys(input).length === 1 && input.action === "health") { send(200, health()); return; }
-        // The timer is routed by FC's event invocation endpoint. Public HTTP
-        // ingress remains subject to the existing JWT policy audited by CI.
-        if (path === "/invoke" && !origin && input.triggerName === SCANNER_TRIGGER) {
+        // FC reserves x-fc-* headers and marks event invocations as /invoke.
+        const timerEvent = path === "/invoke" && !origin && req.headers["x-fc-control-path"] === "/invoke";
+        if (timerEvent && input.triggerName === SCANNER_TRIGGER) {
           scanAction = "run";
           validateScanTimer(input, now());
           const result = await makeMarketScanner(env, now, scannerFetch).run(requestId);
@@ -104,11 +105,11 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           else logger.info(JSON.stringify(log));
           send(200, { requestId, ...result }); return;
         }
-        if (path === "/invoke" && !origin && input.triggerName === "market-order-protection") {
+        if (timerEvent && input.triggerName === "market-order-protection") {
           isOrder = true;
           orderAction = "recover";
+          validateRecoveryTimer(input, now());
           const settings = ordersConfig();
-          authorizeRecovery(input, settings, now());
           const execution = makeProtectedExecution(settings, makeOrderStore(settings, now, orderFetch),
             makeOrderExchange(settings, now, orderFetch), now, event => logger.info(JSON.stringify({ requestId, ...event })));
           const result = await execution.recover();
@@ -118,6 +119,11 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         throw new AppError("UNAUTHORIZED", "分析请求需要 X-JWT-Token。", 401);
       }
       if (path === "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
+      // The gateway routes HTTP using Host and forwards the original request.
+      // Default FC URLs may be anonymous, so business routes use the JWT domain.
+      if (DEFAULT_FC_HOST.test(req.headers.host || "")) {
+        throw new AppError("CUSTOM_DOMAIN_REQUIRED", "请使用启用 JWT 的 FC 自定义域名。", 403);
+      }
       if (req.rawHeaders.filter((_, i) => i % 2 === 0 && req.rawHeaders[i]!.toLowerCase() === TOKEN_HEADER.toLowerCase()).length !== 1) {
         throw new AppError("UNAUTHORIZED", "请提供唯一的 X-JWT-Token。", 401);
       }
@@ -162,11 +168,13 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         try {
           const settings = ordersConfig();
           const owner = orderSubject(token, settings, "trading:sync", now());
-          orderPermit = makeOrderPermit(result, settings, owner, now());
+          const plan = makeOrderPermit(result, owner, now());
+          if (plan) orderPermit = await storeOrderReference(makeOrderStore(settings, now, orderFetch), settings, "research", plan);
         } catch (error) {
           logger.info(JSON.stringify({ event: "order_permit_unavailable", requestId,
             code: error instanceof AppError ? error.code : "INTERNAL_ERROR",
             configurationField: error instanceof AppError ? error.configurationField : undefined,
+            ...(error instanceof AppError ? error.upstream : {}),
           }));
         }
       }

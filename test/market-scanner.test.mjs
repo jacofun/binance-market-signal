@@ -103,7 +103,7 @@ async function server(t, envOverride = {}, marketFailure = false) {
       headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(input) });
     return { status: response.status, data: await response.json() };
   };
-  const invoke = (input = timer, headers = {}) => post("/invoke", input, { "x-fc-request-id": "fc-test", ...headers });
+  const invoke = (input = timer, headers = {}) => post("/invoke", input, { "x-fc-request-id": "fc-test", "x-fc-control-path": "/invoke", ...headers });
   return { post, invoke, calls, objects, logs, state, modelCalls: () => modelCalls };
 }
 
@@ -167,6 +167,7 @@ test("at a publication delay the scanner uses the preceding closed candle, then 
 test("invalid events are rejected and an earlier failure never stops the next invocation", async t => {
   const app = await server(t, {}, true);
   assert.equal((await app.post("/invoke", timer)).status, 404);
+  assert.equal((await app.invoke(timer, { "x-fc-control-path": "/http-invoke" })).status, 401);
   assert.equal((await app.invoke({ ...timer, triggerTime: "bad-time" })).data.error.code, "INVALID_SCAN_TIMER");
   assert.equal((await app.invoke(timer, { Origin: "https://yanxiao.me" })).status, 401);
   assert.equal((await app.invoke({ ...timer, triggerName: "unknown" })).status, 401);
