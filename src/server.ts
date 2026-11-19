@@ -1,11 +1,11 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
-import { AppError, publicError } from "./errors.js";
+import { AppError, exceptionChain, publicError } from "./errors.js";
 import { makeAuthorizer, TOKEN_HEADER } from "./auth.js";
 import { loadConfig, type Config, type Env } from "./config.js";
 import { RestMarketDataProvider } from "./market.js";
 import { WebSocketMarketDataProvider } from "./websocket-market.js";
-import { analyze, type Model } from "./analysis.js";
+import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
 
@@ -28,7 +28,7 @@ async function body(req: IncomingMessage, ramProbe = false): Promise<Record<stri
     const value: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
     return value as Record<string, unknown>;
-  } catch { throw new AppError("INVALID_REQUEST", "请求体必须为 JSON 对象。", 400); }
+  } catch (error) { throw new AppError("INVALID_REQUEST", "请求体必须为 JSON 对象。", 400, undefined, undefined, { cause: error }); }
 }
 function health() { return { status: "ok", service: "binance-market-signal", codeVersion: SOURCE_COMMIT, nodeMajor: Number(process.versions.node.split(".")[0]) }; }
 export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console }: {
@@ -42,6 +42,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
   const cooldowns = new Map<string, number>();
   const server = createServer(async (req, res) => {
     const requestId = randomUUID();
+    const startedAt = now();
+    const trace: { stage: "request" | AnalysisStage; symbol?: string; style?: Style } = { stage: "request" };
     const origin = req.headers.origin;
     const cors = origin && ORIGINS.has(origin) ? { "Access-Control-Allow-Origin": origin } : {};
     const headers = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-Request-Id": requestId, Vary: "Origin", ...cors };
@@ -51,7 +53,12 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
     let acquired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const abort = new AbortController();
-    const disconnected = () => { if (!res.writableEnded) abort.abort(); };
+    let cancellation: "client_disconnected" | "request_deadline" | undefined;
+    const cancel = (reason: typeof cancellation) => {
+      cancellation ??= reason;
+      abort.abort();
+    };
+    const disconnected = () => { if (!res.writableEnded) cancel("client_disconnected"); };
     try {
       const url = new URL(req.url || "/", "http://localhost");
       const path = url.pathname.length > 1 ? url.pathname.replace(/\/$/, "") : url.pathname;
@@ -86,6 +93,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       }
       config ||= loadConfig(env);
       if (!config.symbols.includes(input.symbol)) throw new AppError("SYMBOL_NOT_ALLOWED", "交易对不在 SIGNAL_ALLOWED_SYMBOLS 中。", 400);
+      trace.symbol = input.symbol;
+      trace.style = (input.style || "trend") as Style;
       if (active) throw new AppError("BUSY", "实例正在分析，请稍后重新获取行情。", 429, 5);
       const previous = cooldowns.get(sub);
       if (previous !== undefined && now() - previous < config.cooldownMs) throw new AppError("COOLDOWN", "请稍后重新获取行情。", 429, Math.ceil((config.cooldownMs - now() + previous) / 1000));
@@ -94,14 +103,23 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       cooldowns.set(sub, now());
       market ||= config.mode === "websocket" ? new WebSocketMarketDataProvider(config) : new RestMarketDataProvider(config);
       req.on("aborted", disconnected); res.on("close", disconnected);
-      timer = setTimeout(() => abort.abort(), config.requestTimeoutMs); timer.unref();
-      const result = await analyze(config, market, input.symbol, (input.style || "trend") as Style, abort.signal, model, now);
+      timer = setTimeout(() => cancel("request_deadline"), config.requestTimeoutMs); timer.unref();
+      const result = await analyze(config, market, trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
       send(200, { requestId, ...result });
-      logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId, symbol: input.symbol, status: result.status, totalMs: result.timing.totalMs }));
+      logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId,
+        symbol: trace.symbol, style: trace.style, status: result.status, codeVersion: SOURCE_COMMIT,
+        marketMs: result.timing.marketMs, modelMs: result.timing.modelMs, verificationMs: result.timing.verificationMs, totalMs: result.timing.totalMs,
+      }));
     } catch (error) {
       const safe = abort.signal.aborted ? new AppError("REQUEST_TIMEOUT", "分析已取消或超时，请重新获取行情。", 504) : publicError(error);
       send(safe.status, { requestId, error: { code: safe.code, message: safe.message, ...safe.upstream } }, safe.retryAfter ? { "Retry-After": String(safe.retryAfter) } : {});
-      logger.error(JSON.stringify({ event: "analysis_failed", requestId, code: safe.code, ...safe.upstream }));
+      const original = error instanceof AppError ? error : undefined;
+      logger.error(JSON.stringify({ event: "analysis_failed", requestId, ...trace,
+        stage: original?.validation ? "proposal_validation" : trace.stage,
+        codeVersion: SOURCE_COMMIT, elapsedMs: now() - startedAt, code: safe.code, httpStatus: safe.status, cancellation,
+        ...original?.upstream, validation: original?.validation, marketEndpoint: original?.marketEndpoint,
+        marketHttpStatus: original?.marketHttpStatus, exception: exceptionChain(error),
+      }));
     } finally {
       clearTimeout(timer); req.off("aborted", disconnected); res.off("close", disconnected);
       if (acquired) active = false;

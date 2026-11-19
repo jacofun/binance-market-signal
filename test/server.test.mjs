@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { makeServer } from "../build/server.js";
 import { analyzeWithModel } from "../build/model.js";
-import { env, jwt, NOW, provider, modelResult, silent } from "./fixtures.mjs";
+import { loadConfig } from "../build/config.js";
+import { RestMarketDataProvider } from "../build/market.js";
+import { env, jwt, NOW, provider, modelResult, proposal, silent, snapshot } from "./fixtures.mjs";
 
 async function app(t, options = {}) {
   const server = makeServer({ env, now: () => NOW, logger: silent, provider: provider(), model: async () => modelResult(), ...options });
@@ -109,6 +111,115 @@ test("model output diagnostics reach HTTP and logs without content or reasoning"
   assert.equal(JSON.stringify(body).includes("private-"), false);
   assert.equal(logs.join("").includes("private-"), false);
 });
+test("zone failures log precise reasons and safe market context while preserving the HTTP contract", async t => {
+  for (const reason of ["zone_not_found", "zone_broken", "entry_out_of_bounds", "stop_too_far", "target_out_of_bounds"]) {
+    await t.test(reason, async t => {
+      const logs = [];
+      const market = snapshot();
+      const zone = market.frames[1].zones[0];
+      zone.id = "1h:support:1795000000000";
+      const modelProposal = proposal();
+      modelProposal.research.entryZoneId = zone.id;
+      modelProposal.research.stopZoneId = zone.id;
+      let field = "research.entryZoneId";
+      if (reason === "zone_not_found") modelProposal.research.entryZoneId = "private-invalid-zone";
+      if (reason === "zone_broken") zone.status = "broken";
+      if (reason === "entry_out_of_bounds") modelProposal.entry.min = 9979.9;
+      if (reason === "stop_too_far") { modelProposal.stopLoss = 9800; field = "stopLoss"; }
+      if (reason === "target_out_of_bounds") { modelProposal.targets[0].price = 10230; field = "targets[0].price"; }
+      modelProposal.summary = "private-model-prose";
+      const { request } = await app(t, {
+        provider: provider({ snapshot: async () => market }),
+        model: (...args) => analyzeWithModel(...args, async () => new Response(JSON.stringify({
+          choices: [{ finish_reason: "stop", message: { content: JSON.stringify(modelProposal), reasoning_content: "private-model-reasoning" } }],
+          request_id: "5a5096c5-8e7e-47d7-8998-e4cf310cd50c",
+        }))),
+        logger: { info: x => logs.push(x), error: x => logs.push(x) },
+      });
+      const response = await request();
+      const body = await response.json();
+      const log = JSON.parse(logs[0]);
+      assert.equal(response.status, 502);
+      assert.equal(body.error.outputField, field);
+      assert.equal(body.error.outputReason, reason === "target_out_of_bounds" ? "unsupported_target" : "unsupported_zone");
+      assert.equal(body.error.validation, undefined);
+      assert.equal(body.error.exception, undefined);
+      assert.equal(log.requestId, body.requestId);
+      assert.equal(log.stage, "proposal_validation");
+      assert.equal(log.symbol, "BTCUSDT");
+      assert.equal(log.style, "trend");
+      assert.equal(log.httpStatus, 502);
+      assert.ok(log.codeVersion);
+      assert.equal(log.upstreamRequestId, body.error.upstreamRequestId);
+      assert.equal(log.validation.reason, reason);
+      assert.equal(log.validation.snapshotAsOf, NOW);
+      if (reason === "zone_not_found") {
+        assert.equal(log.validation.zoneReference, "malformed");
+        assert.equal(log.validation.requestedZoneId, undefined);
+        assert.equal(log.validation.zoneCount, 5);
+      }
+      if (reason === "zone_broken" || reason === "entry_out_of_bounds") {
+        assert.equal(log.validation.zone.lower, 9980);
+        assert.equal(log.validation.zone.upper, 10020);
+        assert.deepEqual(log.validation.entry, modelProposal.entry);
+      }
+      if (reason === "stop_too_far") {
+        assert.equal(log.validation.stopDistance, 180);
+        assert.equal(log.validation.hourlyAtr, 100);
+      }
+      assert.ok(log.exception[0].frames.some(frame => frame.startsWith("model.js:")));
+      assert.equal(logs.join("").includes("private-"), false);
+    });
+  }
+});
+
+test("Binance connection failures retain the nested native cause, stage and request path in logs", async t => {
+  const logs = [];
+  const cause = Object.assign(new Error("private-network-address"), { code: "ENOTFOUND" });
+  const fetchError = new TypeError("private-fetch-text", { cause });
+  const market = new RestMarketDataProvider(loadConfig(env), async () => { throw fetchError; }, () => NOW);
+  const { request } = await app(t, { provider: market, logger: { info: x => logs.push(x), error: x => logs.push(x) } });
+  const response = await request();
+  assert.equal(response.status, 504);
+  const payload = await response.json();
+  const log = JSON.parse(logs[0]);
+  assert.equal(payload.error.code, "BINANCE_TIMEOUT");
+  assert.equal(payload.error.exception, undefined);
+  assert.equal(log.stage, "market_snapshot");
+  assert.equal(log.marketEndpoint, "/fapi/v1/time");
+  assert.deepEqual(log.exception.map(({ name, code }) => [name, code]), [
+    ["AppError", "BINANCE_TIMEOUT"], ["TypeError", undefined], ["Error", "ENOTFOUND"],
+  ]);
+  assert.equal(logs.join("").includes("private-"), false);
+});
+
+test("model connection and malformed JSON keep distinct original exception types in logs", async t => {
+  for (const mode of ["connection", "json"]) {
+    await t.test(mode, async t => {
+      const logs = [];
+      const requestModel = async () => {
+        if (mode === "connection") {
+          throw new TypeError("private-fetch-text", { cause: Object.assign(new Error("private-socket-text"), { code: "UND_ERR_SOCKET" }) });
+        }
+        return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "private-model-output" } }] }));
+      };
+      const { request } = await app(t, { model: (...args) => analyzeWithModel(...args, requestModel), logger: { info: x => logs.push(x), error: x => logs.push(x) } });
+      const response = await request();
+      const body = await response.json();
+      const log = JSON.parse(logs[0]);
+      assert.equal(log.stage, "model");
+      if (mode === "connection") {
+        assert.equal(body.error.code, "MODEL_TIMEOUT");
+        assert.equal(log.exception[2].code, "UND_ERR_SOCKET");
+      } else {
+        assert.equal(body.error.outputReason, "invalid_json");
+        assert.equal(log.exception[1].name, "SyntaxError");
+      }
+      assert.equal(logs.join("").includes("private-"), false);
+    });
+  }
+});
+
 test("RAM-invoked boot probe requires neither JWT nor a Bailian key and cannot trigger analysis", async t => {
   const { url } = await app(t, { env: {} });
   for (const path of ["/", "/invoke"]) {

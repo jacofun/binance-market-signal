@@ -8,15 +8,20 @@ import { assessResearch, researchContext } from "./research.js";
 import { candleRow } from "./market.js";
 
 export type Model = typeof analyzeWithModel;
+export type AnalysisStage = "market_snapshot" | "model" | "proposal_validation" | "quote_verification";
 export async function analyze(config: Config, provider: MarketDataProvider, symbol: string, style: Style, signal: AbortSignal,
-  model: Model = analyzeWithModel, now: () => number = Date.now) {
+  model: Model = analyzeWithModel, now: () => number = Date.now, onStage: (stage: AnalysisStage) => void = () => {}) {
   const start = now();
+  onStage("market_snapshot");
   const snapshot = await provider.snapshot(symbol, signal);
   if (signal.aborted) throw new AppError("REQUEST_TIMEOUT", "请求已取消或超时。", 504);
   const modelStart = now();
+  onStage("model");
   const result: ModelResult = await model(config, snapshot, style, signal);
   const modelEnd = now();
+  onStage("proposal_validation");
   const p = validateProposal(result.proposal, snapshot);
+  onStage("quote_verification");
   const latest = await provider.quote(symbol, signal);
   if (signal.aborted) throw new AppError("REQUEST_TIMEOUT", "请求已取消或超时。", 504);
   const end = now();
