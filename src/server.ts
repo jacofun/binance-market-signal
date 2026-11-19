@@ -131,7 +131,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (isOrder) {
         const settings = ordersConfig();
         const input = await body(req);
-        if (input.action === "preview" || input.action === "submit" || input.action === "status") orderAction = input.action;
+        if (input.action === "preview" || input.action === "submit" || input.action === "status" || input.action === "demo-plan") orderAction = input.action;
         const orders = makeOrders(settings, makeOrderStore(settings, now, orderFetch), makeOrderExchange(settings, now, orderFetch),
           now, event => logger.info(JSON.stringify({ requestId, ...event })));
         const result = await orders(input, token);

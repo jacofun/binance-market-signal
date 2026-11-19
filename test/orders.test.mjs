@@ -122,8 +122,9 @@ const makeMock = () => {
 async function start(t, override = {}) {
   const mock = makeMock();
   const logs = [];
+  let modelCalls = 0;
   const server = makeServer({ env: { ...settings, ...override }, logger: { info: value => logs.push(value), error: value => logs.push(value) },
-    now: () => mock.state.clock, model: async () => modelResult(), provider: provider(), orderFetch: mock.mockFetch });
+    now: () => mock.state.clock, model: async () => { modelCalls++; return modelResult(); }, provider: provider(), orderFetch: mock.mockFetch });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
@@ -156,7 +157,7 @@ async function start(t, override = {}) {
   const recover = (triggerTime = new Date(mock.state.clock).toISOString(), controlPath = "/invoke") =>
     request({ triggerName: "market-order-protection", triggerTime }, undefined, "/invoke",
       { "x-fc-request-id": "fc-test", "x-fc-control-path": controlPath });
-  return { ...mock, analyze, request, preview, submit, query, logs, recover, directOrder };
+  return { ...mock, analyze, request, preview, submit, query, logs, recover, directOrder, modelCalls: () => modelCalls };
 }
 
 
@@ -319,6 +320,47 @@ test("legacy accepted, uncertain and rejected records remain readable only by th
 
 const mutations = app => app.calls.filter(call => call.path.startsWith("/fapi/") && call.method !== "GET");
 const entryDraft = preview => preview.options.find(option => option.kind === "market").draft;
+
+test("test plans preview and submit protected market orders without running analysis", async t => {
+  for (const direction of ["long", "short"]) {
+    const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });
+    const request = { action: "demo-plan", direction };
+    assert.equal((await app.request(request, jwt())).http, 401);
+    const { http, data: plan } = await app.request(request, readToken());
+    assert.equal(http, 200, JSON.stringify(plan));
+    assert.equal(plan.mode, "demo");
+    assert.equal((await app.recover()).http, 200);
+    const input = { action: "preview", permit: plan.orderPermit };
+    assert.equal((await app.request(input, readToken("other-owner"))).http, 400);
+    const preview = await app.request(input, readToken());
+    assert.equal(preview.data.analysisId, plan.analysisId);
+    assert.equal(preview.data.direction, direction);
+    assert.equal(preview.data.submission.state, "enabled");
+    assert.deepEqual(mutations(app), []);
+
+    const draft = entryDraft(preview.data);
+    const outcome = await app.submit(draft);
+    assert.equal(outcome.data.protection.state, "active");
+    assert.equal((await app.query(plan.analysisId)).data.protection.state, "active");
+    assert.equal((await app.submit(draft)).data.error.code, "ORDER_ALREADY_RESERVED");
+    const calls = mutations(app);
+    assert.deepEqual(calls.map(call => call.params.get("type")), ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+    assert.equal(calls[0].params.get("positionSide"), direction === "long" ? "LONG" : "SHORT");
+    assert.ok(calls.every(call => call.host === "demo-fapi.binance.com"));
+    assert.equal(app.modelCalls(), 0);
+  }
+});
+
+test("test plans reject live mode and invalid prices before an order can be created", async t => {
+  const request = { action: "demo-plan", direction: "long" };
+  const live = await start(t, { SIGNAL_ORDER_MODE: "live", BINANCE_BASE_URL: "https://fapi.binance.com" });
+  assert.equal((await live.request(request, readToken())).data.error.code, "ORDER_DEMO_ONLY");
+  assert.deepEqual(live.calls, []);
+  const demo = await start(t, { SIGNAL_ORDER_MAX_RISK_USDT: "0.0001" });
+  assert.equal((await demo.request(request, readToken())).data.error.code, "ORDER_DEMO_PRICE_RANGE");
+  assert.deepEqual(mutations(demo), []);
+  assert.equal(demo.objects.size, 0);
+});
 
 async function executionFixture(t) {
   const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });

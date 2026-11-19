@@ -31,6 +31,25 @@ const allowedDrift = 30;
 const drift = (price: number, reference: number) => Math.abs(price - reference) / reference * 10000;
 const TYPES: Record<OrderKind, string> = { market: "MARKET", limit: "LIMIT", conditional: "STOP" };
 
+export function demoOrderPrices(direction: OrderPlan["direction"], quote: Quote, rules: TradingRules, config: OrderConfig) {
+  const reject = () => new AppError("ORDER_DEMO_PRICE_RANGE", "测试网盘口、价格步长或风险上限不足以生成测试草稿。", 409);
+  const tick = Number(rules.price.step);
+  const decimals = (rules.price.step.split(".")[1] || "").length;
+  const mark = Number(quote.mark);
+  const distance = Math.min(mark * 0.0015, config.maxRisk / Number(config.quantity) * 0.75);
+  if (tick <= 0 || distance < 4 * tick) throw reject();
+  const band = Math.max(1, Math.floor(Math.min(distance / 4, mark * 0.0004) / tick));
+  const price = (ticks: number) => Number((ticks * tick).toFixed(decimals));
+  const min = price(Math.floor(Math.min(Number(quote.bid), mark) / tick) - band);
+  const max = price(Math.ceil(Math.max(Number(quote.ask), mark) / tick) + band);
+  const long = direction === "long";
+  const entry = Number(long ? quote.ask : quote.bid);
+  const lower = price(Math.ceil((entry - distance) / tick));
+  const upper = price(Math.floor((entry + distance) / tick));
+  if (!(lower < min && max < upper) || !onGrid(priceText(lower), rules.price) || !onGrid(priceText(upper), rules.price)) throw reject();
+  return { min, max, stop: long ? lower : upper, target: long ? upper : lower, mark };
+}
+
 export function assertQuote(plan: OrderPlan, quote: Quote, now: number) {
   const mark = Number(quote.mark);
   const validRange = plan.direction === "long" ? mark > plan.stop && mark < plan.target : mark < plan.stop && mark > plan.target;
