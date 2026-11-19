@@ -12,6 +12,8 @@ export const object = (value: unknown): value is Record<string, unknown> =>
 export type OrderMode = "demo" | "live";
 export interface OrderConfig {
   mode: OrderMode;
+  executionEnabled: boolean;
+  recoverySecret?: string;
   base: string;
   apiKey: string;
   apiSecret: string;
@@ -60,7 +62,9 @@ export function loadOrderConfig(env: Env): OrderConfig {
     if (jwtKey.asymmetricKeyType !== "rsa" || (jwtKey.asymmetricKeyDetails?.modulusLength ?? 0) < 2048) throw new Error();
   } catch { throw bad("SIGNAL_ORDER_JWT_PUBLIC_KEY"); }
   return {
-    mode, base, quantity, maxRisk: Number(risk), bucket, region,
+    mode, executionEnabled: env.SIGNAL_ORDER_EXECUTE === "true",
+    recoverySecret: /^[0-9a-f]{64}$/.test(env.SIGNAL_ORDER_RECOVERY_SECRET || "") ? env.SIGNAL_ORDER_RECOVERY_SECRET : undefined,
+    base, quantity, maxRisk: Number(risk), bucket, region,
     ossHost: `${bucket}.oss-${region}${network === "internal" ? "-internal" : ""}.aliyuncs.com`,
     prefix: `${prefix}/${mode}`,
     apiKey: required("BINANCE_API_KEY", /^[A-Za-z0-9_-]{16,200}$/),
@@ -88,11 +92,21 @@ export function orderSubject(token: string, config: OrderConfig, scope: string, 
     if (!object(c) || c.iss !== config.issuer || c.aud !== config.audience || c.scope !== scope ||
       typeof c.sub !== "string" || !c.sub || c.sub.length > 128 || !Number.isSafeInteger(c.iat) ||
       !Number.isSafeInteger(c.exp) || Number(c.exp) <= seconds || Number(c.exp) <= Number(c.iat) || Number(c.iat) > seconds + 3 ||
-      Number(c.exp) - Number(c.iat) > (scope === "trading:orders:submit" ? 30 : 120) ||
+      Number(c.exp) - Number(c.iat) > (scope === "trading:orders:submit-protected" ? 30 : 120) ||
       (intent !== undefined && c.intent !== intent)) throw denied();
     return c.sub;
   } catch { throw denied(); }
 }
+export function authorizeRecovery(input: Record<string, unknown>, config: OrderConfig, now: number) {
+  const { triggerName, payload, triggerTime } = input;
+  const time = typeof triggerTime === "string" ? Date.parse(triggerTime) : NaN;
+  if (triggerName !== "market-order-protection" || !Number.isFinite(time) || time > now + 5000 || now - time > 180000 ||
+    !config.recoverySecret || typeof payload !== "string" || !/^[0-9a-f]{64}$/.test(payload) ||
+    !timingSafeEqual(Buffer.from(payload, "hex"), Buffer.from(config.recoverySecret, "hex"))) {
+    throw new AppError("ORDER_RECOVERY_UNAUTHORIZED", "订单恢复定时事件未通过验证。", 401);
+  }
+}
+
 function mac(config: OrderConfig, purpose: string, data: string) {
   return createHmac("sha256", Buffer.from(config.signingSecret, "hex")).update(`market-orders/v1/${config.mode}/${config.base}/${digest(config.apiKey)}/${purpose}/${data}`).digest();
 }

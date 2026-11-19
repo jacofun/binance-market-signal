@@ -6,23 +6,25 @@ import { orderOption } from "../build/order-rules.js";
 import { makeServer } from "../build/server.js";
 import { env, jwt, NOW, provider, modelResult, publicKey } from "./fixtures.mjs";
 
+const recoverySecret = "a".repeat(64);
 const settings = {
   ...env, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: "https://demo-fapi.binance.com",
   BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret",
   ACCESS_KEY_ID: "test-oss-key", ACCESS_KEY_SECRET: "test-oss-secret-123",
   SIGNAL_ORDER_OSS_BUCKET: "orders-bucket", SIGNAL_ORDER_OSS_REGION: "cn-hangzhou",
   SIGNAL_ORDER_JWT_PUBLIC_KEY: publicKey.export({ type: "spki", format: "pem" }),
-  SIGNAL_ORDER_SIGNING_SECRET: "b".repeat(64),
+  SIGNAL_ORDER_SIGNING_SECRET: "b".repeat(64), SIGNAL_ORDER_RECOVERY_SECRET: recoverySecret,
 };
 const digest = text => createHash("sha256").update(text).digest("hex");
-const readToken = (sub = "owner") => jwt({ scope: "trading:orders:read", sub });
-const submitToken = (draft, at = NOW) => jwt({ scope: "trading:orders:submit",
+const readToken = (sub = "owner", at = NOW) => jwt({ scope: "trading:orders:read", sub,
+  iat: Math.floor(at / 1000), exp: Math.floor(at / 1000) + 120 });
+const submitToken = (draft, at = NOW) => jwt({ scope: "trading:orders:submit-protected",
   iat: Math.floor(at / 1000), exp: Math.floor(at / 1000) + 30, intent: digest(draft) });
 const grid = { minQty: "0.001", maxQty: "20", stepSize: "0.001" };
 function symbolRules(notional = "5", tickSize = "0.1") {
   return { symbols: [{
     symbol: "BTCUSDT", baseAsset: "BTC", quoteAsset: "USDT", status: "TRADING", contractType: "PERPETUAL",
-    orderTypes: ["MARKET", "LIMIT", "STOP"], timeInForce: ["GTC", "GTX"],
+    orderTypes: ["MARKET", "LIMIT", "STOP", "STOP_MARKET", "TAKE_PROFIT_MARKET"], timeInForce: ["GTC", "GTX"],
     filters: [
       { filterType: "PRICE_FILTER", minPrice: "1", maxPrice: "1000000", tickSize },
       { filterType: "LOT_SIZE", ...grid }, { filterType: "MARKET_LOT_SIZE", ...grid },
@@ -34,16 +36,29 @@ const ossHeader = { "x-oss-request-id": "test-object-request-id" };
 const makeMock = () => {
   const objects = new Map();
   const calls = [];
-  const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, tickSize: "0.1", orders: new Map() };
+  const state = { clock: NOW, markPrice: "10000", notional: "5", quoteAge: 0, tickSize: "0.1", orders: new Map(),
+    positions: [], entryQty: "0.001", entryStatus: "FILLED", entryFault: "", stopFault: "", targetFault: "", versioning: "", failIntent: false };
   async function mockFetch(url, options) {
     const u = new URL(url);
     const { headers, method } = options;
-    calls.push({ host: u.hostname, path: u.pathname, method, params: u.searchParams });
-    assert.equal(method, "GET");
+    calls.push({ host: u.hostname, path: u.pathname, method, params: method === "POST" ? new URLSearchParams(options.body) : u.searchParams });
     assert.equal(options.redirect, "error");
     if (u.hostname.endsWith(".aliyuncs.com")) {
       assert.equal(u.hostname, "orders-bucket.oss-cn-hangzhou.aliyuncs.com");
       assert.match(headers.authorization, /^OSS4-HMAC-SHA256 Credential=test-oss-key\/20261118\/cn-hangzhou\/oss\/aliyun_v4_request,Signature=[a-f0-9]{64}$/);
+      if (u.search === "?versioning") return new Response(`<VersioningConfiguration>${state.versioning}</VersioningConfiguration>`);
+      if (method === "PUT") {
+        if (state.failIntent && u.pathname.endsWith("/intent.json")) return new Response(null, { status: 503, headers: ossHeader });
+        if (headers["x-oss-forbid-overwrite"] === "true" && objects.has(u.pathname)) return new Response(null, { status: 409, headers: ossHeader });
+        objects.set(u.pathname, JSON.parse(options.body));
+        return new Response(null);
+      }
+      if (method === "DELETE") {
+        assert.match(u.pathname, /locks\/btcusdt\.json$/);
+        objects.delete(u.pathname);
+        return new Response(null, { status: 204 });
+      }
+      assert.equal(method, "GET");
       return objects.has(u.pathname) ? Response.json(objects.get(u.pathname), { headers: ossHeader }) :
         new Response(null, { status: 404, headers: ossHeader });
     }
@@ -61,8 +76,39 @@ const makeMock = () => {
     if (u.pathname.endsWith("/premiumIndex")) return Response.json({ symbol: "BTCUSDT", markPrice: state.markPrice, time: state.clock - state.quoteAge });
     if (u.pathname.endsWith("/bookTicker")) return Response.json({ symbol: "BTCUSDT", bidPrice: "9999.9", askPrice: "10000.1",
       askQty: "0.50", bidQty: "0.50", time: state.clock - state.quoteAge });
+    if (u.pathname.endsWith("/dual")) return Response.json({ dualSidePosition: true });
+    if (u.pathname.endsWith("/positionRisk")) return Response.json(state.positions);
+    if (u.pathname.endsWith("/openOrders") || u.pathname.endsWith("/openAlgoOrders")) return Response.json([]);
     const algo = u.pathname.endsWith("/algoOrder");
     assert.ok(algo || u.pathname.endsWith("/order"));
+    if (method === "POST") {
+      if (algo) {
+        const clientAlgoId = params.get("clientAlgoId");
+        const fault = params.get("type") === "STOP_MARKET" ? state.stopFault : state.targetFault;
+        if (fault === "rejected") return Response.json({ code: -2021 }, { status: 400 });
+        const order = { symbol: "BTCUSDT", algoId: 52, clientAlgoId, algoStatus: "NEW", orderType: params.get("type"),
+          positionSide: params.get("positionSide"), side: params.get("side"), workingType: params.get("workingType"),
+          closePosition: params.get("closePosition") === "true", triggerPrice: params.get("triggerPrice") };
+        state.orders.set(clientAlgoId, order);
+        if (fault === "unknown") return Response.json({ code: -1007 }, { status: 503 });
+        return Response.json(order);
+      }
+      if (state.entryFault === "rejected") return Response.json({ code: -2019 }, { status: 400 });
+      const clientOrderId = params.get("newClientOrderId");
+      const entry = { symbol: "BTCUSDT", orderId: 45, clientOrderId, status: state.entryStatus,
+        positionSide: params.get("positionSide"), side: params.get("side"), executedQty: state.entryQty, avgPrice: "10000.1" };
+      state.orders.set(clientOrderId, entry);
+      if (Number(state.entryQty)) state.positions = [{ symbol: "BTCUSDT", positionSide: entry.positionSide,
+        positionAmt: entry.positionSide === "SHORT" ? "-" + state.entryQty : state.entryQty }];
+      if (state.entryFault === "unknown") return Response.json({ code: -1007 }, { status: 503 });
+      return Response.json(entry);
+    }
+    if (method === "DELETE") {
+      const pending = state.orders.get(params.get("clientAlgoId"));
+      assert.equal(pending.algoStatus, "NEW");
+      pending.algoStatus = "CANCELED";
+      return Response.json({ code: "200" });
+    }
     const order = state.orders.get(params.get(algo ? "clientAlgoId" : "origClientOrderId"));
     return order ? Response.json(order) : Response.json({ code: -2013 }, { status: 400 });
   }
@@ -76,9 +122,9 @@ async function start(t, override = {}) {
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
-  const request = async (data, token, path = "/trade/api/signal/orders") => {
+  const request = async (data, token, path = "/trade/api/signal/orders", extraHeaders = {}) => {
     const response = await fetch(`http://127.0.0.1:${server.address().port}${path}`, { method: "POST",
-      headers: { "content-type": "application/json", ...(token ? { "X-JWT-Token": token } : {}) }, body: JSON.stringify(data) });
+      headers: { "content-type": "application/json", ...(token ? { "X-JWT-Token": token } : {}), ...extraHeaders }, body: JSON.stringify(data) });
     return { http: response.status, data: await response.json() };
   };
   const analyze = (token = jwt()) => request({ symbol: "BTCUSDT" }, token, "/trade/api/signal/analyze");
@@ -90,8 +136,10 @@ async function start(t, override = {}) {
     return result.data;
   };
   const submit = (draft, token = submitToken(draft, mock.state.clock), route = "/orders") => request({ action: "submit", draft }, token, route);
-  const query = (analysisId, subject) => request({ action: "status", analysisId }, readToken(subject));
-  return { ...mock, analyze, request, preview, submit, query, logs };
+  const query = (analysisId, subject) => request({ action: "status", analysisId }, readToken(subject, mock.state.clock));
+  const recover = (secret = recoverySecret) => request({ triggerName: "market-order-protection",
+    triggerTime: new Date(mock.state.clock).toISOString(), payload: secret }, undefined, "/invoke", { "x-fc-request-id": "fc-test" });
+  return { ...mock, analyze, request, preview, submit, query, logs, recover };
 }
 
 
@@ -125,7 +173,6 @@ test("candidate previews fix both protective levels and issue no executable draf
     assert.equal(option.draft, undefined);
   }
   assert.equal(preview.submission.state, "blocked");
-  assert.equal(preview.submission.code, "ORDER_PROTECTION_UNAVAILABLE");
   assert.ok(app.calls.every(call => call.method === "GET" && !call.params.has("signature")));
   const permit = (await app.analyze()).data.orderPermit;
   assert.equal((await app.request({ action: "preview", permit }, readToken("another-owner"))).http, 400);
@@ -140,8 +187,8 @@ test("valid legacy submission tickets are blocked in both modes and route aliase
     const results = await Promise.all(["/orders", "/trade/api/signal/orders"].map(route =>
       app.submit(oldDraft, submitToken(oldDraft), route)));
     for (const result of results) {
-      assert.equal(result.http, 409);
-      assert.equal(result.data.error.code, "ORDER_PROTECTION_UNAVAILABLE");
+      assert.equal(result.http, 400);
+      assert.equal(result.data.error.code, "INVALID_ORDER_DRAFT");
     }
     assert.equal((await app.analyze()).http, 200);
     assert.deepEqual(app.calls, []);
@@ -198,4 +245,120 @@ test("legacy accepted, uncertain and rejected records remain readable only by th
   assert.equal((await app.query(preview.analysisId)).data.exchangeCode, -2019);
   assert.ok(app.calls.every(call => call.method === "GET"));
   assert.doesNotMatch(app.logs.join(""), /test-binance|test-oss/);
+});
+
+const mutations = app => app.calls.filter(call => call.path.startsWith("/fapi/") && call.method !== "GET");
+const entryDraft = preview => preview.options.find(option => option.kind === "market").draft;
+
+async function executionFixture(t) {
+  const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });
+  assert.equal((await app.recover("c".repeat(64))).http, 401);
+  assert.equal(app.calls.length, 0);
+  assert.equal((await app.preview()).submission.state, "blocked");
+  assert.equal((await app.recover()).http, 200);
+  const preview = await app.preview();
+  assert.equal(preview.submission.state, "enabled");
+  assert.ok(entryDraft(preview));
+  assert.ok(preview.options.filter(option => option.kind !== "market").every(option => option.draft === undefined));
+  return { app, preview, draft: entryDraft(preview) };
+}
+
+test("owner-confirmed entry runs once and attaches stop then take profit to the confirmed partial fill", async t => {
+  const { app, preview, draft } = await executionFixture(t);
+  assert.equal((await app.submit(draft, jwt({ scope: "trading:orders:submit", exp: NOW / 1000 + 30, intent: digest(draft) }))).http, 401);
+  assert.equal((await app.submit(draft, readToken())).http, 401);
+  assert.equal((await app.submit("X" + draft.slice(1))).data.error.code, "INVALID_ORDER_DRAFT");
+  app.state.entryQty = "0.0005";
+  app.state.entryStatus = "EXPIRED";
+  const responses = await Promise.all([app.submit(draft), app.submit(draft)]);
+  const settled = responses.find(r => r.http === 200);
+  assert.equal(settled.data.executedQty, "0.0005");
+  assert.equal(settled.data.protection.state, "active");
+  assert.equal(responses.filter(r => r.http === 409).length, 1);
+  const calls = mutations(app);
+  assert.deepEqual(calls.map(call => call.params.get("type")), ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+  assert.equal(calls[0].params.get("quantity"), "0.001");
+  assert.equal(calls[0].params.get("side"), "BUY");
+  assert.deepEqual(calls.slice(1).map(call => call.params.get("triggerPrice")), ["9900", "10200"]);
+  for (const call of calls.slice(1)) {
+    assert.equal(call.path, "/fapi/v1/algoOrder");
+    assert.equal(call.params.get("workingType"), "MARK_PRICE");
+    assert.equal(call.params.get("positionSide"), "LONG");
+    assert.equal(call.params.get("side"), "SELL");
+    assert.equal(call.params.get("closePosition"), "true");
+    assert.equal(call.params.has("quantity"), false);
+    assert.equal(call.params.has("reduceOnly"), false);
+  }
+  assert.equal((await app.query(preview.analysisId)).data.protection.state, "active");
+});
+
+test("uncertain entry survives a later timer tick without resending the entry", async t => {
+  const { app, draft } = await executionFixture(t);
+  app.state.entryFault = "unknown";
+  assert.equal((await app.submit(draft)).data.protection.state, "pending");
+  assert.equal(mutations(app).length, 1);
+  app.state.clock = NOW + 60000;
+  const recoveries = await Promise.all([app.recover(), app.recover()]);
+  assert.ok(recoveries.every(recovered => recovered.http === 200), JSON.stringify(recoveries));
+  assert.equal(recoveries.filter(recovered => recovered.data.protection?.state === "active").length, 1);
+  assert.equal(recoveries.filter(recovered => recovered.data.reason === "recovery_slot_busy").length, 1);
+  assert.deepEqual(mutations(app).map(call => call.params.get("type")), ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+});
+
+test("a timed-out stop is queried before attaching the missing target", async t => {
+  const { app, draft } = await executionFixture(t);
+  app.state.stopFault = "unknown";
+  const sent = await app.submit(draft);
+  assert.equal(sent.data.protection.state, "attention");
+  assert.equal(mutations(app).length, 2);
+  app.state.clock = NOW + 60000;
+  const repaired = await app.recover();
+  assert.equal(repaired.data.protection.state, "active");
+  assert.equal(mutations(app).filter(call => call.params.get("type") === "STOP_MARKET").length, 1);
+});
+
+test("when take profit is rejected, a retry retains the existing stop and later cleans the sibling after exit", async t => {
+  const { app, draft } = await executionFixture(t);
+  app.state.targetFault = "rejected";
+  const sent = await app.submit(draft);
+  assert.equal(sent.data.protection.state, "attention");
+  assert.equal(sent.data.protection.stop.exchangeStatus, "NEW");
+  assert.equal(sent.data.protection.target.exchangeStatus, null);
+  app.state.targetFault = "";
+  app.state.clock = NOW + 60000;
+  const repaired = await app.recover();
+  assert.equal(repaired.data.protection.state, "active");
+  const stopId = repaired.data.protection.stop.clientId;
+  const targetId = repaired.data.protection.target.clientId;
+  app.state.orders.get(stopId).algoStatus = "FINISHED";
+  app.state.positions = [];
+  app.state.clock = NOW + 120000;
+  const closed = await app.recover();
+  assert.equal(closed.data.protection.state, "closed");
+  assert.equal(app.state.orders.get(targetId).algoStatus, "CANCELED");
+  assert.equal(app.objects.has("/private/market-signal-orders/v1/demo/locks/btcusdt.json"), false);
+  assert.equal(mutations(app).filter(call => call.params.get("type") === "STOP_MARKET").length, 1);
+});
+
+test("a rejected entry, known zero fill, stale heartbeat and failed persistence never dispatch exit orders", async t => {
+  const rejected = await executionFixture(t);
+  rejected.app.state.entryFault = "rejected";
+  assert.equal((await rejected.app.submit(rejected.draft)).data.protection.state, "not_required");
+  assert.equal(mutations(rejected.app).length, 1);
+  const unfilled = await executionFixture(t);
+  Object.assign(unfilled.app.state, { entryQty: "0", entryStatus: "EXPIRED" });
+  assert.equal((await unfilled.app.submit(unfilled.draft)).data.protection.state, "not_required");
+  assert.equal(mutations(unfilled.app).length, 1);
+  const stale = await executionFixture(t);
+  stale.app.state.clock = NOW + 91000;
+  assert.equal((await stale.app.submit(stale.draft)).data.error.code, "ORDER_RECOVERY_NOT_READY");
+  assert.deepEqual(mutations(stale.app), []);
+  const storage = await executionFixture(t);
+  storage.app.state.failIntent = true;
+  assert.equal((await storage.app.submit(storage.draft)).data.error.code, "ORDER_STORAGE_UNAVAILABLE");
+  assert.deepEqual(mutations(storage.app), []);
+  storage.app.state.clock = NOW + 60000;
+  storage.app.state.failIntent = false;
+  assert.equal((await storage.app.recover()).data.reason, "entry_never_reserved");
+  assert.deepEqual(mutations(storage.app), []);
 });

@@ -5,6 +5,11 @@ import { boundedJson } from "./http.js";
 import { DECIMAL, type Grid, type OrderKind, type Quote, type TradingRules } from "./order-rules.js";
 
 const SYMBOL = "BTCUSDT";
+export type PositionSide = "LONG" | "SHORT";
+export type ProtectionLeg = "stop" | "target";
+const openingSide = (side: PositionSide) => side === "LONG" ? "BUY" : "SELL";
+const closingSide = (side: PositionSide) => side === "LONG" ? "SELL" : "BUY";
+const protectionType = (leg: ProtectionLeg) => leg === "stop" ? "STOP_MARKET" : "TAKE_PROFIT_MARKET";
 export interface ExchangeOrder {
   state: "accepted" | "rejected" | "unknown";
   exchangeStatus?: string; childStatus?: string; executedQty?: string; avgPrice?: string; exchangeCode?: number; upstreamStatus?: number; reason?: string;
@@ -12,6 +17,13 @@ export interface ExchangeOrder {
 export interface OrderExchange {
   rules(): Promise<TradingRules>;
   quote(): Promise<Quote>;
+  assertFlat(): Promise<void>;
+  position(side: PositionSide, maxQuantity: string): Promise<number>;
+  enter(side: PositionSide, quantity: string, clientId: string, issuedAt: number): Promise<ExchangeOrder>;
+  findEntry(clientId: string): Promise<ExchangeOrder | null>;
+  protect(side: PositionSide, leg: ProtectionLeg, trigger: string, clientId: string, issuedAt: number): Promise<string>;
+  findProtection(side: PositionSide, leg: ProtectionLeg, trigger: string, clientId: string): Promise<string | null>;
+  cancelProtection(clientId: string): Promise<void>;
   query(kind: OrderKind, clientId: string): Promise<ExchangeOrder>;
 }
 
@@ -31,19 +43,20 @@ function parseOrder(data: unknown, clientId: string, algo: boolean): ExchangeOrd
 }
 
 export function makeOrderExchange(config: OrderConfig, now: () => number, fetchImpl = fetch): OrderExchange {
-  async function call(path: string, params: Record<string, string> = {}, signed = false) {
+  async function call(path: string, params: Record<string, string> = {}, signed = false, method: "GET" | "POST" | "DELETE" = "GET", issuedAt = now()) {
     const query = new URLSearchParams(params);
     const headers: Record<string, string> = {};
     if (signed) {
       query.set("recvWindow", "3000");
-      query.set("timestamp", String(now()));
+      query.set("timestamp", String(issuedAt));
       query.set("signature", createHmac("sha256", config.apiSecret).update(query.toString()).digest("hex"));
       headers["X-MBX-APIKEY"] = config.apiKey;
     }
+    if (method === "POST") headers["Content-Type"] = "application/x-www-form-urlencoded";
     let response: Response;
     try {
-      response = await fetchImpl(`${config.base}${path}${query.size ? `?${query}` : ""}`,
-        { method: "GET", headers, signal: AbortSignal.timeout(4000), redirect: "error" });
+      response = await fetchImpl(`${config.base}${path}${method !== "POST" && query.size ? `?${query}` : ""}`,
+        { method, body: method === "POST" ? query.toString() : undefined, headers, signal: AbortSignal.timeout(4000), redirect: "error" });
     } catch (cause) {
       throw new AppError("ORDER_BINANCE_UNAVAILABLE", `币安接口 ${path} 连接失败。`, 502, undefined, undefined, { cause });
     }
@@ -93,8 +106,78 @@ export function makeOrderExchange(config: OrderConfig, now: () => number, fetchI
       price: grid("PRICE_FILTER", ["minPrice", "maxPrice", "tickSize"]),
       lot: grid("LOT_SIZE", qtyNames), marketLot: grid("MARKET_LOT_SIZE", qtyNames), notional, multiplierUp, multiplierDown };
   }
+  const bySymbol = { symbol: SYMBOL };
+  async function positions() {
+    const rows = await call("/fapi/v3/positionRisk", bySymbol, true);
+    if (!Array.isArray(rows) || rows.some(row => !object(row) || row.symbol !== SYMBOL ||
+      !["BOTH", "LONG", "SHORT"].includes(String(row.positionSide)) ||
+      typeof row.positionAmt !== "string" || !DECIMAL.test(row.positionAmt.replace(/^-/, "")))) throw invalid();
+    return rows as { positionSide: string; positionAmt: string }[];
+  }
+  function hasCode(error: unknown, ...codes: number[]) {
+    const upstream = error instanceof AppError ? error.upstream : undefined;
+    return upstream?.upstreamStatus === 400 && "upstreamCode" in upstream && codes.includes(Number(upstream.upstreamCode));
+  }
+  function readProtection(data: unknown, side: PositionSide, leg: ProtectionLeg, trigger: string, clientId: string) {
+    const parsed = parseOrder(data, clientId, true);
+    if (!object(data) || data.positionSide !== side || data.side !== closingSide(side) || data.orderType !== protectionType(leg) ||
+      data.workingType !== "MARK_PRICE" || data.closePosition !== true ||
+      !decimal(data.triggerPrice) || Number(data.triggerPrice) !== Number(trigger)) throw invalid();
+    return parsed.exchangeStatus!;
+  }
+  async function assertFlat() {
+    const [mode, current, normal, conditional] = await Promise.all([
+      call("/fapi/v1/positionSide/dual", {}, true), positions(),
+      call("/fapi/v1/openOrders", bySymbol, true), call("/fapi/v1/openAlgoOrders", bySymbol, true),
+    ]);
+    if (!object(mode) || typeof mode.dualSidePosition !== "boolean" || !Array.isArray(normal) || !Array.isArray(conditional)) throw invalid();
+    if (!mode.dualSidePosition) throw new AppError("ORDER_HEDGE_MODE_REQUIRED", "本站仅支持 BTCUSDT 双向持仓模式。", 409);
+    if (current.some(row => Number(row.positionAmt) !== 0) || normal.length || conditional.length) {
+      throw new AppError("ORDER_ACCOUNT_BUSY", "BTCUSDT 已有持仓或挂单，请先核对账户。", 409);
+    }
+  }
   return {
-    rules, quote,
+    rules, quote, assertFlat,
+    async position(side, maxQuantity) {
+      const current = await positions();
+      const row = current.find(item => item.positionSide === side);
+      const qty = Number(row?.positionAmt ?? 0) * (side === "LONG" ? 1 : -1);
+      if (qty < 0 || qty > Number(maxQuantity) || current.some(item => item.positionSide !== side && Number(item.positionAmt) !== 0)) {
+        throw new AppError("ORDER_POSITION_MISMATCH", "当前 BTCUSDT 持仓与本次开仓不符。请核对账户。", 409);
+      }
+      return qty;
+    },
+    async enter(side, quantity, clientId, issuedAt) {
+      try {
+        const data = await call("/fapi/v1/order", { ...bySymbol, side: openingSide(side), positionSide: side, quantity,
+          type: "MARKET", newOrderRespType: "RESULT", newClientOrderId: clientId }, true, "POST", issuedAt);
+        if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) || !decimal(data.executedQty, true)) throw invalid();
+        return parseOrder(data, clientId, false);
+      } catch (error) {
+        if (!hasCode(error, -1013, -1021, -1022, -1100, -1102, -1111, -1116, -1121, -2019, -4061, -4164)) throw error;
+        const upstream = (error as AppError).upstream;
+        return { state: "rejected", exchangeCode: Number(upstream && "upstreamCode" in upstream ? upstream.upstreamCode : undefined) };
+      }
+    },
+    async findEntry(clientId) {
+      try { return await this.query("market", clientId); }
+      catch (error) { if (hasCode(error, -2013)) return null; throw error; }
+    },
+    async protect(side, leg, trigger, clientId, issuedAt) {
+      const data = await call("/fapi/v1/algoOrder", { ...bySymbol, side: closingSide(side), positionSide: side, algoType: "CONDITIONAL",
+        type: protectionType(leg), triggerPrice: trigger, workingType: "MARK_PRICE", closePosition: "true", clientAlgoId: clientId },
+        true, "POST", issuedAt);
+      return readProtection(data, side, leg, trigger, clientId);
+    },
+    async findProtection(side, leg, trigger, clientId) {
+      try {
+        return readProtection(await call("/fapi/v1/algoOrder", { clientAlgoId: clientId }, true), side, leg, trigger, clientId);
+      } catch (error) { if (hasCode(error, -2013, -2011)) return null; throw error; }
+    },
+    async cancelProtection(clientId) {
+      try { await call("/fapi/v1/algoOrder", { clientAlgoId: clientId }, true, "DELETE"); }
+      catch (error) { if (!hasCode(error, -2013, -2011)) throw error; }
+    },
     async query(kind, clientId) {
       const algo = kind === "conditional";
       const data = await call(algo ? "/fapi/v1/algoOrder" : "/fapi/v1/order", algo ? { clientAlgoId: clientId } :

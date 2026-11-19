@@ -1,17 +1,14 @@
 import { AppError, exceptionChain } from "./errors.js";
-import { ORDER_ID, SEALED, digest, object, orderSubject, unseal, type OrderConfig, type OrderPlan } from "./order-auth.js";
+import { ORDER_ID, SEALED, digest, object, orderSubject, seal, unseal, type OrderConfig, type OrderPlan } from "./order-auth.js";
 import { assertQuote, orderOption, type OrderKind } from "./order-rules.js";
 import type { ExchangeOrder, OrderExchange } from "./order-binance.js";
 import type { OrderStore } from "./order-oss.js";
+import { isProtectedIntent, makeProtectedExecution, supportsExits, type ProtectedDraft } from "./order-execution.js";
 
 interface Reservation { kind: OrderKind; clientId: string }
 interface Outcome extends ExchangeOrder { checkedAt: number; reason?: string }
 
-const protectionUnavailable = {
-  state: "blocked",
-  code: "ORDER_PROTECTION_UNAVAILABLE",
-  reason: "币安 U 本位公开 API 暂无可同时提交开仓、止盈和止损的接口。当前仅可预览。",
-} as const;
+const protectedDraftPurpose = "submit-protected-v2";
 const symbol = "BTCUSDT";
 const kinds: OrderKind[] = ["market", "limit", "conditional"];
 const alreadySent = () => new AppError("ORDER_ALREADY_RESERVED", "本次研究已有提交记录，请查询订单。", 409);
@@ -19,10 +16,13 @@ const invalidRequest = () => new AppError("INVALID_ORDER_REQUEST", "订单请求
 
 export function makeOrders(config: OrderConfig, store: OrderStore, exchange: OrderExchange, now: () => number,
   report: (event: Record<string, unknown>) => void) {
+  const execution = makeProtectedExecution(config, store, exchange, now, report);
   const path = (owner: string, id: string) => `attempts/${owner}/${id}`;
   async function status(owner: string, analysisId: string) {
     const key = path(owner, analysisId);
-    const reservation = await store.read(`${key}/intent.json`) as Reservation | null;
+    const value = await store.read(`${key}/intent.json`);
+    if (isProtectedIntent(value)) return execution.inspect(value);
+    const reservation = value as Reservation | null;
     if (!reservation) return { state: "not_recorded", analysisId, mode: config.mode };
     const outcome = await store.read(`${key}/result.json`) as Outcome | null;
     const base = { mode: config.mode, analysisId, kind: reservation.kind, clientId: reservation.clientId };
@@ -42,16 +42,24 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
     const rules = await exchange.rules();
     const quote = await exchange.quote();
     assertQuote(plan, quote, now());
+    let enabled = false;
     const expiresAt = Math.min(plan.expiresAt, now() + 30000);
     const options = [];
     const unavailable: Record<string, string> = {};
     for (const kind of kinds) {
       const option = orderOption(kind, plan, quote, rules, config);
       if (typeof option === "string") unavailable[kind] = option;
+      else if (kind === "market" && supportsExits(rules) && await execution.ready()) {
+        enabled = true;
+        options.push({ ...option,
+          draft: seal(config, protectedDraftPurpose, { plan, option, quantity: config.quantity, expiresAt } satisfies ProtectedDraft) });
+      }
       else options.push(option);
     }
     return { mode: config.mode, symbol, analysisId: plan.id, direction: plan.direction, quantity: config.quantity, stop: plan.stop,
-      target: plan.target, riskCap: config.maxRisk, markPrice: quote.mark, expiresAt, options, unavailable, submission: protectionUnavailable };
+      target: plan.target, riskCap: config.maxRisk, markPrice: quote.mark, expiresAt, options, unavailable, submission: enabled ? { state: "enabled" as const } :
+        { state: "blocked" as const, reason: options.some(option => option.kind === "market")
+          ? "执行开关、保护恢复任务或交易所条件单尚未就绪，当前仅可预览。" : "本次研究暂无符合条件的市价方案。" } };
   }
   return async (input: Record<string, unknown>, token: string) => {
     if (input.action === "status" && Object.keys(input).length === 2 && typeof input.analysisId === "string" && ORDER_ID.test(input.analysisId)) {
@@ -65,10 +73,10 @@ export function makeOrders(config: OrderConfig, store: OrderStore, exchange: Ord
       return preview(plan);
     }
     if (input.action === "submit" && Object.keys(input).length === 2 && typeof input.draft === "string" && SEALED.test(input.draft)) {
-      // Cached clients may still hold a valid ticket from the previous version.
-      // Stop before OSS writes or any request to the exchange.
-      orderSubject(token, config, "trading:orders:submit", now(), digest(input.draft));
-      throw new AppError(protectionUnavailable.code, protectionUnavailable.reason, 409);
+      const owner = digest(orderSubject(token, config, "trading:orders:submit-protected", now(), digest(input.draft)));
+      const draft = unseal<ProtectedDraft>(config, protectedDraftPurpose, input.draft);
+      if (!object(draft) || draft.plan?.owner !== owner || draft.option?.kind !== "market") throw invalidRequest();
+      return execution.submit(draft);
     }
     throw invalidRequest();
   };

@@ -162,22 +162,28 @@ RAM身份需要目标函数的 `fc:GetFunction`、`fc:UpdateFunction`、`fc:Invo
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
 
-## BTCUSDT 交易计划与查单
+## BTCUSDT 开仓、止盈和止损
 
-网站可预览通过校验的市价、回踩限价或条件限价方案。每张草稿都展示确定的止盈和止损，止盈使用研究的首个目标，止损使用研究失效价。程序检查两价与入场方向的关系和交易所价格步长。计划不含手续费、滑点和资金费。
+市场处于候选状态时，市价草稿展示入场参考价、止盈和止损。止盈使用研究的首个目标，止损使用研究失效价。程序复核价格步长、方向、入场范围、最新标记价格及计划价差风险。回踩限价和条件限价继续供预览。计划风险估算未计手续费、滑点和资金费。
 
-币安 U 本位公开 API 分别提供普通开仓和独立止盈止损条件单。批量接口并行处理，不能保证开仓与两个保护单同时受理。本站要求保护单与开仓一并提交，因此 `demo` 和 `live` 均仅开放预览与历史查单。旧客户端及已签发的提交凭证也会收到 `ORDER_PROTECTION_UNAVAILABLE`。参考 [Binance USDⓈ-M Trade API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)。
+网站所有者确认后，服务端先发送市价开仓请求。币安返回全额或部分成交后，按原价提交标记价格触发的 `STOP_MARKET`，收到止损有效确认后再发 `TAKE_PROFIT_MARKET`。二者均限定 BTCUSDT 的对应双向持仓方向，使用 `closePosition=true` 平掉该方向剩余持仓。开仓前要求 BTCUSDT 无既有持仓及挂单。执行期间应避免在同一账户用其他客户端建立 BTCUSDT 委托或仓位。币安分开受理三个请求，成交与止损生效之间存在风险窗口。
+
+委托 ID 和计划在发送前写入 OSS。同一研究只发送一次开仓请求。开仓响应不明时按客户端订单编号查单。恢复任务仅继续保护已成交仓位，对未查到的保护单核对状态并有限重试。查单页面区分开仓成交、止损状态及止盈状态。确认仓位已平，恢复任务撤销剩余保护单，再释放开仓锁。如果原触发价已被越过、保护单被明确取消或恢复穷尽，页面提示立即核对保护状态，程序仍使用已确认的价格。参考 [Binance USDⓈ-M Trade API](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade)。
 
 | FC 环境变量 | 用途 |
 | --- | --- |
-| `SIGNAL_ORDER_MODE` | 默认关闭。`demo` 使用测试网行情，`live` 使用生产行情。两种模式均只读。 |
+| `SIGNAL_ORDER_MODE` | 默认关闭。`demo` 使用测试网行情，`live` 使用生产行情。需要单独启用执行。 |
+| `SIGNAL_ORDER_EXECUTE` | 执行开关，默认关闭。设为 `true` 且保护恢复任务就绪才允许新开仓。 |
+| `SIGNAL_ORDER_RECOVERY_SECRET` | 用 `openssl rand -hex 32` 生成的 64 位小写十六进制密钥，对应 FC 定时触发器消息。 |
 | `BINANCE_BASE_URL` | 对应币安 USDT-M HTTPS 根地址。实盘只接受 `https://fapi.binance.com`，测试只接受 `https://demo-fapi.binance.com` 或 `https://testnet.binancefuture.com`。 |
-| `BINANCE_API_KEY`、`BINANCE_API_SECRET` | 对应环境的 Binance HMAC 密钥。用于查询已有委托，只需合约读取权限。 |
+| `BINANCE_API_KEY`、`BINANCE_API_SECRET` | 对应环境的 Binance HMAC 密钥。预览和查单使用合约读取权限。执行需开通合约交易权限并限制来源 IP。 |
 | `SIGNAL_ORDER_QUANTITY` | BTC 数量，默认 `0.001`。交易所步长或最低名义额不满足时拦截，保留配置数量。 |
 | `SIGNAL_ORDER_MAX_RISK_USDT` | 入场参考价至止损价的计划价差风险上限，默认 `1`，单位 USDT。 |
-| `SIGNAL_ORDER_JWT_PUBLIC_KEY` | 北京私有鉴权函数配置 `BINANCE_ORDER_TICKETS_ENABLED=true` 后，通过 `/api/private-auth/trading/binance/order-token` 签发站点所有者的只读票据。CDN 将 `/trade/api/signal/orders` 转发至信号函数，保留路径或改写为 `/orders`，透传 JWT 及请求体并关闭缓存。订单配置错误独立于行情分析。
+| `SIGNAL_ORDER_JWT_PUBLIC_KEY` | 北京私有鉴权函数配置 `BINANCE_ORDER_TICKETS_ENABLED=true`。它签发只读票据和绑定具体草稿的 30 秒提交票据。CDN 将 `/trade/api/signal/orders` 转发至信号函数，保留路径或改写为 `/orders`，透传 JWT 及请求体并关闭缓存与自动重试。行情分析不读取 OSS 或下单接口。
 
-OSS 权限只需订单前缀的 `oss:GetObject`。历史委托继续按分析编号读取 `attempts/<ownerSha256>/<analysisId>/intent.json` 与 `result.json`。没有数据迁移或新增 OSS 写入。
+启用执行前，在信号函数上配置 FC 定时触发器 `market-order-protection`，调度 `0 * * * * *`，触发消息值使用 `SIGNAL_ORDER_RECOVERY_SECRET` 的值。事件走 FC 的 `POST /invoke`，无需配置公开的恢复路由。等待日志 `order_protection_recovery` 出现后再打开执行开关。恢复心跳超过 90 秒时拒绝新开仓。关闭执行开关后定时任务仍继续处理现有仓位，保留密钥和触发器直到仓位结束。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
+
+预览与历史查单需 `oss:GetObject`。执行还需桶级 `oss:GetBucketVersioning`、订单前缀下 `oss:PutObject` 和对 `locks/btcusdt.json` 的 `oss:DeleteObject`。同一账户和模式的所有实例使用相同 OSS 桶和前缀。保留激活锁及执行记录，持仓期间不要更换币安 API Key、模式或前缀。遇到 `order_entry_unresolved`、`order_protection_requires_attention` 或 `ORDER_RECOVERY_RELEASE`，按分析编号及客户端订单编号核对成交、持仓和保护单。仅在停用新执行、确认无在途请求与未处置仓位后清理孤立锁。先使用测试网验证 FC、OSS 和币安链路，再启用实盘。
 
 ## 本地验证
 

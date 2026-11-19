@@ -8,9 +8,10 @@ import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
-import { loadOrderConfig, makeOrderPermit, orderSubject, type OrderConfig } from "./order-auth.js";
+import { authorizeRecovery, loadOrderConfig, makeOrderPermit, orderSubject, type OrderConfig } from "./order-auth.js";
 import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
+import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
@@ -89,6 +90,17 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if ((path === "/" || path === "/invoke") && req.headers["x-fc-request-id"] && !req.headers[TOKEN_HEADER.toLowerCase()]) {
         const input = await body(req, true);
         if (Object.keys(input).length === 1 && input.action === "health") { send(200, health()); return; }
+        if (path === "/invoke" && !origin && input.triggerName === "market-order-protection") {
+          isOrder = true;
+          orderAction = "recover";
+          const settings = ordersConfig();
+          authorizeRecovery(input, settings, now());
+          const execution = makeProtectedExecution(settings, makeOrderStore(settings, now, orderFetch),
+            makeOrderExchange(settings, now, orderFetch), now, event => logger.info(JSON.stringify({ requestId, ...event })));
+          const result = await execution.recover();
+          logger.info(JSON.stringify({ event: "order_protection_recovery", requestId, ...result }));
+          send(200, { requestId, ...result }); return;
+        }
         throw new AppError("UNAUTHORIZED", "分析请求需要 X-JWT-Token。", 401);
       }
       if (path === "/invoke") throw new AppError("NOT_FOUND", "接口不存在。", 404);
