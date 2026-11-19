@@ -11,6 +11,8 @@ export const SCANNER_TRIGGER = "binance-market-scanner";
 const symbol = "BTCUSDT";
 const interval = INTERVAL_MS["15m"];
 const pageSize = 16;
+const hour = INTERVAL_MS["1h"];
+const pageWindow = 4 * hour;
 const historyDays = 30;
 const rulesVersion = "v1";
 const minimumRvol = 1.5;
@@ -104,61 +106,97 @@ function storageConfig(env: Env) {
     ossKey: value("ACCESS_KEY_ID", env.ACCESS_KEY_ID, /^[A-Za-z0-9_-]{8,128}$/),
     ossSecret: value("ACCESS_KEY_SECRET", env.ACCESS_KEY_SECRET, /^[A-Za-z0-9_+/=-]{16,200}$/) };
 }
+const hourFor = (time: number) => Math.floor(time / hour) * hour;
 const slotFor = (time: number) => Math.floor(time / interval) * interval;
-const keyFor = (slot: number) => `${symbol}/${slot}.json`;
+const legacyKey = (slot: number) => `${symbol}/${slot}.json`;
+const logKey = (time: number) => `${symbol}/runs/${hourFor(time)}.ndjson`;
+const cursorFormat = /^(\d{13}):([a-z0-9-]{0,60})$/;
 
-export function scanSlot(input: Record<string, unknown>, now: number) {
+export function validateScanTimer(input: Record<string, unknown>, now: number) {
   const time = typeof input.triggerTime === "string" ? Date.parse(input.triggerTime) : NaN;
-  if (input.triggerName !== SCANNER_TRIGGER || !Number.isFinite(time) || time > now + 5000 || now - time >= interval) {
-    throw scanError("INVALID_SCAN_TIMER", "扫描触发时间无效、过期或超过容许时钟偏差。");
+  if (input.triggerName !== SCANNER_TRIGGER || !Number.isFinite(time) || time > now + 5000) {
+    throw scanError("INVALID_SCAN_TIMER", "扫描触发时间无效或超出容许时钟偏差。");
   }
-  return slotFor(time);
 }
+
+const asObject = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
 export function makeMarketScanner(env: Env, now: () => number, request: typeof fetch = fetch) {
   const store = makeOrderStore(storageConfig(env), now, request, "SCAN");
+  async function listLegacy(input: Record<string, unknown>) {
+    const latest = slotFor(now());
+    const oldest = latest - historyDays * 24 * hour;
+    const before = input.before === undefined ? latest + interval : input.before;
+    if (Object.keys(input).some(key => key !== "before") || typeof before !== "number" || !Number.isSafeInteger(before) ||
+      before % interval !== 0 || before <= oldest || before > latest + interval) {
+      throw scanError("INVALID_SCAN_CURSOR", "扫描记录分页参数无效。");
+    }
+    const slots = Array.from({ length: pageSize }, (_, i) => before - (i + 1) * interval).filter(slot => slot >= oldest);
+    const rows = await limited(slots.map(slot => () => store.read(legacyKey(slot))), 4);
+    const start = slots.at(-1)!;
+    return { records: rows.filter(row => row !== null), from: start, to: before - interval, next: start > oldest ? start : null };
+  }
+
   return {
-    async run(slot: number) {
-      const existing = await store.read(keyFor(slot));
-      if (existing !== null) return { slot, duplicate: true };
-      // Only public, closed-candle endpoints enter this path.
+    async run(id: string) {
+      const scannedAt = now();
       const provider = new RestMarketDataProvider({ symbols: [symbol], maxPriceAgeMs: 5000, binanceTimeoutMs: 8000 }, request, now);
       const signal = AbortSignal.timeout(26000);
-      const basis = { slot, symbol, rulesVersion, codeVersion: SOURCE_COMMIT };
+      const basis = { id, time: scannedAt, scannedAt, symbol, rulesVersion, codeVersion: SOURCE_COMMIT };
+      let candleClosedAt: number | null = null;
       let record: Record<string, unknown>;
       try {
         const serverTime = await provider.serverTime(signal);
-        if (serverTime < slot) throw scanError("SCAN_CANDLE_NOT_CLOSED", "币安尚未确认该时段收盘。", 503);
-        // Use a context available before either of the two pattern candles.
-        const contextAt = slot - 2 * interval;
-        const [short, hourly, background] = await limited([
-          async () => frame(await provider.candles(symbol, "15m", slot, signal), "15m"),
-          async () => frame(await provider.candles(symbol, "1h", contextAt, signal), "1h"),
-          async () => frame(await provider.candles(symbol, "4h", contextAt, signal), "4h"),
+        // During publication lag, use the newest available closed bar, provided
+        // the series is still continuous and at most one close behind Binance time.
+        const short = frame(await provider.candles(symbol, "15m", serverTime, signal, true), "15m");
+        candleClosedAt = short.lastCloseTime + 1;
+        // Keep the higher-timeframe zones fixed at the start of the pattern.
+        const contextAt = candleClosedAt - 2 * interval;
+        const [hourly, background] = await Promise.all([
+          provider.candles(symbol, "1h", contextAt, signal).then(candles => frame(candles, "1h")),
+          provider.candles(symbol, "4h", contextAt, signal).then(candles => frame(candles, "4h")),
         ]);
-        const rules = scanRules(short!, hourly!, background!);
-        record = { ...basis, status: rules.some(rule => rule.status === "passed") ? "passed" :
+        const rules = scanRules(short, hourly, background);
+        record = { ...basis, candleClosedAt, status: rules.some(rule => rule.status === "passed") ? "passed" :
           rules.some(rule => rule.status === "watch") ? "watch" : rules.some(rule => rule.status === "filtered") ? "filtered" : "none",
-        close: short!.close, rvol20: short!.volumeRatio20, trend4h: background!.trend, rules };
+        close: short.close, rvol20: short.volumeRatio20, trend4h: background.trend, rules };
       } catch (error) {
-        if (error instanceof AppError && error.code === "SCAN_CANDLE_NOT_CLOSED") throw error;
-        record = { ...basis, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
+        record = { ...basis, candleClosedAt, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
       }
-      const created = await store.create(keyFor(slot), record);
-      return created ? { slot, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode } : {}) } : { slot, duplicate: true };
+      await store.appendJsonLine(logKey(scannedAt), record);
+      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode } : {}) };
     },
     async list(input: Record<string, unknown>) {
-      const latest = slotFor(now());
-      const oldest = latest - historyDays * 24 * 4 * interval;
-      const before = input.before === undefined ? latest + interval : input.before;
-      if (Object.keys(input).some(key => key !== "before") || typeof before !== "number" || !Number.isSafeInteger(before) ||
-        before % interval !== 0 || before <= oldest || before > latest + interval) {
-        throw scanError("INVALID_SCAN_CURSOR", "扫描记录分页参数无效。");
-      }
-      const slots = Array.from({ length: pageSize }, (_, i) => before - (i + 1) * interval).filter(slot => slot >= oldest);
-      const rows = await limited(slots.map(slot => () => store.read(keyFor(slot))), 4);
-      const start = slots.at(-1)!;
-      return { records: rows.filter(row => row !== null), from: start, to: before - interval, next: start > oldest ? start : null };
+      if (input.version !== 2) return listLegacy(input);
+      const latest = now();
+      const oldest = hourFor(latest) - historyDays * 24 * hour;
+      const before = typeof input.before === "string" ? cursorFormat.exec(input.before) : null;
+      const to = before ? Number(before[1]) : latest;
+      if (Object.keys(input).some(key => key !== "version" && key !== "before") || input.before !== undefined && !before ||
+        to < oldest || to > latest) throw scanError("INVALID_SCAN_CURSOR", "扫描记录分页参数无效。");
+      const from = Math.max(oldest, to - pageWindow + 1);
+      const hours = Array.from({ length: (hourFor(to) - hourFor(from)) / hour + 1 }, (_, i) => hourFor(to) - i * hour);
+      const slots = Array.from({ length: pageSize + 1 }, (_, i) => slotFor(to) - i * interval).filter(slot => slot >= from);
+      const reads: (() => Promise<unknown[]>)[] = hours.map(h => () => store.readJsonLines(logKey(h), 8 * 1024 * 1024));
+      for (const slot of slots) reads.push(async () => {
+        const row = asObject(await store.read(legacyKey(slot)));
+        return row ? [{ ...row, time: slot, id: `legacy-${slot}`, scannedAt: null,
+          candleClosedAt: row.status === "error" ? null : slot }] : [];
+      });
+      const rows = (await limited(reads, 4)).flat().flatMap(value => {
+        const item = asObject(value);
+        if (!item || typeof item.id !== "string" || !/^[a-z0-9-]{1,60}$/.test(item.id) ||
+          typeof item.time !== "number" || !Number.isSafeInteger(item.time) || item.time < from || item.time > to ||
+          (before && item.time === to && item.id >= before[2]!)) return [];
+        return [{ record: item, time: item.time, id: item.id }];
+      }).sort((a, b) => b.time - a.time || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+      const visible = rows.slice(0, pageSize);
+      const last = visible.at(-1);
+      const hasMore = rows.length > pageSize && last;
+      return { records: visible.map(item => item.record), from: hasMore ? last.time : from, to,
+        next: hasMore ? `${last.time}:${last.id}` : from > oldest ? `${from}:` : null };
     },
   };
 }

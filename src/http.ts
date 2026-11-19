@@ -1,6 +1,6 @@
 import { AppError } from "./errors.js";
 
-export async function boundedJson(response: Response, limit: number, code: string): Promise<unknown> {
+async function parseBounded<T>(response: Response, limit: number, code: string, parse: (body: string) => T): Promise<T> {
   const size = response.headers.get("content-length");
   if (size && Number(size) > limit) {
     await response.body?.cancel().catch(() => {});
@@ -18,12 +18,20 @@ export async function boundedJson(response: Response, limit: number, code: strin
       if (length > limit) throw new AppError(code, "上游响应超过大小限制。", 502);
       chunks.push(value);
     }
-    return JSON.parse(Buffer.concat(chunks, length).toString("utf8"));
+    return parse(Buffer.concat(chunks, length).toString("utf8"));
   } catch (error) {
     await reader.cancel().catch(() => {});
     if (error instanceof AppError) throw error;
     throw new AppError(code, "上游响应格式无效或读取中断。", 502, undefined, undefined, { cause: error });
   } finally { reader.releaseLock(); }
+}
+
+export function boundedJson(response: Response, limit: number, code: string): Promise<unknown> {
+  return parseBounded(response, limit, code, JSON.parse);
+}
+
+export function boundedJsonLines(response: Response, limit: number, code: string): Promise<unknown[]> {
+  return parseBounded(response, limit, code, body => body.trim() ? body.trim().split("\n").map(line => JSON.parse(line)) : []);
 }
 
 export async function limited<T>(tasks: (() => Promise<T>)[], concurrency = 2): Promise<T[]> {

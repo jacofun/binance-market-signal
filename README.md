@@ -187,13 +187,13 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 ## BTCUSDT 自动扫描
 
-独立的 FC 事件入口 `POST /invoke` 处理名为 `binance-market-scanner` 的定时触发器。建议使用 `10 */15 * * * *`，在每根 15m K 线收盘后留出 10 秒给行情数据发布。触发消息可留空。扫描使用币安公开的 USDT-M 行情，固定扫描 BTCUSDT 的已收盘 K 线。手工分析、查单、保护单恢复及交易复盘走各自的入口。
+独立的 FC 事件入口 `POST /invoke` 处理名为 `binance-market-scanner` 的定时触发器。触发频率由 FC 配置，触发消息可留空。每次收到事件都会重新读取币安公开的 BTCUSDT U 本位行情，按币安服务器时间选取已返回的最新一根 15m 已收盘 K 线。收盘数据发布稍迟时允许使用前一根已收盘线，缺两根或行情不连续时写入失败记录。手工分析、查单、保护单恢复及交易复盘走各自的入口。
 
 - **顺势突破**要求 15m 收盘穿越已确认的 1h 关键区、相对成交量达到 1.5 倍、4h 趋势一致，且收盘距穿越边缘不超过 1 倍 15m ATR，到下一个反向区至少有 1 倍 15m ATR。
 - **假突破回收**要求盘中穿过边缘且重新收进区间，随后一根收盘向回收方向继续移动。确认后检查与区间边缘的距离和到反向区的空间。两类规则都用形态开始前已知的 1h 区域。找不到下一个反向区时记录为数据不足。
-- 通过、待确认、过滤、无触发及行情失败都会记录。每个收盘时段使用单独的 OSS 对象 `private/market-signal-scanner/v1/BTCUSDT/<closeBoundaryEpochMs>.json`，重复触发复用该时段。刊登在交易日志的「自动扫描」页时每页最多覆盖 16 个时段，可回看最近 30 天。通过初筛只代表规则命中。
+- 通过、待确认、过滤、无触发及行情失败都会记录。每次执行分别记录扫描时间和 K 线收盘时间，通过 OSS AppendObject 追加到 `private/market-signal-scanner/v1/BTCUSDT/runs/<utcHourEpochMs>.ndjson`。同一根 K 线可对应多条记录。交易日志 v2 列表按扫描时间倒序，每页最多 16 条，在最多四小时的窗口内翻页，可回看最近 30 天。原按收盘时段保存的 JSON 记录继续可查，扫描时间显示为空。通过初筛只代表规则命中。
 
-扫描使用函数已有的 `ACCESS_KEY_ID`、`ACCESS_KEY_SECRET`。配置 `SIGNAL_SCANNER_OSS_BUCKET`、`SIGNAL_SCANNER_OSS_REGION` 和可选的 `SIGNAL_SCANNER_OSS_NETWORK`（`public` 或 `internal`），未设置时分别复用 `SIGNAL_ORDER_OSS_BUCKET`、`SIGNAL_ORDER_OSS_REGION`、`SIGNAL_ORDER_OSS_NETWORK`，网络最终缺省为 `public`。授予扫描前缀 `oss:GetObject` 和 `oss:PutObject`。选择从未启用版本控制的 Bucket 可让 OSS 原子防覆盖头生效。列表按时间槽直接读取对象，无需列桶权限。
+扫描使用函数已有的 `ACCESS_KEY_ID`、`ACCESS_KEY_SECRET`。配置 `SIGNAL_SCANNER_OSS_BUCKET`、`SIGNAL_SCANNER_OSS_REGION` 和可选的 `SIGNAL_SCANNER_OSS_NETWORK`（`public` 或 `internal`），未设置时分别复用 `SIGNAL_ORDER_OSS_BUCKET`、`SIGNAL_ORDER_OSS_REGION`、`SIGNAL_ORDER_OSS_NETWORK`，网络最终缺省为 `public`。授予扫描前缀 `oss:GetObject` 和 `oss:PutObject`。记录使用 OSS 追加位置校验处理并发，需要 Bucket 的保留策略允许追加。读取和写入仍使用原有扫描前缀，无需列桶权限。
 
 CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` 可以原路径转发或改写为 `/scans`，透传原有 JWT 到 FC。列表复用站点所有者的短期交易凭证。扫描日志可按 `market_scan_recorded` 和 `market_scan_request_failed` 检索。扫描不访问百炼、不会生成下单草稿。
 

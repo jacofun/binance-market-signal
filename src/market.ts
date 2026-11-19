@@ -20,7 +20,7 @@ function timestamp(value: unknown): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) throw badData();
   return Number(value);
 }
-export function parseCandles(raw: unknown, interval: Interval, serverTime: number): Candle[] {
+export function parseCandles(raw: unknown, interval: Interval, serverTime: number, allowOneMissingClose = false): Candle[] {
   if (!Array.isArray(raw) || raw.length > 300) throw badData();
   const period = INTERVAL_MS[interval];
   const rows = raw.map((row: unknown) => {
@@ -33,8 +33,9 @@ export function parseCandles(raw: unknown, interval: Interval, serverTime: numbe
       c.takerBuyVolume > c.volume + 1e-8) throw badData();
     return c;
   }).filter(c => c.closeTime < serverTime);
+  const expectedClose = Math.floor(serverTime / period) * period - 1;
   if (rows.length < 60 || rows.some((c, i) => i > 0 && c.openTime !== rows[i - 1]!.openTime + period) ||
-    rows.at(-1)!.closeTime !== Math.floor(serverTime / period) * period - 1) throw badData();
+    rows.at(-1)!.closeTime < expectedClose - (allowOneMissingClose ? period : 0)) throw badData();
   return rows.slice(-CANDLE_LIMIT);
 }
 
@@ -124,8 +125,8 @@ export class RestMarketDataProvider implements MarketDataProvider {
     if (age < -2000 || age > this.config.maxPriceAgeMs) throw new AppError("STALE_MARKET_DATA", "最新标记价格已过期，本次不生成有效机会。", 503);
     return q;
   }
-  async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
-    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(CANDLE_LIMIT + 1), endTime: String(at) }, signal), interval, at);
+  async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
+    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(CANDLE_LIMIT + 1), endTime: String(at) }, signal), interval, at, allowOneMissingClose);
   }
   async openInterest(symbol: string, at: number, signal: AbortSignal): Promise<Snapshot["openInterest"]> {
     const raw = await this.get("/futures/data/openInterestHist", { symbol, period: "1h", limit: "12" }, signal);

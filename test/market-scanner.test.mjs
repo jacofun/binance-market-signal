@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { scanRules } from "../build/market-scanner.js";
 import { INTERVAL_MS } from "../build/market.js";
@@ -59,29 +60,39 @@ async function server(t, envOverride = {}, marketFailure = false) {
   const objects = new Map();
   const logs = [];
   let modelCalls = 0;
+  const state = { now: NOW + 10000, marketFailure, missingCloses: 0 };
   const scannerFetch = async (input, options) => {
     const url = new URL(input);
     calls.push({ host: url.hostname, path: url.pathname, params: url.searchParams, method: options.method ?? "GET" });
     if (url.hostname === "scan-test.oss-cn-hangzhou.aliyuncs.com") {
       assert.match(options.headers.authorization, /^OSS4-HMAC-SHA256 Credential=/);
-      if (options.method === "PUT") {
-        assert.equal(options.headers["x-oss-forbid-overwrite"], "true");
-        if (objects.has(url.pathname)) return new Response(null, { status: 409 });
-        objects.set(url.pathname, JSON.parse(options.body));
+      if (options.method === "POST") {
+        assert.equal(url.searchParams.has("append"), true);
+        assert.equal(options.headers["content-type"], "application/x-ndjson");
+        assert.equal(options.headers["content-md5"], createHash("md5").update(options.body).digest("base64"));
+        const previous = objects.get(url.pathname) ?? "";
+        const length = Buffer.byteLength(previous);
+        if (Number(url.searchParams.get("position")) !== length) {
+          return new Response(null, { status: 409, headers: { "x-oss-next-append-position": String(length) } });
+        }
+        objects.set(url.pathname, previous + options.body);
         return new Response(null);
       }
-      return objects.has(url.pathname) ? Response.json(objects.get(url.pathname)) :
+      const object = objects.get(url.pathname);
+      return typeof object === "string" ? new Response(object) : object ? Response.json(object) :
         new Response(null, { status: 404, headers: { "x-oss-request-id": "test-oss-id" } });
     }
     assert.equal(url.hostname, "fapi.binance.com");
     assert.equal(options.headers["X-MBX-APIKEY"], undefined);
-    if (marketFailure) return new Response(null, { status: 429 });
-    if (url.pathname === "/fapi/v1/time") return Response.json({ serverTime: NOW + 10000 });
+    if (state.marketFailure) return new Response(null, { status: 429 });
+    if (url.pathname === "/fapi/v1/time") return Response.json({ serverTime: state.now });
     assert.equal(url.pathname, "/fapi/v1/klines");
-    return Response.json(klines(INTERVAL_MS[url.searchParams.get("interval")], Number(url.searchParams.get("endTime"))));
+    const timeframe = url.searchParams.get("interval");
+    const values = klines(INTERVAL_MS[timeframe], Number(url.searchParams.get("endTime")));
+    return Response.json(timeframe === "15m" && state.missingCloses ? values.slice(0, -1 - state.missingCloses) : values);
   };
   const runtime = makeServer({ env: { SIGNAL_ORDER_OSS_BUCKET: "scan-test", SIGNAL_ORDER_OSS_REGION: "cn-hangzhou",
-    ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", ...envOverride }, now: () => NOW + 10000,
+    ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", ...envOverride }, now: () => state.now,
     scannerFetch, provider: provider(), model: async () => { modelCalls++; return modelResult(); },
     logger: { info: line => logs.push(line), error: line => logs.push(line) } });
   runtime.listen(0, "127.0.0.1");
@@ -93,47 +104,99 @@ async function server(t, envOverride = {}, marketFailure = false) {
     return { status: response.status, data: await response.json() };
   };
   const invoke = (input = timer, headers = {}) => post("/invoke", input, { "x-fc-request-id": "fc-test", ...headers });
-  return { post, invoke, calls, objects, logs, modelCalls: () => modelCalls };
+  return { post, invoke, calls, objects, logs, state, modelCalls: () => modelCalls };
 }
 
-test("FC scan uses only public market REST and OSS, produces one row and exposes a bounded read page", async t => {
+const auth = { "X-JWT-Token": jwt() };
+const rowsAt = (app, time = NOW) => {
+  const hour = Math.floor(time / INTERVAL_MS["1h"]) * INTERVAL_MS["1h"];
+  const key = `/private/market-signal-scanner/v1/BTCUSDT/runs/${hour}.ndjson`;
+  return (app.objects.get(key) || "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+};
+
+test("every invocation scans the latest available closed data and produces a separate row even for the same candle", async t => {
   const app = await server(t);
-  const unauth = await app.post("/trade/api/signal/scans", {});
-  assert.equal(unauth.status, 401);
+  assert.equal((await app.post("/trade/api/signal/scans", { version: 2 })).status, 401);
   assert.equal(app.calls.length, 0);
   const scan = await app.invoke();
   assert.equal(scan.status, 200, JSON.stringify(scan));
   assert.equal(scan.data.status, "none");
-  assert.equal(app.objects.size, 1);
+  assert.equal(scan.data.candleClosedAt, NOW);
+  assert.equal(scan.data.scannedAt, NOW + 10000);
+  const prior = app.state.now;
+  app.state.now += 20000;
+  // Replayed delivery of the same triggerTime still scans the current exchange data.
+  const repeated = await app.invoke();
+  assert.equal(repeated.data.candleClosedAt, NOW);
+  assert.equal(repeated.data.scannedAt, app.state.now);
+  assert.equal(rowsAt(app).length, 2);
+  assert.notEqual(rowsAt(app)[0].id, rowsAt(app)[1].id);
   assert.equal(app.modelCalls(), 0);
   const market = app.calls.filter(call => call.host === "fapi.binance.com");
-  assert.equal(market.length, 4);
-  assert.equal(market.find(call => call.params.get("interval") === "15m").params.get("endTime"), String(NOW));
+  assert.equal(market.length, 8);
+  assert.deepEqual(market.filter(call => call.params.get("interval") === "15m").map(call => call.params.get("endTime")),
+    [String(prior), String(app.state.now)]);
   assert.ok(market.filter(call => ["1h", "4h"].includes(call.params.get("interval"))).every(call =>
     call.params.get("endTime") === String(NOW - 2 * period)));
-  assert.equal((await app.invoke()).data.duplicate, true);
-  assert.equal(app.calls.filter(call => call.host === "fapi.binance.com").length, 4);
-  const read = await app.post("/trade/api/signal/scans", {}, { "X-JWT-Token": jwt() });
-  assert.equal(read.data.records[0].slot, NOW);
+  const read = await app.post("/trade/api/signal/scans", { version: 2 }, auth);
+  assert.deepEqual(read.data.records.map(row => row.scannedAt), [app.state.now, prior]);
   assert.equal(read.data.records[0].rules.length, 2);
-  assert.equal(read.data.next, NOW - 15 * period);
-  const older = await app.post("/scans", { before: read.data.next }, { "X-JWT-Token": jwt() });
+  assert.equal(read.data.next, `${read.data.from}:`);
+  const older = await app.post("/scans", { version: 2, before: read.data.next }, auth);
   assert.deepEqual(older.data.records, []);
-  assert.equal((await app.post("/scans", { before: NOW + 2 * period }, { "X-JWT-Token": jwt() })).status, 400);
-  assert.equal((await app.post("/scans", { action: "run" }, { "X-JWT-Token": jwt() })).status, 400);
+  assert.equal((await app.post("/scans", { version: 2, before: `${app.state.now + period}:` }, auth)).status, 400);
+  assert.equal((await app.post("/scans", { version: 2, action: "run" }, auth)).status, 400);
   assert.ok(app.logs.some(log => log.includes("market_scan_recorded")));
 });
 
-test("invalid events are rejected and a failed scan still leaves a diagnostic row", async t => {
+test("at a publication delay the scanner uses the preceding closed candle, then the newly published candle on the next invocation", async t => {
+  const app = await server(t);
+  app.state.missingCloses = 1;
+  const delayed = await app.invoke();
+  assert.equal(delayed.data.candleClosedAt, NOW - period);
+  app.state.missingCloses = 0;
+  const available = await app.invoke();
+  assert.equal(available.data.candleClosedAt, NOW);
+  app.state.missingCloses = 2;
+  const stale = await app.invoke();
+  assert.equal(stale.data.status, "error");
+  assert.equal(stale.data.errorCode, "INVALID_MARKET_DATA");
+  assert.equal(rowsAt(app).length, 3);
+});
+
+test("invalid events are rejected and an earlier failure never stops the next invocation", async t => {
   const app = await server(t, {}, true);
   assert.equal((await app.post("/invoke", timer)).status, 404);
-  assert.equal((await app.invoke({ ...timer, triggerTime: new Date(NOW - period).toISOString() })).data.error.code, "INVALID_SCAN_TIMER");
+  assert.equal((await app.invoke({ ...timer, triggerTime: "bad-time" })).data.error.code, "INVALID_SCAN_TIMER");
   assert.equal((await app.invoke(timer, { Origin: "https://yanxiao.me" })).status, 401);
   assert.equal((await app.invoke({ ...timer, triggerName: "unknown" })).status, 401);
   assert.equal(app.calls.length, 0);
   const failure = await app.invoke();
   assert.deepEqual([failure.status, failure.data.status, failure.data.errorCode], [200, "error", "BINANCE_RATE_LIMITED"]);
+  app.state.marketFailure = false;
+  const next = await app.invoke({ ...timer, triggerTime: new Date(NOW - period).toISOString() });
+  assert.equal(next.data.candleClosedAt, NOW);
+  assert.equal(rowsAt(app).length, 2);
   assert.equal(app.modelCalls(), 0);
+});
+
+test("scan history includes legacy rows and paginates concurrent records with the same scan time", async t => {
+  const app = await server(t);
+  await app.invoke();
+  const [record] = rowsAt(app);
+  const shard = [...app.objects.keys()][0];
+  app.objects.set(shard, Array.from({ length: 17 }, (_, i) => JSON.stringify({ ...record, id: `run-${String(i).padStart(2, "0")}` })).join("\n") + "\n");
+  app.objects.set(`/private/market-signal-scanner/v1/BTCUSDT/${NOW}.json`, {
+    symbol: "BTCUSDT", slot: NOW, rulesVersion: "v1", status: "none", close: record.close, rvol20: record.rvol20, trend4h: record.trend4h, rules: record.rules,
+  });
+  const first = (await app.post("/scans", { version: 2 }, auth)).data;
+  assert.equal(first.records.length, 16);
+  assert.equal(first.records[0].id, "run-16");
+  const next = (await app.post("/scans", { version: 2, before: first.next }, auth)).data;
+  assert.deepEqual(next.records.map(row => row.id), ["run-00", `legacy-${NOW}`]);
+  assert.equal(next.records[1].scannedAt, null);
+  assert.equal(next.records[1].candleClosedAt, NOW);
+  assert.equal((await app.post("/scans", {}, auth)).data.records[0].slot, NOW);
 });
 
 test("missing scanner credentials leave existing model analysis independent", async t => {

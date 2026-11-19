@@ -13,7 +13,7 @@ import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
-import { makeMarketScanner, scanSlot, SCANNER_TRIGGER } from "./market-scanner.js";
+import { makeMarketScanner, validateScanTimer, SCANNER_TRIGGER } from "./market-scanner.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -98,8 +98,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         // ingress remains subject to the existing JWT policy audited by CI.
         if (path === "/invoke" && !origin && input.triggerName === SCANNER_TRIGGER) {
           scanAction = "run";
-          const slot = scanSlot(input, now());
-          const result = await makeMarketScanner(env, now, scannerFetch).run(slot);
+          validateScanTimer(input, now());
+          const result = await makeMarketScanner(env, now, scannerFetch).run(requestId);
           const log = { event: "market_scan_recorded", requestId, ...result, elapsedMs: now() - startedAt };
           if ("errorCode" in result) logger.error(JSON.stringify(log));
           else logger.info(JSON.stringify(log));

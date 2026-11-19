@@ -1,7 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
 import type { OrderConfig } from "./order-auth.js";
 import { AppError } from "./errors.js";
-import { boundedJson } from "./http.js";
+import { boundedJson, boundedJsonLines } from "./http.js";
 
 export interface OrderStore {
   assertAtomicWrites(): Promise<void>;
@@ -13,11 +13,14 @@ export interface OrderStore {
 
 type OssConfig = Pick<OrderConfig, "region" | "bucket" | "ossHost" | "prefix" | "ossKey" | "ossSecret">;
 
-export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore {
+export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore & {
+  appendJsonLine(path: string, value: unknown): Promise<void>;
+  readJsonLines(path: string, limit: number): Promise<unknown[]>;
+} {
   const storageCode = `${domain}_STORAGE_UNAVAILABLE`;
   const label = domain === "SCAN" ? "扫描记录" : "订单";
   async function request(method: string, path = "", value?: unknown, query = "", overwrite = false) {
-    const body = value === undefined ? undefined : JSON.stringify(value);
+    const body = value === undefined ? undefined : JSON.stringify(value) + (method === "POST" ? "\n" : "");
     const date = new Date(now()).toISOString().replace(/[-:]|\.\d{3}/g, "");
     const scope = `${date.slice(0, 8)}/${config.region}/oss/aliyun_v4_request`;
     const payload = "UNSIGNED-PAYLOAD";
@@ -27,6 +30,12 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
       headers["content-md5"] = createHash("md5").update(body!).digest("base64");
       if (!overwrite) headers["x-oss-forbid-overwrite"] = "true";
       headers["x-oss-server-side-encryption"] = "AES256";
+    } else if (method === "POST") {
+      headers["content-type"] = "application/x-ndjson";
+      headers["content-md5"] = createHash("md5").update(body!).digest("base64");
+      if (query === "append&position=0") {
+        headers["x-oss-server-side-encryption"] = "AES256";
+      }
     }
     const resource = path ? `/${config.prefix}/${path}` : "/";
     const canonicalHeaders = Object.keys(headers).sort().map(name => `${name}:${headers[name]}\n`).join("");
@@ -68,6 +77,26 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
       const response = await request("PUT", path, value, "", true);
       await response.body?.cancel().catch(() => {});
       if (!response.ok) throw unavailable(response);
+    },
+    async appendJsonLine(path, value) {
+      let position = 0;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const response = await request("POST", path, value, `append&position=${position}`);
+        await response.body?.cancel().catch(() => {});
+        if (response.ok) return;
+        const next = Number(response.headers.get("x-oss-next-append-position"));
+        if (response.status !== 409 || !Number.isSafeInteger(next) || next <= position || attempt === 4) throw unavailable(response);
+        position = next;
+      }
+    },
+    async readJsonLines(path, limit) {
+      const response = await request("GET", path);
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => {});
+        if (response.status === 404 && response.headers.get("x-oss-request-id")) return [];
+        throw unavailable(response);
+      }
+      return boundedJsonLines(response, limit, storageCode);
     },
     async read(path) {
       const response = await request("GET", path);
