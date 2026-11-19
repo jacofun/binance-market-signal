@@ -142,11 +142,23 @@ def smoke(client, target, expected_commit):
         if not isinstance(raw, bytes) or len(raw) > 4096:
             raise ValueError()
         result = json.loads(raw)
-        if (response.status_code != 200 or result.get("status") != "ok" or result.get("service") != "binance-market-signal"
-                or result.get("nodeMajor") != 24 or result.get("codeVersion") != expected_commit):
+        if not isinstance(result, dict):
             raise ValueError()
-    except (TypeError, ValueError, AttributeError):
-        raise DeployError("Cold-start health/version probe failed; inspect FC startup logs and Node.js 24 layer/PATH.") from None
+    except (TypeError, ValueError):
+        result = {}
+    service_ready = result.get("status") == "ok" and result.get("service") == "binance-market-signal"
+    node_major = result.get("nodeMajor")
+    actual_commit = result.get("codeVersion")
+    if response.status_code != 200 or not service_ready or node_major != 24 or actual_commit != expected_commit:
+        known_codes = {"UNAUTHORIZED", "NOT_FOUND", "UNSUPPORTED_MEDIA_TYPE", "CUSTOM_DOMAIN_REQUIRED", "CORS_FORBIDDEN"}
+        error = result.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        diagnostics = {"event": "fc_health_probe_mismatch", "httpStatus": response.status_code, "serviceReady": service_ready,
+                       "nodeMajor": node_major if type(node_major) is int else None,
+                       "actualCommit": actual_commit if isinstance(actual_commit, str) and re.fullmatch(r"[0-9a-f]{40}", actual_commit) else None,
+                       "errorCode": code if isinstance(code, str) and code in known_codes else None}
+        print(json.dumps(diagnostics), flush=True)
+        return None
     return {"health": "ok", "nodeMajor": 24, "codeVersion": expected_commit}
 
 
@@ -183,8 +195,15 @@ def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
             result = {"functionName": name, "region": target["region"], "runtime": deployed.runtime,
                       "timeout": deployed.timeout, "codeChecksum": checksum,
                       "zipSha256": hashlib.sha256(package).hexdigest(), "sourceCommit": expected_commit}
-            result.update(smoke(client, target, expected_commit))
-            return result
+            # Readback can be current while a warm worker still serves the old
+            # version. Retry only the read-only probe and never re-upload here.
+            for attempt in range(5):
+                health = smoke(client, target, expected_commit)
+                if health is not None:
+                    return {**result, **health}
+                if attempt < 4:
+                    sleep(5)
+            raise DeployError("Cold-start health/version probe failed; inspect fc_health_probe_mismatch and FC startup logs.")
         sleep(5)
     raise DeployError("FC deployment readback timed out; inspect the FC console before retrying.")
 

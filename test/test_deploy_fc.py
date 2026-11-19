@@ -88,6 +88,13 @@ class DeployTests(unittest.TestCase):
             with self.assertRaisesRegex(module.DeployError, "health/version"):
                 module.deploy(client, self.target, b"zip", sleep=lambda _: None)
 
+    def test_deploy_retries_read_only_health_when_a_worker_is_still_on_the_old_version(self):
+        client = FakeClient(health_commit="a" * 40)
+        with patch.object(client, "update_function_with_options", wraps=client.update_function_with_options) as update:
+            result = module.deploy(client, self.target, b"zip", sleep=lambda _: setattr(client, "health_commit", "development"))
+        self.assertEqual(result["codeVersion"], "development")
+        update.assert_called_once()
+
     def test_package_rejects_secrets_and_runtime_dependencies(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "test.zip"
