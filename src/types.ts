@@ -46,7 +46,7 @@ export interface ModelDecision {
   modelStatus: Proposal["status"];
   modelDirection: Proposal["direction"];
   modelSummary: string;
-  normalization?: "entry_missing" | "target_obstacle";
+  normalization?: "entry_missing" | "entry_out_of_bounds" | "target_obstacle";
 }
 export interface ModelResult {
   proposal: Proposal;

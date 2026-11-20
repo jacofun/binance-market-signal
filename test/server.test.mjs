@@ -119,7 +119,7 @@ test("model output diagnostics reach HTTP and logs without content or reasoning"
   assert.equal(logs.join("").includes("private-"), false);
 });
 test("zone failures log precise reasons and safe market context while preserving the HTTP contract", async t => {
-  for (const reason of ["zone_not_found", "zone_broken", "entry_out_of_bounds", "zone_wrong_kind", "target_out_of_bounds"]) {
+  for (const reason of ["zone_not_found", "zone_broken", "zone_wrong_kind", "target_out_of_bounds"]) {
     await t.test(reason, async t => {
       const logs = [];
       const market = snapshot();
@@ -131,7 +131,6 @@ test("zone failures log precise reasons and safe market context while preserving
       let field = "research.entryZoneId";
       if (reason === "zone_not_found") modelProposal.research.entryZoneId = "private-invalid-zone";
       if (reason === "zone_broken") zone.status = "broken";
-      if (reason === "entry_out_of_bounds") modelProposal.entry.min = 9979.9;
       if (reason === "zone_wrong_kind") { modelProposal.research.stopZoneId = "up"; field = "research.stopZoneId"; }
       if (reason === "target_out_of_bounds") { modelProposal.targets[0].price = 10230; field = "targets[0].price"; }
       modelProposal.summary = "private-model-prose";
@@ -165,7 +164,7 @@ test("zone failures log precise reasons and safe market context while preserving
         assert.equal(log.validation.requestedZoneId, undefined);
         assert.equal(log.validation.zoneCount, 5);
       }
-      if (reason === "zone_broken" || reason === "entry_out_of_bounds") {
+      if (reason === "zone_broken") {
         assert.equal(log.validation.zone.lower, 9980);
         assert.equal(log.validation.zone.upper, 10020);
         assert.deepEqual(log.validation.entry, modelProposal.entry);
@@ -178,6 +177,47 @@ test("zone failures log precise reasons and safe market context while preserving
       assert.equal(logs.join("").includes("private-"), false);
     });
   }
+});
+
+test("the reported short entry outside its zone returns a documented watch without an order", async t => {
+  const logs = [];
+  const market = snapshot();
+  market.quote.price = 61750;
+  const hourly = market.frames[1];
+  const resistance = { ...hourly.zones[0], id: "15m:resistance:1795178700000", interval: "15m", kind: "resistance",
+    lower: 61707.179300966774, upper: 61786.42069903323 };
+  const support = { ...hourly.zones[0], id: "support", lower: 61100, upper: 61200 };
+  hourly.zones = [support];
+  market.frames[2].zones = [resistance];
+  const raw = proposal({ direction: "short", entry: { min: 61617.8, max: 61786.4 }, stopLoss: 61800,
+    targets: [{ zoneId: support.id, price: 61200, reason: "支撑" }] });
+  raw.research.entryZoneId = raw.research.stopZoneId = resistance.id;
+  const { request } = await app(t, {
+    provider: provider({ snapshot: async () => market, quote: async () => market.quote }),
+    model: (...args) => analyzeWithModel(...args, async () =>
+      Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(raw) } }] })),
+    logger: { info: line => logs.push(JSON.parse(line)), error: line => logs.push(JSON.parse(line)) },
+  });
+
+  const response = await request();
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.status, "watch");
+  assert.equal(result.decision.modelStatus, "candidate");
+  assert.equal(result.decision.modelDirection, "short");
+  assert.equal(result.decision.reasons[0].code, "entry_out_of_bounds");
+  assert.match(result.decision.reasons[0].message, /61617\.8–61786\.4.*61707\.2–61786\.4/);
+  assert.deepEqual(result.opportunity.evidence, raw.evidence);
+  assert.equal(result.opportunity.entry, null);
+  assert.equal(result.opportunity.stopLoss, null);
+  assert.deepEqual(result.opportunity.targets, []);
+  assert.equal(result.orderPermit, undefined);
+  assert.deepEqual(logs.find(log => log.event === "analysis_completed").decisionReasons, ["entry_out_of_bounds"]);
+
+  raw.targets[0].price = 61200.1;
+  const invalid = await request();
+  assert.equal(invalid.status, 502);
+  assert.equal((await invalid.json()).error.outputReason, "unsupported_target");
 });
 
 test("Binance connection failures retain the nested native cause, stage and request path in logs", async t => {

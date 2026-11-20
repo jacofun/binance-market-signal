@@ -2,14 +2,14 @@ import { randomUUID } from "node:crypto";
 import { AppError } from "./errors.js";
 import { analyzeWithModel, evaluateProposal, RESEARCH_PROMPT_VERSION } from "./model.js";
 import type { Config } from "./config.js";
-import type { MarketDataProvider, ModelResult, Proposal, Style } from "./types.js";
+import type { MarketDataProvider, ModelDecision, ModelResult, Proposal, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
 import { assessResearch, researchContext } from "./research.js";
 import { candleRow } from "./market.js";
 
 export type Model = typeof analyzeWithModel;
 export type AnalysisStage = "market_snapshot" | "model" | "proposal_validation" | "quote_verification";
-type DecisionCode = "model_watch" | "model_none" | "entry_missing" | "target_obstacle" | "quote_outside_entry" |
+type DecisionCode = NonNullable<ModelDecision["normalization"]> | "model_watch" | "model_none" | "quote_outside_entry" |
   "analysis_age" | "quote_stale" | "quote_drift" | "quote_crossed_exit";
 interface DecisionReason { code: DecisionCode; message: string }
 

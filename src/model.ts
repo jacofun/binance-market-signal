@@ -6,7 +6,7 @@ import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
-export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v7";
+export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v8";
 export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
 export const AUTO_ORDER_PROMPT_VERSION = `${AUTO_SCAN_PROMPT_VERSION}-immediate-v1`;
 
@@ -146,7 +146,7 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
   return evaluateProposal(raw, snapshot).proposal;
 }
 
-export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResearchOnBlockedTarget = false): {
+export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResearchOnUnusablePlan = false): {
   proposal: Proposal; decision: ModelDecision;
 } {
   const r = object(raw, proposalSchema.required, "proposal");
@@ -231,7 +231,8 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
     }
 
     const entryZone = requireZone(p.research.entryZoneId, "research.entryZoneId", "unsupported_zone", { entry: p.entry });
-    if (!inside(p.entry.min, entryZone) || !inside(p.entry.max, entryZone)) reject("unsupported_zone", "research.entryZoneId",
+    const entryOutsideZone = !inside(p.entry.min, entryZone) || !inside(p.entry.max, entryZone);
+    if (entryOutsideZone && !preserveResearchOnUnusablePlan) reject("unsupported_zone", "research.entryZoneId",
       { reason: "entry_out_of_bounds", ...zoneReference(p.research.entryZoneId, entryZone), entry: p.entry,
         selectablePriceRange: selectablePriceRange(entryZone, snapshot.tickSize) });
 
@@ -249,13 +250,22 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
           selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) });
       const blocker = targetObstacles(zones, p, target.price, zone.id).find(obstacle => significantObstacle(obstacle) &&
         !p.targets.slice(0, i).some(earlier => inside(earlier.price, obstacle)));
-      if (blocker && !preserveResearchOnBlockedTarget) reject("target_obstacle", field, {
+      if (blocker && !preserveResearchOnUnusablePlan) reject("target_obstacle", field, {
         reason: "target_skips_obstacle", zone: zoneSummary(zone), price: target.price, blockingZone: zoneSummary(blocker),
       });
       blockedBy ??= blocker;
     }
     const volumeMetrics = volumePriceMetrics(snapshot);
     if (!p.evidence.some(e => volumeMetrics.includes(e.metric))) invalid("missing_volume_price_evidence", "evidence");
+    if (entryOutsideZone) {
+      const range = selectablePriceRange(entryZone, snapshot.tickSize);
+      const available = range ? `可选范围为 ${range.min}–${range.max}` : "该区域内没有符合价格步长的入场价";
+      return {
+        proposal: researchOnly(p, "入场区间超出引用区域",
+          `模型给出的入场区间 ${p.entry.min}–${p.entry.max} 超出所引用的 ${entryZone.interval} 区域，${available}。本次仅供观察。`),
+        decision: { ...decision, normalization: "entry_out_of_bounds" },
+      };
+    }
     if (blockedBy) {
       const range = selectablePriceRange(blockedBy, snapshot.tickSize);
       const area = `${blockedBy.interval} ${long ? "阻力区" : "支撑区"}${range ? `（${range.min}–${range.max}）` : ""}`;
@@ -302,7 +312,7 @@ summary 首句明确写出做多候选、做空候选、等待确认或放弃。
 candidate 表示现有证据和风险收益已支持尝试，不要求形态完美。${immediate ? "本次候选会进入即时下单复核。用已经出现的收盘证据判断，并要求当前报价在入场区内。如果某个尚未发生的条件是交易成立的必要前提，才为该条件等待。" : "实际入场仍须人工复核 triggerConditions。"}只要 direction 是 long 或 short，就必须提供完整计划，entry 必须是含数值 min 和 max 的对象，并给出 stopLoss、至少一个 target 及对应区间。只有方向参考、还没有可用入场区间时，输出无计划的 watch，在 summary 和周期解读中说明方向倾向以及仍需确认的条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 全部为 null，targets 为空数组，research.scenario 为 none。
 有计划时，在 triggerConditions 写明${immediate ? "已经出现的入场依据和下单前须复核的入场区间。将可承受的剩余不确定性写进 riskFactors。" : "入场前须复核的价格区和已有的可观察依据，注明周期和价位。"}止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
 
-有计划时，从 frames.zones 引用区域 ID。入场两端和每个目标价须落在各自引用区域的 selectablePriceRange.min 至 max 之间（含端点）。这是程序按 tickSize 向区间内取整的可用范围。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
+有计划时，从 frames.zones 引用区域 ID。先选 research.entryZoneId，再从同一区域的 selectablePriceRange 选择 entry.min 和 entry.max。输出前核对 selectablePriceRange.min ≤ entry.min ≤ entry.max ≤ selectablePriceRange.max，两个端点不可取自不同区域。每个目标价须落在它引用区域的 selectablePriceRange 内。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
 stopZoneId 引用有效结构作为止损参考，做多引用支撑、做空引用阻力。综合量价、局部失效位和 1h ATR 自主决定 stopLoss，区域边缘和 ATR 是研究参考。做空可以在阻力区内或其下方设置更近的止损，前提是止损严格高于 entry.max；做多止损严格低于 entry.min。解释为什么这个价位代表失效，以及较近止损被正常波动触发的风险。目标区做多选阻力，做空选支撑。按 effectiveKind 识别有效支阻，broken 区域不可用。
 目标按价格路径由近至远，合并查看全部周期。做空从 entry.min 向下，按有效支撑区的上沿由高到低考虑。做多从 entry.max 向上，按有效阻力区的下沿由低到高考虑。每个远端目标之前，若有整个区域位于入场边界和该目标之间、与引用目标区不重叠且 importantObstacle 为 true 的区域，目标列表必须先有一个价位落在该近端区域。即使近端是 15m、远端是 1h 或 4h，也按同一规则。无法先给出有依据的近端目标时，返回无计划的 watch 或 none。结合目标距离、历史波幅和反对证据说明依据，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。

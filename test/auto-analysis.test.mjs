@@ -222,6 +222,7 @@ test("auto ordering is gated by the two switches, market eligibility, heartbeat 
     [{ autoOrder: false }, undefined],
     [{ execution: false }, "ORDER_EXECUTION_DISABLED"],
     [{ proposal: noSetup }, "AUTO_ORDER_NOT_CANDIDATE"],
+    [{ proposal: proposal({ entry: { min: 9979.9, max: 10010 } }) }, "AUTO_ORDER_NOT_CANDIDATE"],
     [{ finalMark: 10020 }, "AUTO_ORDER_NOT_CANDIDATE"],
     [{ proposal: short }, "AUTO_ORDER_SCAN_DIRECTION_MISMATCH"],
     [{ noHeartbeat: true }, "ORDER_RECOVERY_NOT_READY"],
@@ -238,6 +239,11 @@ test("auto ordering is gated by the two switches, market eligibility, heartbeat 
     assert.equal(autoAnalysis.status, status, JSON.stringify({ override, autoAnalysis }));
     assert.equal(autoAnalysis.order?.code, expected, JSON.stringify({ override, autoAnalysis }));
     assert.equal(app.submissions.length, 0);
+    if (override.proposal?.entry?.min === 9979.9) {
+      const saved = JSON.parse(app.objects.get(`${archive}/records/${autoAnalysis.analysisId}.json`));
+      assert.equal(saved.decision.reasons[0].code, "entry_out_of_bounds");
+      assert.equal(saved.opportunity.entry, null);
+    }
   }
 });
 
@@ -305,7 +311,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   assert.equal(completed.modelStatus, "none");
   assert.deepEqual(completed.decisionReasons, ["model_none"]);
   assert.equal(completed.modelSummary, undefined);
-  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v7-auto-scan");
+  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v8-auto-scan");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));

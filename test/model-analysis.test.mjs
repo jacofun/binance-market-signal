@@ -92,6 +92,7 @@ test("model receives usable tick-aligned zone edges and a rounded-out entry stil
   const result = await analyzeWithModel(loadConfig(env), market, "trend", AbortSignal.timeout(1000), async (_url, options) => {
     const body = JSON.parse(options.body);
     assert.match(body.messages[0].content, /靠近边界时直接使用对应的 min 或 max/);
+    assert.match(body.messages[0].content, /selectablePriceRange.min ≤ entry.min ≤ entry.max ≤ selectablePriceRange.max/);
     const request = JSON.parse(body.messages[1].content);
     const [inputZone, narrow, exact, broken] = request.snapshot.frames.find(f => f.interval === "15m").zones;
     assert.deepEqual(inputZone, { ...entryZone, selectablePriceRange: selectable, effectiveKind: "resistance", importantObstacle: false });
@@ -137,7 +138,7 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v7");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v8");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);
