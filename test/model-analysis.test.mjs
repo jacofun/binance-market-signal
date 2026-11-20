@@ -42,9 +42,29 @@ test("Kimi receives the snapshot metric enum, price rules and a larger default o
     assert.ok(!metrics.includes("openInterest"));
     assert.match(prompt, /stopLoss < entry.min <= entry.max/);
     assert.match(prompt, /只能引用1个枚举指标/);
+    assert.match(prompt, /同一周期和同一成交量口径下，对比前一段趋势推进、反向调整和当前尝试恢复三段/);
+    assert.match(prompt, /用 15m 判断反向调整处于进行中、趋于停顿还是已确认顺势恢复/);
+    assert.match(prompt, /判断 1h 结构翻转时.*哪根 1h K 线收盘/);
+    assert.match(prompt, /时机未确认时，输出无计划的 watch/);
+    assert.match(prompt, /invalidationConditions 区分【未入场失效】和【持仓提前退出】/);
+    assert.doesNotMatch(prompt, /scanEvidence 是程序初筛/);
+    assert.equal(JSON.parse(body.messages[1].content).scanEvidence, undefined);
     assert.equal(body.max_tokens, 4096);
     return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal()) } }] }));
   });
+});
+
+test("manual analysis exposes labelled timing conditions and the prompt version through the existing result contract", async () => {
+  const triggerConditions = ["15m 成交 K 线收盘收复 10000，标记价格仍在入场区"];
+  const invalidationConditions = ["【未入场失效】15m 成交 K 线收低于 9980",
+    "【持仓提前退出】放量上行受阻后，15m 成交 K 线收低于 9990"];
+  const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
+    async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
+  assert.equal(result.schemaVersion, 4);
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v2");
+  assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
+  assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
+  assert.equal(result.opportunity.triggerVerified, false);
 });
 test("complete fenced JSON is accepted, while surrounding prose, corrupt JSON and reasoning are rejected", async () => {
   const json = JSON.stringify(proposal());

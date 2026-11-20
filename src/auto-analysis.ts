@@ -2,7 +2,7 @@ import { analyze, type AnalysisStage } from "./analysis.js";
 import { loadConfig, type Config, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
 import { autoOutcomePath, type AutoAnalysisOutcome, type ScanEvidence } from "./market-scanner.js";
-import { analyzeWithModel } from "./model.js";
+import { analyzeWithModel, AUTO_SCAN_PROMPT_VERSION } from "./model.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadOssConfig } from "./oss-config.js";
 import type { MarketDataProvider } from "./types.js";
@@ -136,7 +136,7 @@ export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, opti
       }, now, value => { stage = value; });
       analysisId = result.analysisId;
       stage = "archive";
-      const model = { ...result.model, promptVersion: "market-research-v4-auto-scan-v1" };
+      const model = { ...result.model, promptVersion: AUTO_SCAN_PROMPT_VERSION };
       await archiveResult(history, { ...result, model, requestId: evidence.scanId, scanEvidence: evidence });
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
         ...model, elapsedMs: now() - start }));

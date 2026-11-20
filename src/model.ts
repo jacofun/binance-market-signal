@@ -6,6 +6,9 @@ import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
+export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v2";
+export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
+
 const text = { type: "string", minLength: 1, maxLength: 600 };
 const list = { type: "array", items: text, maxItems: 8 };
 export const proposalSchema = {
@@ -227,15 +230,22 @@ export async function analyzeWithModel(config: Config, snapshot: Snapshot, style
       recentCandles: recentCandles.map(candleRow),
     })),
   };
-  const system = `你是币安 USDT 永续合约行情研究助手。仅使用提供的数据，以 4h 背景、1h 结构、15m 量价组织研究。recentCandles 为依 candleColumns 排列的全部收盘成交 K 线；quote.price 是标记价格。按 style 研究趋势延续、反转或无机会，不强行给出方向，不报告胜率或收益预测。
-volumePrice 最近5根，量比以此前20根均量为分母，CLV 为-1到1收盘位置；volumeWindows 对比等长前一阶段。结合量比、影线、创新高低、趋势一致性、区域的 breakRvol20、closesBeyondBreak 和 lastRetestRvol20，判断放量突破是否守住、缩量回踩或反弹。OI 与主动买量仅描述观测数据。
-research 说明 marketRegime、scenario、三个周期各自结论、风险和 researchHorizon（4、12或24小时）。历史分位数来自不重叠的成交K线窗口，属于历史描述。validForSeconds 在30至300之间，用于短期复核，与研究窗口独立。
-candidate 是待确认触发的候选。watch 可以给出完整计划，也可以与 none 一样清空方向、入场、止损、目标和区域引用，scenario 用 none。证据冲突或缺少结构目标时使用 watch 或 none。
+  const system = `你是币安 USDT 永续合约行情研究助手。仅使用提供的数据，以 4h 背景、1h 结构、15m 量价组织研究。recentCandles 为依 candleColumns 排列的全部收盘成交 K 线。quote.price 是标记价格。style 指示优先研究趋势延续或翻转，最终判断取决于证据。使用短句，不强行给出方向，不报告胜率或收益预测。
+
+量价按波段比较。在同一周期和同一成交量口径下，对比前一段趋势推进、反向调整和当前尝试恢复三段，指出价格推进幅度、每根均量或量比、收盘是否守住关键区。长短不同的波段比较每根均量或相对量，避免直接比较总量。放量时检查价格是否取得有效进展，缩量时检查价格是否仍能推进。对重要判断注明周期和观测值。缺少相应波段或可比数据时说明缺口，等待确认，不编造数据。
+volumePrice 为最近5根的明细，量比以此前20根均量为分母，CLV 为-1到1收盘位置。volumeWindows 对比等长前一阶段。可结合影线、创新高低、区域的 breakRvol20、closesBeyondBreak 和 lastRetestRvol20 判断突破后是否站稳。OI 与主动买量仅描述观测数据，不用来推断持仓者身份或开平方向。
+
+顺大周期、逆小周期。趋势延续以 4h 为方向依据，在 1h 找到回调仍属于原趋势的结构及失效边界，用 15m 判断反向调整处于进行中、趋于停顿还是已确认顺势恢复。趋势未破坏且 15m 已收盘确认恢复，例如收复回调内部阻力或跌破反弹内部支撑，才考虑候选。若参与整理后的顺势突破，说明 15m 收盘是否有效越过边缘、后续是否站稳，以及当前位置到首个目标的空间。确认后价格已远离合法入场区或紧贴重要反向区时，转为等待回测或放弃。
+翻转明确发生在哪个周期。比较原方向两次推进时价格与量能的变化，量价背离用作动能减弱证据。判断 1h 结构翻转时，指出原方向在哪个关键区推进失败，以及哪根 1h K 线收盘收复或跌破了哪个结构位。仅有 15m 背离、单根长影线或小周期回收时，等待相应级别确认。4h 方向不清时，按区间或转换分析，避免强行判为趋势延续。
+
+summary 首句明确写出做多候选、做空候选、等待确认或放弃。research 交代 marketRegime、scenario、三个周期的证据、风险和 researchHorizon（4、12或24小时）。历史分位数来自不重叠的成交 K 线窗口，属于历史描述。validForSeconds 在30至300之间，用于本次报价复核，与研究窗口独立。
+candidate 表示快照中已有时机证据，实际入场仍须人工复核 triggerConditions。方向有依据但时机未确认时，输出无计划的 watch，说明要等的周期、价位和收盘条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 为 null，targets 为空，scenario 为 none。
+有计划时，在 triggerConditions 写明入场前仍需核对的价格区和可观察的收盘条件，注明周期和价位。止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
+
 有计划时，从 frames.zones 引用区域 ID。entry 的两个端点须落在 entryZoneId 区域内。止损须在 stopZoneId 不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标价格在各自 zoneId 的区域内，按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
-按此 JSON Schema 输出：${JSON.stringify(schema)}${scanEvidence ? `
-以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
-开头直接给出一个结论：做多候选、做空候选、等待确认或放弃。避免同时陈列多空方向后不表态。等待时具体写出转为候选所缺的可观察条件，放弃时指出决定性的否决证据。保留有依据的反向证据，不虚构确定性、盈利承诺或超出结构的目标。` : ""}`;
+${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
+` : ""}按此 JSON Schema 输出：${JSON.stringify(schema)}`;
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }
