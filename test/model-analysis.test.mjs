@@ -4,6 +4,7 @@ import { analyzeWithModel, validateProposal } from "../build/model.js";
 import { analyze } from "../build/analysis.js";
 import { loadConfig } from "../build/config.js";
 import { RestMarketDataProvider } from "../build/market.js";
+import { makeOrderPermit } from "../build/order-auth.js";
 import { env, NOW, snapshot, proposal, modelResult, provider, quote, marketFetch } from "./fixtures.mjs";
 
 test("model JSON is validated beyond syntax, and invented metrics/confidence are rejected", () => {
@@ -45,7 +46,8 @@ test("Kimi receives the snapshot metric enum, price rules and a larger default o
     assert.match(prompt, /同一周期和同一成交量口径下，对比前一段趋势推进、反向调整和当前尝试恢复三段/);
     assert.match(prompt, /用 15m 判断反向调整处于进行中、趋于停顿还是已确认顺势恢复/);
     assert.match(prompt, /判断 1h 结构翻转时.*哪根 1h K 线收盘/);
-    assert.match(prompt, /时机未确认时，输出无计划的 watch/);
+    assert.match(prompt, /只有方向参考、还没有可用入场区间时，输出无计划的 watch/);
+    assert.match(prompt, /只要 direction 是 long 或 short，就必须提供完整计划/);
     assert.match(prompt, /invalidationConditions 区分【未入场失效】和【持仓提前退出】/);
     assert.doesNotMatch(prompt, /scanEvidence 是程序初筛/);
     assert.equal(JSON.parse(body.messages[1].content).scanEvidence, undefined);
@@ -104,10 +106,39 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v3");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v4");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);
+});
+
+test("directional replies with a null entry preserve research and cannot create order drafts", async () => {
+  for (const status of ["candidate", "watch"]) {
+    const raw = proposal({ status, direction: "short", entry: null });
+    let calls = 0;
+    const runModel = (config, market, style, signal) => analyzeWithModel(config, market, style, signal, async () => {
+      calls++;
+      return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(raw) } }] });
+    });
+    const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
+    assert.equal(calls, 1);
+    assert.equal(result.status, "watch");
+    assert.equal(result.opportunity.direction, null);
+    assert.equal(result.opportunity.entry, null);
+    assert.equal(result.opportunity.stopLoss, null);
+    assert.deepEqual(result.opportunity.targets, []);
+    assert.deepEqual(result.opportunity.triggerConditions, []);
+    assert.deepEqual(result.opportunity.invalidationConditions, []);
+    assert.match(result.opportunity.summary, /偏空.*未提供入场区间/);
+    assert.deepEqual(result.opportunity.evidence, raw.evidence);
+    assert.deepEqual(result.research.timeframeAnalysis, raw.research.timeframeAnalysis);
+    assert.equal(result.research.scenario, "none");
+    assert.equal(result.research.entryZoneId, null);
+    assert.equal(result.research.stopZoneId, null);
+    assert.equal(makeOrderPermit(result, "owner", NOW), undefined);
+  }
+  assert.throws(() => validateProposal(proposal({ entry: {} }), snapshot()),
+    { upstream: { outputReason: "schema", outputField: "entry" } });
 });
 test("complete fenced JSON is accepted, while surrounding prose, corrupt JSON and reasoning are rejected", async () => {
   const json = JSON.stringify(proposal());
