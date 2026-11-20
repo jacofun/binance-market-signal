@@ -141,6 +141,12 @@ test("qualified timer sends the actual checks once and archives the independent 
   const { analysisId } = run.autoAnalysis;
   const saved = JSON.parse(app.objects.get(`${archive}/records/${analysisId}.json`));
   assert.equal(saved.status, "none");
+  assert.equal(saved.decision.modelStatus, "none");
+  assert.equal(saved.decision.reasons[0].code, "model_none");
+  const completed = app.logs.find(log => log.event === "market_auto_analysis_completed" && log.analysisId === analysisId);
+  assert.equal(completed.modelStatus, "none");
+  assert.deepEqual(completed.decisionReasons, ["model_none"]);
+  assert.equal(completed.modelSummary, undefined);
   assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v5-auto-scan");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);

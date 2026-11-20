@@ -26,12 +26,19 @@ test("health and CORS work before business configuration; unauthorized calls do 
   assert.equal(denied.status, 401); assert.equal(calls, 0);
 });
 test("full prefix and CDN-rewritten root paths return opportunities using only X-JWT-Token", async t => {
-  const { request } = await app(t);
+  const logs = [];
+  const { request } = await app(t, { logger: { info: line => logs.push(JSON.parse(line)), error: silent.error } });
   for (const path of ["/trade/api/signal/analyze", "/trade/api/signal/", "/analyze", "/"]) {
     const response = await request(path, { symbol: "BTCUSDT" }, { Authorization: "OSS cdn-origin-signature", Origin: "https://www.yanxiao.me" });
     assert.equal(response.status, 200);
     const result = await response.json();
     assert.equal(result.status, "candidate"); assert.ok(result.requestId); assert.equal(result.opportunity.triggerVerified, false);
+    assert.equal(result.decision.modelStatus, "candidate");
+    const completed = logs.find(log => log.event === "analysis_completed" && log.requestId === result.requestId);
+    assert.equal(completed.modelStatus, "candidate");
+    assert.equal(completed.modelDirection, "long");
+    assert.deepEqual(completed.decisionReasons, []);
+    assert.equal(completed.modelSummary, undefined);
     assert.equal(response.headers.get("cache-control"), "no-store");
   }
   const wrong = await request("/trade/api/signal/analyze", { symbol: "BTCUSDT" }, { "X-JWT-Token": "", Authorization: jwt() });

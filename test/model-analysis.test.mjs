@@ -130,6 +130,8 @@ test("directional replies with a null entry preserve research and cannot create 
     assert.deepEqual(result.opportunity.triggerConditions, []);
     assert.deepEqual(result.opportunity.invalidationConditions, []);
     assert.match(result.opportunity.summary, /偏空.*未提供入场区间/);
+    assert.deepEqual(result.decision, { modelStatus: status, modelDirection: "short", modelSummary: raw.summary,
+      reasons: [{ code: "entry_missing", message: result.opportunity.summary }] });
     assert.deepEqual(result.opportunity.evidence, raw.evidence);
     assert.deepEqual(result.research.timeframeAnalysis, raw.research.timeframeAnalysis);
     assert.equal(result.research.scenario, "none");
@@ -180,12 +182,15 @@ test("a short target that skips the reported 15m support returns research withou
   assert.equal(observe.status, "watch");
   assert.deepEqual(observe.opportunity.evidence, skipped.evidence);
   assert.match(observe.opportunity.summary, /15m 支撑区.*61617\.8–61797\.7/);
+  assert.deepEqual(observe.decision, { modelStatus: "candidate", modelDirection: "short", modelSummary: skipped.summary,
+    reasons: [{ code: "target_obstacle", message: observe.opportunity.summary }] });
   assert.deepEqual(observe.opportunity.targets, []);
   assert.equal(makeOrderPermit(observe, "owner", NOW), undefined);
 
   response = complete;
   const candidate = await analyze(config, source, "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
   assert.equal(candidate.status, "candidate");
+  assert.deepEqual(candidate.decision.reasons, []);
   assert.deepEqual(candidate.opportunity.targets, complete.targets);
 });
 test("complete fenced JSON is accepted, while surrounding prose, corrupt JSON and reasoning are rejected", async () => {
@@ -342,9 +347,34 @@ test("fresh price is fetched after the model; drift, expiry and crossed prices i
   assert.equal(result.status, "candidate"); assert.equal(result.opportunity.triggerVerified, false); assert.equal(result.opportunity.rewardRisk[0].ratio, 190 / 110);
   const drifted = await analyze(config, provider({ quote: async () => quote({ price: 10100 }) }), "BTCUSDT", "trend", AbortSignal.timeout(1000), async () => modelResult(), () => NOW);
   assert.equal(drifted.status, "expired");
+  assert.equal(drifted.decision.modelStatus, "candidate");
+  assert.ok(drifted.decision.reasons.some(reason => reason.code === "quote_drift"));
+  assert.deepEqual(drifted.decision.reasons.map(reason => reason.message), drifted.opportunity.expiredReasons);
   const outOfRange = await analyze(config, provider({ quote: async () => quote({ price: 10020 }) }), "BTCUSDT", "trend", AbortSignal.timeout(1000), async () => modelResult(), () => NOW);
   assert.equal(outOfRange.status, "watch");
+  assert.equal(outOfRange.decision.modelStatus, "candidate");
+  assert.equal(outOfRange.decision.reasons[0].code, "quote_outside_entry");
+  assert.match(outOfRange.decision.reasons[0].message, /10020/);
+  assert.deepEqual(outOfRange.opportunity.entry, result.opportunity.entry);
   let time = NOW;
   const expired = await analyze(config, provider({ quote: async () => quote({ time }) }), "BTCUSDT", "trend", AbortSignal.timeout(1000), async () => { time += 61000; return modelResult(); }, () => time);
   assert.equal(expired.status, "expired");
+  assert.equal(expired.decision.reasons[0].code, "analysis_age");
+});
+
+test("a model watch or no-opportunity remains distinguishable when the final quote expires", async () => {
+  const config = loadConfig(env);
+  for (const status of ["watch", "none"]) {
+    const raw = proposal({ status, direction: null, entry: null, stopLoss: null, targets: [] });
+    const runModel = async () => modelResult(raw);
+    const result = await analyze(config, provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
+    assert.equal(result.status, status);
+    assert.equal(result.decision.modelStatus, status);
+    assert.equal(result.decision.modelDirection, null);
+    assert.equal(result.decision.reasons[0].code, `model_${status}`);
+    const stale = provider({ quote: async () => quote({ time: NOW - config.maxPriceAgeMs - 1 }) });
+    const expired = await analyze(config, stale, "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
+    assert.equal(expired.status, "expired");
+    assert.deepEqual(expired.decision.reasons.map(reason => reason.code), [`model_${status}`, "quote_stale"]);
+  }
 });

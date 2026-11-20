@@ -139,6 +139,8 @@ export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, opti
       const model = { ...result.model, promptVersion: AUTO_SCAN_PROMPT_VERSION };
       await archiveResult(history, { ...result, model, requestId: evidence.scanId, scanEvidence: evidence });
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
+        modelStatus: result.decision.modelStatus, modelDirection: result.decision.modelDirection,
+        decisionReasons: result.decision.reasons.map(reason => reason.code),
         ...model, elapsedMs: now() - start }));
       return { status: "completed", analysisId };
     } finally {

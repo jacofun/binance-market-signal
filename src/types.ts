@@ -42,7 +42,17 @@ export interface Proposal {
   counterarguments: string[]; validForSeconds: number;
   research: ResearchProposal;
 }
-export interface ModelResult { proposal: Proposal; usage: { inputTokens: number | null; outputTokens: number | null } }
+export interface ModelDecision {
+  modelStatus: Proposal["status"];
+  modelDirection: Proposal["direction"];
+  modelSummary: string;
+  normalization?: "entry_missing" | "target_obstacle";
+}
+export interface ModelResult {
+  proposal: Proposal;
+  decision?: ModelDecision;
+  usage: { inputTokens: number | null; outputTokens: number | null };
+}
 
 export type ResearchHours = 4 | 12 | 24;
 export type Trend = "up" | "down" | "flat";

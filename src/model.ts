@@ -4,7 +4,7 @@ import { effectiveKind } from "./price-zones.js";
 import { hourlyAtr, inside, researchContext, significantObstacle, structureZones, targetObstacles, zoneUsable } from "./research.js";
 import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
-import type { ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
+import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
 export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v5";
 export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
@@ -141,7 +141,13 @@ function researchOnly(p: Proposal, title: string, summary: string): Proposal {
   };
 }
 
-export function validateProposal(raw: unknown, snapshot: Snapshot, preserveResearchOnBlockedTarget = false): Proposal {
+export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
+  return evaluateProposal(raw, snapshot).proposal;
+}
+
+export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResearchOnBlockedTarget = false): {
+  proposal: Proposal; decision: ModelDecision;
+} {
   const r = object(raw, proposalSchema.required, "proposal");
   if (typeof r.status !== "string" || !["candidate", "watch", "none"].includes(r.status)) invalid("schema", "status");
   if (!["long", "short", null].includes(r.direction as string | null)) invalid("schema", "direction");
@@ -173,11 +179,15 @@ export function validateProposal(raw: unknown, snapshot: Snapshot, preserveResea
       riskFactors: strings(research.riskFactors, "research.riskFactors"),
     },
   };
+  const decision: ModelDecision = { modelStatus: p.status, modelDirection: p.direction, modelSummary: p.summary };
   // A directional outlook without an entry cannot become an order plan.
   // Preserve the validated research and discard all execution details.
   if (p.entry === null && p.direction !== null && p.status !== "none" && p.research.scenario !== "none") {
-    return researchOnly(p, "等待确认入场区间",
-      `模型给出了${p.direction === "long" ? "偏多" : "偏空"}的研究判断，但未提供入场区间。本次仅供观察。`);
+    return {
+      proposal: researchOnly(p, "等待确认入场区间",
+        `模型给出了${p.direction === "long" ? "偏多" : "偏空"}的研究判断，但未提供入场区间。本次仅供观察。`),
+      decision: { ...decision, normalization: "entry_missing" },
+    };
   }
 
   const noPlan = p.direction === null || p.status === "none";
@@ -254,11 +264,14 @@ export function validateProposal(raw: unknown, snapshot: Snapshot, preserveResea
     if (blockedBy) {
       const range = selectablePriceRange(blockedBy, snapshot.tickSize);
       const area = `${blockedBy.interval} ${long ? "阻力区" : "支撑区"}${range ? `（${range.min}–${range.max}）` : ""}`;
-      return researchOnly(p, "目标前方存在重要结构",
-        `模型提出的目标跳过了更近的 ${area}。本次仅供观察。`);
+      return {
+        proposal: researchOnly(p, "目标前方存在重要结构",
+          `模型提出的目标跳过了更近的 ${area}。本次仅供观察。`),
+        decision: { ...decision, normalization: "target_obstacle" },
+      };
     }
   }
-  return p;
+  return { proposal: p, decision };
 }
 
 export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal,
@@ -339,7 +352,7 @@ ${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构�
       const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(trimmed);
       let raw: unknown;
       try { raw = JSON.parse(fenced ? fenced[1]! : trimmed); } catch (error) { invalid("invalid_json", undefined, undefined, error); }
-      return { proposal: validateProposal(raw, snapshot, true), usage: { inputTokens: details.inputTokens!, outputTokens: details.outputTokens! } };
+      return { ...evaluateProposal(raw, snapshot, true), usage: { inputTokens: details.inputTokens!, outputTokens: details.outputTokens! } };
     } catch (error) {
       if (error instanceof AppError && error.code === "INVALID_MODEL_OUTPUT") {
         error.upstream = { ...details, outputReason: "response_envelope", ...error.upstream };

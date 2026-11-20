@@ -193,6 +193,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       send(200, { requestId, ...result, ...(orderPermit ? { orderPermit } : {}) });
       logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId,
         symbol: trace.symbol, style: trace.style, status: result.status, codeVersion: SOURCE_COMMIT,
+        modelStatus: result.decision.modelStatus, modelDirection: result.decision.modelDirection,
+        decisionReasons: result.decision.reasons.map(reason => reason.code),
         marketMs: result.timing.marketMs, modelMs: result.timing.modelMs, verificationMs: result.timing.verificationMs, totalMs: result.timing.totalMs,
       }));
     } catch (error) {
