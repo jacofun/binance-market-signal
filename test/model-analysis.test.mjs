@@ -54,6 +54,49 @@ test("Kimi receives the snapshot metric enum, price rules and a larger default o
   });
 });
 
+test("model receives usable tick-aligned zone edges and a rounded-out entry still fails validation", async () => {
+  const market = snapshot();
+  market.quote.price = 62200;
+  const [hourlyZone] = market.frames.find(f => f.interval === "1h").zones;
+  const entryZone = { ...hourlyZone, id: "15m:resistance:1795128300000", interval: "15m", kind: "resistance",
+    lower: 62173.64899614541, upper: 62427.85100385459 };
+  const targetZone = { ...hourlyZone, id: "target", lower: 61600, upper: 61800 };
+  const narrowZone = { ...entryZone, id: "narrow", lower: 62500.02, upper: 62500.06 };
+  const exactEdge = { ...entryZone, id: "exact-edge", lower: 62500.3, upper: 62500.3 };
+  const brokenZone = { ...entryZone, id: "broken", status: "broken" };
+  market.frames.find(f => f.interval === "1h").zones = [targetZone];
+  market.frames.find(f => f.interval === "15m").zones = [entryZone, narrowZone, exactEdge, brokenZone];
+  const short = proposal({ direction: "short", entry: { min: 62173.7, max: 62253.2 }, stopLoss: 62428,
+    targets: [{ price: 61700, reason: "前方支撑", zoneId: targetZone.id }] });
+  short.research = { ...short.research, entryZoneId: entryZone.id, stopZoneId: entryZone.id };
+  const selectable = { min: 62173.7, max: 62427.8 };
+  for (const entry of [{ ...short.entry, min: 62173.6 }, { ...short.entry, max: 62427.9 }]) {
+    assert.throws(() => validateProposal({ ...short, entry }, market), error => {
+      assert.equal(error.validation.reason, "entry_out_of_bounds");
+      assert.deepEqual(error.validation.selectablePriceRange, selectable);
+      return true;
+    });
+  }
+  assert.throws(() => validateProposal({ ...short, targets: [{ ...short.targets[0], price: 61800.1 }] }, market), error => {
+    assert.equal(error.validation.reason, "target_out_of_bounds");
+    assert.deepEqual(error.validation.selectablePriceRange, { min: 61600, max: 61800 });
+    return true;
+  });
+  const result = await analyzeWithModel(loadConfig(env), market, "trend", AbortSignal.timeout(1000), async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.match(body.messages[0].content, /靠近边界时直接使用对应的 min 或 max/);
+    const request = JSON.parse(body.messages[1].content);
+    const [inputZone, narrow, exact, broken] = request.snapshot.frames.find(f => f.interval === "15m").zones;
+    assert.deepEqual(inputZone, { ...entryZone, selectablePriceRange: selectable });
+    assert.equal(narrow.selectablePriceRange, null);
+    assert.deepEqual(exact.selectablePriceRange, { min: 62500.3, max: 62500.3 });
+    assert.equal(broken.selectablePriceRange, null);
+    return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(short) } }] });
+  });
+  assert.deepEqual(result.proposal.entry, short.entry);
+  assert.equal(entryZone.selectablePriceRange, undefined);
+});
+
 test("manual analysis exposes labelled timing conditions and the prompt version through the existing result contract", async () => {
   const triggerConditions = ["15m 成交 K 线收盘收复 10000，标记价格仍在入场区"];
   const invalidationConditions = ["【未入场失效】15m 成交 K 线收低于 9980",
@@ -61,7 +104,7 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v2");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v3");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);

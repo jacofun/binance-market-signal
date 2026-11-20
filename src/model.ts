@@ -6,7 +6,7 @@ import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
-export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v2";
+export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v3";
 export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
 
 const text = { type: "string", minLength: 1, maxLength: 600 };
@@ -103,6 +103,28 @@ const zoneSummary = (zone: PriceZone) => ({
   id: zone.id, status: zone.status, lower: zone.lower, upper: zone.upper, effectiveKind: effectiveKind(zone),
 });
 
+function onPriceGrid(price: number, tickSize: number): boolean {
+  const ticks = price / tickSize;
+  return Number.isFinite(ticks) && ticks <= Number.MAX_SAFE_INTEGER / 8 &&
+    Math.abs(Math.round(ticks) - ticks) <= Math.min(0.0001, 8 * Number.EPSILON * ticks);
+}
+
+function selectablePriceRange(zone: PriceZone, tickSize: number) {
+  if (!zoneUsable(zone) || !Number.isFinite(tickSize) || tickSize <= 0) return null;
+  const [mantissa, exponent = "0"] = tickSize.toString().split("e");
+  const decimals = Math.max(0, (mantissa?.split(".")[1]?.length ?? 0) - Number(exponent));
+  if (decimals > 100) return null;
+  const priceAt = (ticks: number) => Number((ticks * tickSize).toFixed(decimals));
+  // Compare normalized prices to the original edges. The division itself
+  // can place an already valid edge just above or below its integer tick.
+  const below = Math.floor(zone.lower / tickSize);
+  const above = Math.ceil(zone.upper / tickSize);
+  const min = priceAt(priceAt(below) >= zone.lower ? below : below + 1);
+  const max = priceAt(priceAt(above) <= zone.upper ? above : above - 1);
+  return min > 0 && min <= max && inside(min, zone) && inside(max, zone) &&
+    onPriceGrid(min, tickSize) && onPriceGrid(max, tickSize) ? { min, max } : null;
+}
+
 function zoneReference(id: string | null, zone?: PriceZone): Pick<ValidationDetails, "requestedZoneId" | "zoneReference" | "zone"> {
   if (zone) return { requestedZoneId: zone.id, zone: zoneSummary(zone) };
   if (id === null) return { zoneReference: "missing" };
@@ -166,11 +188,7 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
       { field: "stopLoss", price: p.stopLoss }, ...p.targets.map((t, i) => ({ field: `targets[${i}].price`, price: t.price }))];
     const badScale = prices.find(({ price }) => price < q * 0.5 || price > q * 1.5);
     if (badScale) reject("price_scale", "entry/stopLoss/targets", { reason: "price_out_of_scale", markPrice: q, ...badScale });
-    const badTick = prices.find(({ price }) => {
-      const ticks = price / snapshot.tickSize;
-      return !Number.isFinite(ticks) || ticks > Number.MAX_SAFE_INTEGER / 8 ||
-        Math.abs(Math.round(ticks) - ticks) > Math.min(0.0001, 8 * Number.EPSILON * ticks);
-    });
+    const badTick = prices.find(({ price }) => !onPriceGrid(price, snapshot.tickSize));
     if (badTick) reject("price_precision", "entry/stopLoss/targets", { reason: "price_off_tick_grid", ...badTick });
 
     const zones = structureZones(snapshot);
@@ -188,7 +206,8 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
 
     const entryZone = requireZone(p.research.entryZoneId, "research.entryZoneId", "unsupported_zone", { entry: p.entry });
     if (!inside(p.entry.min, entryZone) || !inside(p.entry.max, entryZone)) reject("unsupported_zone", "research.entryZoneId",
-      { reason: "entry_out_of_bounds", ...zoneReference(p.research.entryZoneId, entryZone), entry: p.entry });
+      { reason: "entry_out_of_bounds", ...zoneReference(p.research.entryZoneId, entryZone), entry: p.entry,
+        selectablePriceRange: selectablePriceRange(entryZone, snapshot.tickSize) });
 
     const stopZone = requireZone(p.research.stopZoneId, "research.stopZoneId", "unsupported_zone",
       { price: p.stopLoss, expectedKind: long ? "support" : "resistance" });
@@ -205,7 +224,8 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
       if (previous && (target.price - previous.price) * direction <= 0) invalid("price_relationship", field);
       const zone = requireZone(target.zoneId, field, "unsupported_target", { price: target.price, expectedKind: long ? "resistance" : "support" });
       if (!inside(target.price, zone)) reject("unsupported_target", field,
-        { reason: "target_out_of_bounds", zone: zoneSummary(zone), price: target.price });
+        { reason: "target_out_of_bounds", zone: zoneSummary(zone), price: target.price,
+          selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) });
       const blocker = targetObstacles(zones, p, target.price, zone.id).find(obstacle => significantObstacle(obstacle) &&
         !p.targets.slice(0, i).some(earlier => inside(earlier.price, obstacle)));
       if (blocker) reject("target_obstacle", field, { reason: "target_skips_obstacle", zone: zoneSummary(zone), price: target.price, blockingZone: zoneSummary(blocker) });
@@ -225,9 +245,10 @@ export async function analyzeWithModel(config: Config, snapshot: Snapshot, style
     trendAlignment: context.alignment,
     openInterestChanges: context.openInterestChanges,
     candleColumns: ["openTimeMs", "open", "high", "low", "close", "volume", "takerBuyVolume"],
-    frames: snapshot.frames.map(({ recentCandles, ...summary }) => ({
+    frames: snapshot.frames.map(({ recentCandles, zones, ...summary }) => ({
       ...summary,
       recentCandles: recentCandles.map(candleRow),
+      zones: zones.map(zone => ({ ...zone, selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) })),
     })),
   };
   const system = `你是币安 USDT 永续合约行情研究助手。仅使用提供的数据，以 4h 背景、1h 结构、15m 量价组织研究。recentCandles 为依 candleColumns 排列的全部收盘成交 K 线。quote.price 是标记价格。style 指示优先研究趋势延续或翻转，最终判断取决于证据。使用短句，不强行给出方向，不报告胜率或收益预测。
@@ -242,7 +263,8 @@ summary 首句明确写出做多候选、做空候选、等待确认或放弃。
 candidate 表示快照中已有时机证据，实际入场仍须人工复核 triggerConditions。方向有依据但时机未确认时，输出无计划的 watch，说明要等的周期、价位和收盘条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 为 null，targets 为空，scenario 为 none。
 有计划时，在 triggerConditions 写明入场前仍需核对的价格区和可观察的收盘条件，注明周期和价位。止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
 
-有计划时，从 frames.zones 引用区域 ID。entry 的两个端点须落在 entryZoneId 区域内。止损须在 stopZoneId 不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标价格在各自 zoneId 的区域内，按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
+有计划时，从 frames.zones 引用区域 ID。入场两端和每个目标价须落在各自引用区域的 selectablePriceRange.min 至 max 之间（含端点）。这是程序按 tickSize 向区间内取整的可用范围。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
+止损须在 stopZoneId 原始区域不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
 ${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
 ` : ""}按此 JSON Schema 输出：${JSON.stringify(schema)}`;

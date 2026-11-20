@@ -106,16 +106,17 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 
 用网站响应的 `requestId` 搜索 `analysis_failed` 或 `analysis_completed`。失败日志包含代码版本、HTTP 状态、耗时和执行阶段（`request`、`market_snapshot`、`model`、`proposal_validation`、`quote_verification`）。超时和客户端断开分别记录为 `request_deadline` 和 `client_disconnected`。币安请求失败时可查看固定的 `marketEndpoint` 和上游返回的 `marketHttpStatus`。百炼用 `upstreamRequestId` 关联上游请求。
 
-业务校验失败时查看 `validation.reason`。例如，`zone_not_found` 表示本次快照缺少引用区域，`zone_broken` 表示区域已突破，`entry_out_of_bounds` 同时记录入场上下限和区域上下限。止损方向或距离、目标范围、阻挡区域和价格步长有各自的原因及数值上下文。格式不合法的模型区域 ID 只记录为 `malformed`。这些字段只进入 FC 日志。
+业务校验失败时查看 `validation.reason`。例如，`zone_not_found` 表示本次快照缺少引用区域，`zone_broken` 表示区域已突破，`entry_out_of_bounds` 同时记录入场上下限、原始区域上下限及按价格步长计算的 `selectablePriceRange`。目标越界也记录对应区域的可选范围。止损方向或距离、阻挡区域和价格步长有各自的原因及数值上下文。格式不合法的模型区域 ID 只记录为 `malformed`。这些字段只进入 FC 日志。
 
 日志的 `exception` 保留最多四层异常类型、受控的错误码和服务模块行号，可以区分 DNS、连接超时、断线及 JSON 格式错误。HTTP 错误响应保持原有结构。日志仅采集诊断字段，不采集 Token、API Key、请求正文、完整模型输出或上游异常原文。
 
 ### V4 数据契约
 
-- `schemaVersion=4`。新版提示词以 `market-research-v4-volume-timing-v2` 标记，自动扫描附加 `-auto-scan`。保留 `opportunity`、`market.chart`、历史解析和当前 JWT 接口。
+- `schemaVersion=4`。新版提示词以 `market-research-v4-volume-timing-v3` 标记，自动扫描附加 `-auto-scan`。保留 `opportunity`、`market.chart`、历史解析和当前 JWT 接口。
 - `market.frames` 保留各周期的趋势、ATR 百分比、波动状态、最近 5 根量价细节及 5/20/50 根阶段统计。RVOL20 以此前 20 根均量为分母，CLV 取值为 −1 到 1。量比达到 1.5 或降至 0.75 时分别标记放量和缩量。OI 按两个相邻整点与 1h 已收盘价格对齐，缺失值保留为空。
 - 每个摆动点等待后两根 K 线收盘确认。新摆动点与同类区域聚类时，中心跨度上限取初次和本次确认 ATR14 的较小值乘 0.5。区域在极值外扩初次确认 ATR 的 0.15，外扩上限为价格的 1%。区间 ID 由周期、原始支阻类型和第一个摆动点的开盘毫秒组成。聚类扩张后，以最后确认时点起跟踪最终边界的突破和回测，保留量比及触达反应。每周期保留每类离最新成交收盘价最近的 6 个区间。区域来自摆动结构，成交量证据为整根 K 线的观察量。
 - 模型从区间 ID 中选择入场、失效和目标依据。止损在失效区不利侧边界外，至边界至多 1 倍 1h ATR。目标按方向排序，较近的有效 4h 区域或触达至少两次的独立区域须优先设目标。全市场 `exchangeInfo` 按实例缓存 1 小时，读取 `PRICE_FILTER.tickSize` 并校验各价位。程序保留模型提交的价位或返回诊断。
+- 模型输入的区域额外附带 `selectablePriceRange`，用于入场和目标选价。程序按价格步长向区间内取整，下界上取整，上界下取整。区域已突破或范围内无可用价位时，该字段为空。原始区域边界继续用于研究和最终校验。
 - `research` 包含市场状态、情景、三周期结论、价格区间、风险、目标评估和规则结果。目标距离、1h ATR 倍数和 R 以入场区间的不利端计算；历史波动分位数用快照前不重叠的 1h 成交 K 线窗口计算，并附样本数。4h / 12h / 24h 研究窗口独立于 30–300 秒的 `validForSeconds`。无计划的 `watch` 可与 `none` 一样留空方向和价格。
 - 手动与自动分析共享波段量价和入场时机要求。比较同周期的趋势推进、反向调整和恢复阶段。顺势计划以 4h 定方向、1h 定关键区，15m 已收盘 K 线确认恢复。研究 1h 结构翻转时要求对应周期的收盘证据。方向有依据而时机未确认时，模型标记为无计划的 `watch`，说明还缺什么条件。
 - 研究结果通过 `triggerConditions` 记录入场前复核条件，在 `invalidationConditions` 写出「未入场失效」和「持仓提前退出」。这些条件用于人工复核，结构止损和目标仍使用 `stopLoss` 和 `targets`。

@@ -130,6 +130,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   assert.match(request.messages[0].content, /最大合理盈利空间/);
   assert.match(request.messages[0].content, /顺大周期、逆小周期/);
   assert.match(request.messages[0].content, /invalidationConditions 区分【未入场失效】和【持仓提前退出】/);
+  assert.match(request.messages[0].content, /selectablePriceRange/);
   const { style, scanEvidence } = JSON.parse(request.messages[1].content);
   assert.equal(style, "trend");
   assert.equal(scanEvidence.candleClosedAt, NOW);
@@ -140,7 +141,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   const { analysisId } = run.autoAnalysis;
   const saved = JSON.parse(app.objects.get(`${archive}/records/${analysisId}.json`));
   assert.equal(saved.status, "none");
-  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v2-auto-scan");
+  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v3-auto-scan");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));

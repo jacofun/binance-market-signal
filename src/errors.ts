@@ -34,6 +34,7 @@ export interface ValidationDetails {
   blockingZone?: ZoneDetails;
   zoneCount?: number;
   entry?: { min: number; max: number };
+  selectablePriceRange?: { min: number; max: number } | null;
   price?: number;
   expectedKind?: "support" | "resistance";
   stopDistance?: number;
