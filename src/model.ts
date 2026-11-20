@@ -6,7 +6,7 @@ import { candleRow } from "./market.js";
 import type { Config } from "./config.js";
 import type { ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
-export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v4";
+export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v5";
 export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
 
 const text = { type: "string", minLength: 1, maxLength: 600 };
@@ -133,7 +133,15 @@ function zoneReference(id: string | null, zone?: PriceZone): Pick<ValidationDeta
   return { zoneReference: "formatted", requestedZoneId: id };
 }
 
-export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
+function researchOnly(p: Proposal, title: string, summary: string): Proposal {
+  return {
+    ...p, title, summary, status: "watch", direction: null, entry: null,
+    stopLoss: null, targets: [], triggerConditions: [], invalidationConditions: [],
+    research: { ...p.research, scenario: "none", entryZoneId: null, stopZoneId: null },
+  };
+}
+
+export function validateProposal(raw: unknown, snapshot: Snapshot, preserveResearchOnBlockedTarget = false): Proposal {
   const r = object(raw, proposalSchema.required, "proposal");
   if (typeof r.status !== "string" || !["candidate", "watch", "none"].includes(r.status)) invalid("schema", "status");
   if (!["long", "short", null].includes(r.direction as string | null)) invalid("schema", "direction");
@@ -168,13 +176,8 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
   // A directional outlook without an entry cannot become an order plan.
   // Preserve the validated research and discard all execution details.
   if (p.entry === null && p.direction !== null && p.status !== "none" && p.research.scenario !== "none") {
-    return {
-      ...p,
-      status: "watch", direction: null, title: "等待确认入场区间",
-      summary: `模型给出了${p.direction === "long" ? "偏多" : "偏空"}的研究判断，但未提供入场区间。本次仅供观察。`,
-      stopLoss: null, targets: [], triggerConditions: [], invalidationConditions: [],
-      research: { ...p.research, scenario: "none", entryZoneId: null, stopZoneId: null },
-    };
+    return researchOnly(p, "等待确认入场区间",
+      `模型给出了${p.direction === "long" ? "偏多" : "偏空"}的研究判断，但未提供入场区间。本次仅供观察。`);
   }
 
   const noPlan = p.direction === null || p.status === "none";
@@ -230,6 +233,7 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
       zone: zoneSummary(stopZone), price: p.stopLoss, stopDistance, hourlyAtr: atr,
     });
 
+    let blockedBy: PriceZone | undefined;
     for (const [i, target] of p.targets.entries()) {
       const field = `targets[${i}].price`;
       const previous = p.targets[i - 1];
@@ -240,10 +244,19 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
           selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) });
       const blocker = targetObstacles(zones, p, target.price, zone.id).find(obstacle => significantObstacle(obstacle) &&
         !p.targets.slice(0, i).some(earlier => inside(earlier.price, obstacle)));
-      if (blocker) reject("target_obstacle", field, { reason: "target_skips_obstacle", zone: zoneSummary(zone), price: target.price, blockingZone: zoneSummary(blocker) });
+      if (blocker && !preserveResearchOnBlockedTarget) reject("target_obstacle", field, {
+        reason: "target_skips_obstacle", zone: zoneSummary(zone), price: target.price, blockingZone: zoneSummary(blocker),
+      });
+      blockedBy ??= blocker;
     }
     const volumeMetrics = volumePriceMetrics(snapshot);
     if (!p.evidence.some(e => volumeMetrics.includes(e.metric))) invalid("missing_volume_price_evidence", "evidence");
+    if (blockedBy) {
+      const range = selectablePriceRange(blockedBy, snapshot.tickSize);
+      const area = `${blockedBy.interval} ${long ? "阻力区" : "支撑区"}${range ? `（${range.min}–${range.max}）` : ""}`;
+      return researchOnly(p, "目标前方存在重要结构",
+        `模型提出的目标跳过了更近的 ${area}。本次仅供观察。`);
+    }
   }
   return p;
 }
@@ -260,7 +273,10 @@ export async function analyzeWithModel(config: Config, snapshot: Snapshot, style
     frames: snapshot.frames.map(({ recentCandles, zones, ...summary }) => ({
       ...summary,
       recentCandles: recentCandles.map(candleRow),
-      zones: zones.map(zone => ({ ...zone, selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) })),
+      zones: zones.map(zone => ({
+        ...zone, selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize),
+        effectiveKind: effectiveKind(zone), importantObstacle: zoneUsable(zone) && significantObstacle(zone),
+      })),
     })),
   };
   const system = `你是币安 USDT 永续合约行情研究助手。仅使用提供的数据，以 4h 背景、1h 结构、15m 量价组织研究。recentCandles 为依 candleColumns 排列的全部收盘成交 K 线。quote.price 是标记价格。style 指示优先研究趋势延续或翻转，最终判断取决于证据。使用短句，不强行给出方向，不报告胜率或收益预测。
@@ -276,7 +292,8 @@ candidate 表示快照中已有时机证据，实际入场仍须人工复核 tri
 有计划时，在 triggerConditions 写明入场前仍需核对的价格区和可观察的收盘条件，注明周期和价位。止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
 
 有计划时，从 frames.zones 引用区域 ID。入场两端和每个目标价须落在各自引用区域的 selectablePriceRange.min 至 max 之间（含端点）。这是程序按 tickSize 向区间内取整的可用范围。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
-止损须在 stopZoneId 原始区域不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
+止损须在 stopZoneId 原始区域不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力，做空相反。按区域的 effectiveKind 识别有效支阻，broken 区域不可用。
+目标按价格路径由近至远，合并查看全部周期。做空从 entry.min 向下，按有效支撑区的上沿由高到低考虑。做多从 entry.max 向上，按有效阻力区的下沿由低到高考虑。每个远端目标之前，若有整个区域位于入场边界和该目标之间、与引用目标区不重叠且 importantObstacle 为 true 的区域，目标列表必须先有一个价位落在该近端区域。即使近端是 15m、远端是 1h 或 4h，也按同一规则。无法先给出有依据的近端目标时，返回无计划的 watch 或 none。结合目标距离、历史波幅和反对证据说明依据，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
 ${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
 ` : ""}按此 JSON Schema 输出：${JSON.stringify(schema)}`;
@@ -322,7 +339,7 @@ ${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构�
       const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(trimmed);
       let raw: unknown;
       try { raw = JSON.parse(fenced ? fenced[1]! : trimmed); } catch (error) { invalid("invalid_json", undefined, undefined, error); }
-      return { proposal: validateProposal(raw, snapshot), usage: { inputTokens: details.inputTokens!, outputTokens: details.outputTokens! } };
+      return { proposal: validateProposal(raw, snapshot, true), usage: { inputTokens: details.inputTokens!, outputTokens: details.outputTokens! } };
     } catch (error) {
       if (error instanceof AppError && error.code === "INVALID_MODEL_OUTPUT") {
         error.upstream = { ...details, outputReason: "response_envelope", ...error.upstream };

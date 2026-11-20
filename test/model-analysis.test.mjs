@@ -89,7 +89,7 @@ test("model receives usable tick-aligned zone edges and a rounded-out entry stil
     assert.match(body.messages[0].content, /靠近边界时直接使用对应的 min 或 max/);
     const request = JSON.parse(body.messages[1].content);
     const [inputZone, narrow, exact, broken] = request.snapshot.frames.find(f => f.interval === "15m").zones;
-    assert.deepEqual(inputZone, { ...entryZone, selectablePriceRange: selectable });
+    assert.deepEqual(inputZone, { ...entryZone, selectablePriceRange: selectable, effectiveKind: "resistance", importantObstacle: false });
     assert.equal(narrow.selectablePriceRange, null);
     assert.deepEqual(exact.selectablePriceRange, { min: 62500.3, max: 62500.3 });
     assert.equal(broken.selectablePriceRange, null);
@@ -106,7 +106,7 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v4");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v5");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);
@@ -139,6 +139,54 @@ test("directional replies with a null entry preserve research and cannot create 
   }
   assert.throws(() => validateProposal(proposal({ entry: {} }), snapshot()),
     { upstream: { outputReason: "schema", outputField: "entry" } });
+});
+
+test("a short target that skips the reported 15m support returns research without an order plan", async () => {
+  const market = snapshot();
+  market.quote.price = 62200;
+  const hourly = market.frames.find(f => f.interval === "1h");
+  const entryZone = { ...hourly.zones[0], id: "entry-and-stop", kind: "resistance", lower: 61990, upper: 62220 };
+  const far = { ...hourly.zones[0], id: "1h:support:1795122000000", lower: 61162.69123503722, upper: 61468.10876496277 };
+  const near = { ...hourly.zones[0], id: "15m:support:1795120200000", interval: "15m", touches: 2,
+    lower: 61617.775961926505, upper: 61797.724038073495 };
+  hourly.zones = [entryZone, far];
+  market.frames.find(f => f.interval === "15m").zones = [near];
+  const skipped = proposal({ direction: "short", entry: { min: 62000, max: 62210 }, stopLoss: 62250,
+    targets: [{ price: 61468.1, reason: "1h 支撑", zoneId: far.id }] });
+  skipped.research = { ...skipped.research, entryZoneId: entryZone.id, stopZoneId: entryZone.id };
+  assert.throws(() => validateProposal(skipped, market), error => {
+    assert.equal(error.upstream.outputReason, "target_obstacle");
+    assert.equal(error.upstream.outputField, "targets[0].price");
+    assert.equal(error.validation.blockingZone.id, near.id);
+    return true;
+  });
+
+  const complete = { ...skipped, targets: [{ price: 61797.7, reason: "较近的 15m 支撑", zoneId: near.id }, ...skipped.targets] };
+  let response = skipped;
+  let calls = 0;
+  const runModel = (config, current, style, signal) => analyzeWithModel(config, current, style, signal, async (_url, options) => {
+    calls++;
+    const { messages } = JSON.parse(options.body);
+    assert.match(messages[0].content, /即使近端是 15m、远端是 1h 或 4h，也按同一规则/);
+    const { zones } = JSON.parse(messages[1].content).snapshot.frames.find(f => f.interval === "15m");
+    assert.equal(zones[0].importantObstacle, true);
+    assert.equal(zones[0].effectiveKind, "support");
+    return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(response) } }] });
+  });
+  const config = loadConfig(env);
+  const source = provider({ snapshot: async () => market, quote: async () => market.quote });
+  const observe = await analyze(config, source, "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
+  assert.equal(calls, 1);
+  assert.equal(observe.status, "watch");
+  assert.deepEqual(observe.opportunity.evidence, skipped.evidence);
+  assert.match(observe.opportunity.summary, /15m 支撑区.*61617\.8–61797\.7/);
+  assert.deepEqual(observe.opportunity.targets, []);
+  assert.equal(makeOrderPermit(observe, "owner", NOW), undefined);
+
+  response = complete;
+  const candidate = await analyze(config, source, "BTCUSDT", "trend", AbortSignal.timeout(1000), runModel, () => NOW);
+  assert.equal(candidate.status, "candidate");
+  assert.deepEqual(candidate.opportunity.targets, complete.targets);
 });
 test("complete fenced JSON is accepted, while surrounding prose, corrupt JSON and reasoning are rejected", async () => {
   const json = JSON.stringify(proposal());
