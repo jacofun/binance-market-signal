@@ -60,7 +60,7 @@ async function server(t, envOverride = {}, marketFailure = false) {
   const objects = new Map();
   const logs = [];
   let modelCalls = 0;
-  const state = { now: NOW + 10000, marketFailure, missingCloses: 0 };
+  const state = { now: NOW + 10000, marketFailure, missingCloses: 0, lagResponses: 0, serverBeforeClose: false };
   const scannerFetch = async (input, options) => {
     const url = new URL(input);
     calls.push({ host: url.hostname, path: url.pathname, params: url.searchParams, method: options.method ?? "GET" });
@@ -85,11 +85,23 @@ async function server(t, envOverride = {}, marketFailure = false) {
     assert.equal(url.hostname, "fapi.binance.com");
     assert.equal(options.headers["X-MBX-APIKEY"], undefined);
     if (state.marketFailure) return new Response(null, { status: 429 });
-    if (url.pathname === "/fapi/v1/time") return Response.json({ serverTime: state.now });
+    if (url.pathname === "/fapi/v1/time") {
+      const serverTime = state.serverBeforeClose ? state.now - 1 : state.now;
+      state.serverBeforeClose = false;
+      return Response.json({ serverTime });
+    }
     assert.equal(url.pathname, "/fapi/v1/klines");
     const timeframe = url.searchParams.get("interval");
     const values = klines(INTERVAL_MS[timeframe], Number(url.searchParams.get("endTime")));
-    return Response.json(timeframe === "15m" && state.missingCloses ? values.slice(0, -1 - state.missingCloses) : values);
+    if (timeframe === "15m") {
+      [values[198][4], values[199][4], values[200][4]] = ["9995", "10050", "10088"];
+      if (state.lagResponses > 0) {
+        state.lagResponses--;
+        return Response.json(values.slice(0, -2));
+      }
+      if (state.missingCloses) return Response.json(values.slice(0, -1 - state.missingCloses));
+    }
+    return Response.json(values);
   };
   const runtime = makeServer({ env: { SIGNAL_ORDER_OSS_BUCKET: "scan-test", SIGNAL_ORDER_OSS_REGION: "cn-hangzhou",
     ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", ...envOverride }, now: () => state.now,
@@ -114,7 +126,7 @@ const rowsAt = (app, time = NOW) => {
   return (app.objects.get(key) || "").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 };
 
-test("every invocation scans the latest available closed data and produces a separate row even for the same candle", async t => {
+test("every invocation scans the latest closed candle and produces a separate row even for the same candle", async t => {
   const app = await server(t, { OSS_BUCKET: "scan-test", OSS_REGION: "cn-hangzhou", SIGNAL_ORDER_OSS_BUCKET: "other-legacy-bucket" });
   assert.equal((await app.post("/trade/api/signal/scans", { version: 2 })).status, 401);
   assert.equal(app.calls.length, 0);
@@ -135,11 +147,12 @@ test("every invocation scans the latest available closed data and produces a sep
   const market = app.calls.filter(call => call.host === "fapi.binance.com");
   assert.equal(market.length, 8);
   assert.deepEqual(market.filter(call => call.params.get("interval") === "15m").map(call => call.params.get("endTime")),
-    [String(prior), String(app.state.now)]);
+    [String(NOW), String(NOW)]);
   assert.ok(market.filter(call => ["1h", "4h"].includes(call.params.get("interval"))).every(call =>
     call.params.get("endTime") === String(NOW - 2 * period)));
   const read = await app.post("/trade/api/signal/scans", { version: 2 }, auth);
   assert.deepEqual(read.data.records.map(row => row.scannedAt), [app.state.now, prior]);
+  assert.equal(read.data.records[0].close, 10050);
   assert.equal(read.data.records[0].rules.length, 2);
   assert.equal(read.data.next, `${read.data.from}:`);
   const older = await app.post("/scans", { version: 2, before: read.data.next }, auth);
@@ -149,11 +162,32 @@ test("every invocation scans the latest available closed data and produces a sep
   assert.ok(app.logs.some(log => log.includes("market_scan_recorded")));
 });
 
-test("at a publication delay the scanner uses the preceding closed candle, then the newly published candle on the next invocation", async t => {
+test("a 23:15 scan waits for the exchange boundary and retries the 23:15 candle within the same invocation", async t => {
+  const app = await server(t);
+  const closeAt = Date.UTC(2026, 10, 18, 15, 15);
+  app.state.now = closeAt;
+  app.state.serverBeforeClose = true;
+  app.state.lagResponses = 1;
+  const scan = await app.invoke();
+  assert.equal(scan.data.candleClosedAt, closeAt);
+  assert.equal(scan.data.scannedAt, closeAt);
+  const [row] = rowsAt(app, closeAt);
+  assert.equal(row.close, 10050);
+  assert.equal(row.candleClosedAt, closeAt);
+  assert.equal(app.calls.filter(call => call.path.endsWith("/time")).length, 2);
+  assert.deepEqual(app.calls.filter(call => call.params.get("interval") === "15m").map(call => Number(call.params.get("endTime"))), [closeAt, closeAt]);
+});
+
+test("unpublished or discontinuous candles are recorded as errors without substituting a previous close", async t => {
   const app = await server(t);
   app.state.missingCloses = 1;
   const delayed = await app.invoke();
-  assert.equal(delayed.data.candleClosedAt, NOW - period);
+  assert.equal(delayed.data.status, "error");
+  assert.equal(delayed.data.errorCode, "SCAN_CANDLE_NOT_READY");
+  assert.equal(delayed.data.candleClosedAt, null);
+  assert.equal(delayed.data.expectedCandleClosedAt, NOW);
+  assert.equal(rowsAt(app)[0].close, undefined);
+  assert.equal(rowsAt(app)[0].rules, undefined);
   app.state.missingCloses = 0;
   const available = await app.invoke();
   assert.equal(available.data.candleClosedAt, NOW);

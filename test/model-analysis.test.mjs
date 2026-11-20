@@ -43,6 +43,7 @@ test("Kimi receives the snapshot metric enum, price rules and a larger default o
     assert.ok(!metrics.includes("openInterest"));
     assert.match(prompt, /stopLoss < entry.min <= entry.max/);
     assert.match(prompt, /只能引用1个枚举指标/);
+    assert.match(prompt, /做空可以在阻力区内或其下方设置更近的止损/);
     assert.match(prompt, /同一周期和同一成交量口径下，对比前一段趋势推进、反向调整和当前尝试恢复三段/);
     assert.match(prompt, /用 15m 判断反向调整处于进行中、趋于停顿还是已确认顺势恢复/);
     assert.match(prompt, /判断 1h 结构翻转时.*哪根 1h K 线收盘/);
@@ -99,6 +100,32 @@ test("model receives usable tick-aligned zone edges and a rounded-out entry stil
   assert.equal(entryZone.selectablePriceRange, undefined);
 });
 
+test("the reported short stop below the resistance upper edge stays unchanged after validation", async () => {
+  const market = snapshot();
+  market.quote.price = 62400;
+  const hourly = market.frames.find(f => f.interval === "1h");
+  const stopZone = { ...hourly.zones[0], id: "1h:resistance:1795136400000", kind: "resistance",
+    lower: 62219.43321369928, upper: 62715.96678630072 };
+  const target = { ...hourly.zones[0], id: "target", lower: 61600, upper: 61800 };
+  hourly.atr14 = 625.0476757453868;
+  hourly.zones = [stopZone, target];
+  const short = proposal({ direction: "short", entry: { min: 62350, max: 62450 }, stopLoss: 62648.6,
+    targets: [{ price: 61700, reason: "前方支撑", zoneId: target.id }] });
+  short.research.entryZoneId = short.research.stopZoneId = stopZone.id;
+  const source = provider({ snapshot: async () => market, quote: async () => market.quote });
+  const model = (config, input, style, signal) => analyzeWithModel(config, input, style, signal, async () =>
+    Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(short) } }] }));
+  const result = await analyze(loadConfig(env), source, "BTCUSDT", "trend", AbortSignal.timeout(1000), model, () => NOW);
+  assert.equal(result.status, "candidate");
+  assert.equal(result.opportunity.stopLoss, 62648.6);
+  assert.equal(makeOrderPermit(result, "owner", NOW).stop, 62648.6);
+  assert.equal(result.research.ruleAssessment.invalidation.riskDistance, 62648.6 - short.entry.min);
+  assert.throws(() => validateProposal({ ...short, stopLoss: short.entry.max }, market),
+    { upstream: { outputReason: "price_relationship", outputField: "stopLoss/targets" } });
+  assert.throws(() => validateProposal({ ...short, stopLoss: 62648.61 }, market),
+    { upstream: { outputReason: "price_precision", outputField: "entry/stopLoss/targets" } });
+});
+
 test("manual analysis exposes labelled timing conditions and the prompt version through the existing result contract", async () => {
   const triggerConditions = ["15m 成交 K 线收盘收复 10000，标记价格仍在入场区"];
   const invalidationConditions = ["【未入场失效】15m 成交 K 线收低于 9980",
@@ -106,7 +133,7 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v5");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v6");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);

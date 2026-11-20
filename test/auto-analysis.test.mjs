@@ -222,6 +222,7 @@ test("auto ordering is gated by the two switches, market eligibility, heartbeat 
     [{ proposal: short }, "AUTO_ORDER_SCAN_DIRECTION_MISMATCH"],
     [{ noHeartbeat: true }, "ORDER_RECOVERY_NOT_READY"],
     [{ askPrice: "10020.1" }, "ORDER_RULE_CHANGED"],
+    [{ proposal: proposal({ stopLoss: 8900 }) }, "ORDER_RULE_CHANGED"],
     [{ modelElapsed: 94000 }, "AUTO_ORDER_DEADLINE"],
     [{ rejectArchive: true }, undefined, "failed"],
     [{ invalidModel: true }, undefined, "failed"],
@@ -295,7 +296,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   assert.equal(completed.modelStatus, "none");
   assert.deepEqual(completed.decisionReasons, ["model_none"]);
   assert.equal(completed.modelSummary, undefined);
-  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v5-auto-scan");
+  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v6-auto-scan");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));

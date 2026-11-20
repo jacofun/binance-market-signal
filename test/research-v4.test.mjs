@@ -139,7 +139,7 @@ test("range distributions use disjoint windows entirely before the snapshot", ()
   assert.equal(historicalRanges(data.slice(1), hour)[24].short.favorableMovePct, null);
 });
 
-test("structural validation enforces tick grid, zone role, grounded stop and near obstacles", () => {
+test("structural validation enforces tick grid, stop reference roles and near obstacles", () => {
   const market = snapshot();
   const target = { zoneId: "up", reason: "区内参考", price: 10199.8 };
   const accepted = validateProposal(proposal({ targets: [target] }), market);
@@ -148,8 +148,11 @@ test("structural validation enforces tick grid, zone role, grounded stop and nea
     { upstream: { outputReason: "price_precision", outputField: "entry/stopLoss/targets" } });
   assert.throws(() => validateProposal(proposal({ targets: [{ ...target, zoneId: "invented" }] }), market),
     { upstream: { outputReason: "unsupported_target", outputField: "targets[0].price" } });
-  assert.throws(() => validateProposal(proposal({ stopLoss: 9800 }), market),
-    { upstream: { outputReason: "unsupported_zone", outputField: "stopLoss" } });
+  for (const stopLoss of [9800, 9985]) assert.equal(validateProposal(proposal({ stopLoss }), market).stopLoss, stopLoss);
+  const wrongStopZone = proposal();
+  wrongStopZone.research.stopZoneId = "up";
+  assert.throws(() => validateProposal(wrongStopZone, market),
+    { upstream: { outputReason: "unsupported_zone", outputField: "research.stopZoneId" } });
   const near = { id: "near", lower: 10100, upper: 10140, kind: "resistance", interval: "1h", touches: 2, status: "active" };
   market.frames[1].zones.push(near);
   assert.throws(() => validateProposal(accepted, market), { upstream: { outputReason: "target_obstacle", outputField: "targets[0].price" } });

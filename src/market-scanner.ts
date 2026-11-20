@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "./errors.js";
 import type { Env } from "./config.js";
 import { limited } from "./http.js";
@@ -19,6 +20,8 @@ const rulesVersion = "v1";
 const minimumRvol = 1.5;
 const maximumDistanceAtr = 1;
 const minimumRoomAtr = 1;
+const closePublicationGraceMs = 1000;
+const closeRetryDelaysMs = [0, 400, 1000, 2000];
 
 type Direction = "long" | "short";
 type Decision = "passed" | "watch" | "filtered" | "none";
@@ -111,6 +114,23 @@ const legacyKey = (slot: number) => `${symbol}/${slot}.json`;
 const logKey = (time: number) => `${symbol}/runs/${hourFor(time)}.ndjson`;
 const cursorFormat = /^(\d{13}):([a-z0-9-]{0,60})$/;
 
+async function latestScanCandles(provider: RestMarketDataProvider, serverTime: number, expectedClose: number, signal: AbortSignal) {
+  const settledAt = expectedClose + closePublicationGraceMs;
+  if (serverTime < settledAt) await delay(settledAt - serverTime, undefined, { signal });
+  for (const wait of closeRetryDelaysMs) {
+    if (wait) await delay(wait, undefined, { signal });
+    if (serverTime < expectedClose) {
+      serverTime = await provider.serverTime(signal);
+      if (serverTime < expectedClose) continue;
+    }
+    // Keep the requested close fixed across retries. A continuous response ending
+    // one bar early identifies publication lag but cannot drive a scan.
+    const candles = await provider.candles(symbol, "15m", expectedClose, signal, true);
+    if (candles.at(-1)?.closeTime === expectedClose - 1) return candles;
+  }
+  throw scanError("SCAN_CANDLE_NOT_READY", "本次应收盘的 15m K 线尚未发布。", 503);
+}
+
 export function validateScanTimer(input: Record<string, unknown>, now: number) {
   const time = typeof input.triggerTime === "string" ? Date.parse(input.triggerTime) : NaN;
   if (input.triggerName !== SCANNER_TRIGGER || !Number.isFinite(time) || time > now + 5000) {
@@ -144,13 +164,13 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
       const signal = AbortSignal.timeout(26000);
       const basis = { id, time: scannedAt, scannedAt, symbol, rulesVersion, codeVersion: SOURCE_COMMIT };
       let candleClosedAt: number | null = null;
+      let expectedCandleClosedAt: number | undefined;
       let record: Record<string, unknown>;
       let evidence: ScanEvidence | undefined;
       try {
         const serverTime = await provider.serverTime(signal);
-        // During publication lag, use the newest available closed bar, provided
-        // the series is still continuous and at most one close behind Binance time.
-        const short = frame(await provider.candles(symbol, "15m", serverTime, signal, true), "15m");
+        expectedCandleClosedAt = slotFor(Math.max(now(), serverTime));
+        const short = frame(await latestScanCandles(provider, serverTime, expectedCandleClosedAt, signal), "15m");
         candleClosedAt = short.lastCloseTime + 1;
         // Keep the higher-timeframe zones fixed at the start of the pattern.
         const contextAt = candleClosedAt - 2 * interval;
@@ -168,11 +188,11 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
           record.autoAnalysis = { status: followUp ? "pending" : "disabled" };
         }
       } catch (error) {
-        record = { ...basis, candleClosedAt, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
+        record = { ...basis, candleClosedAt, expectedCandleClosedAt, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
       }
       await store.appendJsonLine(logKey(scannedAt), record);
       const autoAnalysis = evidence && followUp ? await followUp(evidence, store) : record.autoAnalysis;
-      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode } : {}),
+      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode, expectedCandleClosedAt } : {}),
         ...(autoAnalysis ? { autoAnalysis } : {}) };
     },
     async list(input: Record<string, unknown>) {

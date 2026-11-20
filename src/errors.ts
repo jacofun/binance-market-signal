@@ -25,7 +25,7 @@ interface ZoneDetails {
 
 export interface ValidationDetails {
   reason: "zone_not_found" | "zone_broken" | "zone_wrong_kind" | "entry_out_of_bounds" |
-    "stop_wrong_side" | "stop_too_far" | "target_out_of_bounds" | "target_skips_obstacle" |
+    "target_out_of_bounds" | "target_skips_obstacle" |
     "price_out_of_scale" | "price_off_tick_grid";
   field?: string;
   requestedZoneId?: string;
@@ -37,8 +37,6 @@ export interface ValidationDetails {
   selectablePriceRange?: { min: number; max: number } | null;
   price?: number;
   expectedKind?: "support" | "resistance";
-  stopDistance?: number;
-  hourlyAtr?: number;
   markPrice?: number;
   direction?: "long" | "short";
   snapshotAsOf?: number;

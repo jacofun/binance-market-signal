@@ -119,7 +119,7 @@ test("model output diagnostics reach HTTP and logs without content or reasoning"
   assert.equal(logs.join("").includes("private-"), false);
 });
 test("zone failures log precise reasons and safe market context while preserving the HTTP contract", async t => {
-  for (const reason of ["zone_not_found", "zone_broken", "entry_out_of_bounds", "stop_too_far", "target_out_of_bounds"]) {
+  for (const reason of ["zone_not_found", "zone_broken", "entry_out_of_bounds", "zone_wrong_kind", "target_out_of_bounds"]) {
     await t.test(reason, async t => {
       const logs = [];
       const market = snapshot();
@@ -132,7 +132,7 @@ test("zone failures log precise reasons and safe market context while preserving
       if (reason === "zone_not_found") modelProposal.research.entryZoneId = "private-invalid-zone";
       if (reason === "zone_broken") zone.status = "broken";
       if (reason === "entry_out_of_bounds") modelProposal.entry.min = 9979.9;
-      if (reason === "stop_too_far") { modelProposal.stopLoss = 9800; field = "stopLoss"; }
+      if (reason === "zone_wrong_kind") { modelProposal.research.stopZoneId = "up"; field = "research.stopZoneId"; }
       if (reason === "target_out_of_bounds") { modelProposal.targets[0].price = 10230; field = "targets[0].price"; }
       modelProposal.summary = "private-model-prose";
       const { request } = await app(t, {
@@ -170,9 +170,9 @@ test("zone failures log precise reasons and safe market context while preserving
         assert.equal(log.validation.zone.upper, 10020);
         assert.deepEqual(log.validation.entry, modelProposal.entry);
       }
-      if (reason === "stop_too_far") {
-        assert.equal(log.validation.stopDistance, 180);
-        assert.equal(log.validation.hourlyAtr, 100);
+      if (reason === "zone_wrong_kind") {
+        assert.equal(log.validation.expectedKind, "support");
+        assert.equal(log.validation.zone.effectiveKind, "resistance");
       }
       assert.ok(log.exception[0].frames.some(frame => frame.startsWith("model.js:")));
       assert.equal(logs.join("").includes("private-"), false);
