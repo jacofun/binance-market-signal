@@ -209,7 +209,22 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 授予共用 OSS 凭证扫描前缀的 `oss:GetObject` 和 `oss:PutObject`。记录使用 OSS 追加位置校验处理并发，Bucket 的保留策略须允许追加对象。扫描列表无需列桶权限。
 
-CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` 可以原路径转发或改写为 `/scans`，透传原有 JWT 到 FC。列表复用站点所有者的短期交易凭证。扫描日志可按 `market_scan_recorded` 和 `market_scan_request_failed` 检索。扫描不访问百炼、不会生成下单草稿。
+CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` 可以原路径转发或改写为 `/scans`，透传原有 JWT 到 FC。列表复用站点所有者的短期交易凭证。扫描日志可按 `market_scan_recorded` 和 `market_scan_request_failed` 检索。
+
+### 初筛通过后的自动分析
+
+在 `binance-market-signal` FC 配置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为非负整数。留空或设为 `0` 时仅扫描。设为正整数时，按北京时间自然日限制实际自动模型请求，手动分析不占该额度。现有 `binance-market-scanner` 触发器继续使用。
+
+函数先保存原始扫描，初筛通过时加载 V4 实时行情，在百炼请求前对同一交易对的 15m 收盘时间去重并按追加位置原子占用一个名额。并发冲突或 OSS 失败按安全上限处理。已发出的超时或无效模型输出计入配额，函数不会补发。若函数在占用名额后中断，名额保留至当日结束。达到上限的信号不留待次日补跑。模型输入包含两条规则的判定、方向、价格区域和逐项证据，保留现有结构校验及报价校验。自动分析只生成私有研究记录。
+
+| OSS 路径 | 用途与权限 |
+| --- | --- |
+| `private/market-signal-scanner/v1/BTCUSDT/auto-analysis/` | 去重、每日调用配额和扫描跟进状态，使用现有扫描桶，需 `oss:GetObject` 与 `oss:PutObject`。配额、去重对象至少保留至相关扫描时段结束，启用期间勿重置正在使用的对象。 |
+| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | 复用网站私有分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。根目录默认 `/private`，若网站使用其他根目录，在本函数配置相同的 `PRIVATE_RESOURCE_ROOT`。 |
+
+归档默认使用扫描桶。如果网站内容桶与扫描桶分开，在本函数配置网站的 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`，由现有 `ACCESS_KEY_ID` 和 `ACCESS_KEY_SECRET` 写入授权前缀。跨地域归档使用公网端点。触发器、历史读取权限和复盘函数沿用现有设置。
+
+在交易日志的扫描表查看自动分析状态和研究详情，归档结果也会出现在分析历史。日志事件 `market_auto_analysis_completed` 记录模型和 Token 用量，`market_auto_analysis_failed` 记录失败阶段、请求编号、异常来源和已有的百炼诊断信息。归档失败时，可用扫描请求编号定位诊断，无需重调模型。
 
 ## 本地验证
 

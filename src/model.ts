@@ -213,7 +213,8 @@ export function validateProposal(raw: unknown, snapshot: Snapshot): Proposal {
   return p;
 }
 
-export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal, request: typeof fetch = fetch): Promise<ModelResult> {
+export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal,
+  request: typeof fetch = fetch, scanEvidence?: import("./market-scanner.js").ScanEvidence): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
   const context = researchContext(snapshot);
   const marketInput = {
@@ -232,11 +233,13 @@ research 说明 marketRegime、scenario、三个周期各自结论、风险和 r
 candidate 是待确认触发的候选。watch 可以给出完整计划，也可以与 none 一样清空方向、入场、止损、目标和区域引用，scenario 用 none。证据冲突或缺少结构目标时使用 watch 或 none。
 有计划时，从 frames.zones 引用区域 ID。entry 的两个端点须落在 entryZoneId 区域内。止损须在 stopZoneId 不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力；做空相反。retested 区域支阻互换，broken 区域不可用。目标价格在各自 zoneId 的区域内，按方向由近至远。若前方有不重叠的4h区域或至少两次触达的区域，必须先给该区域的目标。每项解释选择依据和反对证据。结合目标距离、历史波幅和中间结构，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
-按此 JSON Schema 输出：${JSON.stringify(schema)}`;
+按此 JSON Schema 输出：${JSON.stringify(schema)}${scanEvidence ? `
+以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
+开头直接给出一个结论：做多候选、做空候选、等待确认或放弃。避免同时陈列多空方向后不表态。等待时具体写出转为候选所缺的可观察条件，放弃时指出决定性的否决证据。保留有依据的反向证据，不虚构确定性、盈利承诺或超出结构的目标。` : ""}`;
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }
-  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot: marketInput }) }],
+  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot: marketInput, ...(scanEvidence ? { scanEvidence } : {}) }) }],
     // Bailian Kimi K3.1 Pro rejects non-default sampling values; Qwen keeps the
     // existing low-temperature setting. top_p/presence_penalty use defaults.
     stream: false, temperature: config.model === "kimi-k3.1-pro" ? 1 : 0.1, max_tokens: config.maxTokens,

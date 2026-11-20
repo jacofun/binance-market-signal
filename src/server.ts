@@ -14,6 +14,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeMarketScanner, validateScanTimer, SCANNER_TRIGGER } from "./market-scanner.js";
+import { runAutoAnalysis } from "./auto-analysis.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -48,6 +49,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
   let orderConfig: OrderConfig | undefined;
   const ordersConfig = () => orderConfig ??= loadOrderConfig(env);
   let market = provider;
+  const getMarket = (settings: Config) => market ||= settings.mode === "websocket" ?
+    new WebSocketMarketDataProvider(settings) : new RestMarketDataProvider(settings);
   let active = false;
   const cooldowns = new Map<string, number>();
   const server = createServer(async (req, res) => {
@@ -99,7 +102,17 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         if (timerEvent && input.triggerName === SCANNER_TRIGGER) {
           scanAction = "run";
           validateScanTimer(input, now());
-          const result = await makeMarketScanner(env, now, scannerFetch).run(requestId);
+          const enabled = env.SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT?.trim();
+          const result = await makeMarketScanner(env, now, scannerFetch).run(requestId,
+            enabled && enabled !== "0" ? (evidence, store) => runAutoAnalysis(evidence, store, {
+              env, now, logger, request: scannerFetch, market: getMarket,
+              deadline: startedAt + 105_000,
+              acquire: () => {
+                if (active) return undefined;
+                active = true;
+                return () => { active = false; };
+              },
+            }) : undefined);
           const log = { event: "market_scan_recorded", requestId, ...result, elapsedMs: now() - startedAt };
           if ("errorCode" in result) logger.error(JSON.stringify(log));
           else logger.info(JSON.stringify(log));
@@ -158,10 +171,9 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       active = true; acquired = true;
       if (cooldowns.size >= 64) cooldowns.delete(cooldowns.keys().next().value!);
       cooldowns.set(sub, now());
-      market ||= config.mode === "websocket" ? new WebSocketMarketDataProvider(config) : new RestMarketDataProvider(config);
       req.on("aborted", disconnected); res.on("close", disconnected);
       timer = setTimeout(() => cancel("request_deadline"), config.requestTimeoutMs); timer.unref();
-      const result = await analyze(config, market, trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
+      const result = await analyze(config, getMarket(config), trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
       let orderPermit: string | undefined;
       if ((env.SIGNAL_ORDER_MODE === "demo" || env.SIGNAL_ORDER_MODE === "live") &&
           result.symbol === "BTCUSDT" && result.opportunity.direction && (result.status === "candidate" || result.status === "watch")) {

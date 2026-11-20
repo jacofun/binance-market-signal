@@ -24,6 +24,14 @@ type Direction = "long" | "short";
 type Decision = "passed" | "watch" | "filtered" | "none";
 type Check = { code: string; passed: boolean | null; value: number | string | null; expected: number | string | null };
 type Rule = { kind: "breakout" | "reclaim"; status: Decision; direction: Direction | null; zone: Pick<PriceZone, "id" | "lower" | "upper"> | null; checks: Check[] };
+export interface ScanEvidence {
+  scanId: string; symbol: typeof symbol; scannedAt: number; candleClosedAt: number; rulesVersion: typeof rulesVersion;
+  close: number; rvol20: number | null; trend4h: Frame["trend"]; rules: Rule[];
+}
+export type AutoAnalysisOutcome =
+  { status: "disabled" | "duplicate" | "daily_limit" | "busy" | "stale" } |
+  { status: "failed"; stage: string; errorCode: string } |
+  { status: "completed"; analysisId: string };
 
 export function scanRules(short: Frame, hourly: Frame, background: Frame): Rule[] {
   const [before, previous, last] = short.recentCandles.slice(-3);
@@ -126,13 +134,14 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
   }
 
   return {
-    async run(id: string) {
+    async run(id: string, followUp?: (evidence: ScanEvidence, scanStore: typeof store) => Promise<AutoAnalysisOutcome>) {
       const scannedAt = now();
       const provider = new RestMarketDataProvider({ symbols: [symbol], maxPriceAgeMs: 5000, binanceTimeoutMs: 8000 }, request, now);
       const signal = AbortSignal.timeout(26000);
       const basis = { id, time: scannedAt, scannedAt, symbol, rulesVersion, codeVersion: SOURCE_COMMIT };
       let candleClosedAt: number | null = null;
       let record: Record<string, unknown>;
+      let evidence: ScanEvidence | undefined;
       try {
         const serverTime = await provider.serverTime(signal);
         // During publication lag, use the newest available closed bar, provided
@@ -146,14 +155,21 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
           provider.candles(symbol, "4h", contextAt, signal).then(candles => frame(candles, "4h")),
         ]);
         const rules = scanRules(short, hourly, background);
-        record = { ...basis, candleClosedAt, status: rules.some(rule => rule.status === "passed") ? "passed" :
-          rules.some(rule => rule.status === "watch") ? "watch" : rules.some(rule => rule.status === "filtered") ? "filtered" : "none",
-        close: short.close, rvol20: short.volumeRatio20, trend4h: background.trend, rules };
+        const status = rules.some(rule => rule.status === "passed") ? "passed" :
+          rules.some(rule => rule.status === "watch") ? "watch" : rules.some(rule => rule.status === "filtered") ? "filtered" : "none";
+        const observations = { close: short.close, rvol20: short.volumeRatio20, trend4h: background.trend, rules };
+        record = { ...basis, candleClosedAt, status, ...observations };
+        if (status === "passed") {
+          evidence = { scanId: id, symbol, scannedAt, candleClosedAt, rulesVersion, ...observations };
+          record.autoAnalysis = { status: followUp ? "pending" : "disabled" };
+        }
       } catch (error) {
         record = { ...basis, candleClosedAt, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
       }
       await store.appendJsonLine(logKey(scannedAt), record);
-      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode } : {}) };
+      const autoAnalysis = evidence && followUp ? await followUp(evidence, store) : record.autoAnalysis;
+      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode } : {}),
+        ...(autoAnalysis ? { autoAnalysis } : {}) };
     },
     async list(input: Record<string, unknown>) {
       if (input.version !== 2) return listLegacy(input);
@@ -182,8 +198,16 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
       const visible = rows.slice(0, pageSize);
       const last = visible.at(-1);
       const hasMore = rows.length > pageSize && last;
-      return { records: visible.map(item => item.record), from: hasMore ? last.time : from, to,
+      const records = await limited(visible.map(({ record, id }) => async () => {
+        if (asObject(record.autoAnalysis)?.status !== "pending") return record;
+        // A failed status lookup must not hide the saved scan.
+        const outcome = await store.read(autoOutcomePath(id)).catch(() => null);
+        return outcome ? { ...record, autoAnalysis: outcome } : record;
+      }), 4);
+      return { records, from: hasMore ? last.time : from, to,
         next: hasMore ? `${last.time}:${last.id}` : from > oldest ? `${from}:` : null };
     },
   };
 }
+
+export const autoOutcomePath = (id: string) => `${symbol}/auto-analysis/outcomes/${id}.json`;

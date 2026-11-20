@@ -14,6 +14,7 @@ export interface OrderStore {
 type OssConfig = ReturnType<typeof loadOssConfig> & { prefix: string };
 
 export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore & {
+  appendJsonLineAt(path: string, value: unknown, position: number): Promise<number | null>;
   appendJsonLine(path: string, value: unknown): Promise<void>;
   readJsonLines(path: string, limit: number): Promise<unknown[]>;
 } {
@@ -57,7 +58,16 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
     const requestId = response.headers.get("x-oss-request-id") || "";
     return new AppError(storageCode, `${label}存储操作失败，请使用请求编号查看函数日志。`, 503, undefined, { upstreamStatus: status, ...(/^[a-zA-Z0-9-]{8,100}$/.test(requestId) ? { upstreamRequestId: requestId } : {}) });
   }
+  async function appendJsonLineAt(path: string, value: unknown, position: number) {
+    const response = await request("POST", path, value, `append&position=${position}`);
+    await response.body?.cancel().catch(() => {});
+    if (response.ok) return null;
+    const next = Number(response.headers.get("x-oss-next-append-position"));
+    if (response.status === 409 && Number.isSafeInteger(next) && next > position) return next;
+    throw unavailable(response);
+  }
   return {
+    appendJsonLineAt,
     async assertAtomicWrites() {
       const response = await request("GET", "", undefined, "versioning");
       if (!response.ok) { await response.body?.cancel(); throw unavailable(response); }
@@ -81,13 +91,11 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
     async appendJsonLine(path, value) {
       let position = 0;
       for (let attempt = 0; attempt < 5; attempt++) {
-        const response = await request("POST", path, value, `append&position=${position}`);
-        await response.body?.cancel().catch(() => {});
-        if (response.ok) return;
-        const next = Number(response.headers.get("x-oss-next-append-position"));
-        if (response.status !== 409 || !Number.isSafeInteger(next) || next <= position || attempt === 4) throw unavailable(response);
+        const next = await appendJsonLineAt(path, value, position);
+        if (next === null) return;
         position = next;
       }
+      throw new AppError(storageCode, `${label}并发追加冲突，请使用请求编号查看函数日志。`, 503);
     },
     async readJsonLines(path, limit) {
       const response = await request("GET", path);
