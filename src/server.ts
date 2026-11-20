@@ -8,7 +8,7 @@ import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
-import { loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
+import { autoOrderBase, loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
 import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
@@ -103,10 +103,13 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           scanAction = "run";
           validateScanTimer(input, now());
           const enabled = env.SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT?.trim();
-          const result = await makeMarketScanner(env, now, scannerFetch).run(requestId,
+          const orderBase = autoOrderBase(env);
+          const result = await makeMarketScanner(env, now, scannerFetch, orderBase).run(requestId,
             enabled && enabled !== "0" ? (evidence, store) => runAutoAnalysis(evidence, store, {
-              env, now, logger, request: scannerFetch, market: getMarket,
+              env, now, logger, request: scannerFetch, orderBase, orderRequest: orderFetch,
+              market: settings => orderBase ? provider ?? new RestMarketDataProvider(settings, scannerFetch, now, orderBase) : getMarket(settings),
               deadline: startedAt + 105_000,
+              orderDeadline: startedAt + 115_000,
               acquire: () => {
                 if (active) return undefined;
                 active = true;

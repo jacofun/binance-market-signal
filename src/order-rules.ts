@@ -11,7 +11,8 @@ export interface TradingRules {
   notional: string; multiplierUp: string; multiplierDown: string;
 }
 export interface OrderOption {
-  kind: OrderKind; price: string; triggerPrice?: string; stopLossPrice: string; takeProfitPrice: string; risk: number; notional: number;
+  kind: OrderKind; price: string; timeInForce?: "IOC"; triggerPrice?: string;
+  stopLossPrice: string; takeProfitPrice: string; risk: number; notional: number;
 }
 export const DECIMAL = /^\d{1,16}(?:\.\d{1,12})?$/;
 // Normalize to exchange decimal units to keep filter checks exact.
@@ -61,17 +62,18 @@ export function assertQuote(plan: OrderPlan, quote: Quote, now: number) {
 }
 
 export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rules: TradingRules,
-  config: OrderConfig): OrderOption | string {
+  config: OrderConfig, immediate = false): OrderOption | string {
   const buy = plan.direction === "long";
   const mark = Number(quote.mark);
   const higher = Number(quote.ask);
   const lower = Number(quote.bid);
   const bound = buy ? plan.max : plan.min;
   const market = kind === "market";
+  const crossing = market || immediate;
   const conditional = kind === "conditional";
-  if (market && plan.status !== "candidate") return "观望状态仅提供价格条件或回踩限价草稿。";
+  if (crossing && plan.status !== "candidate") return "观望状态仅提供价格条件或回踩限价草稿。";
   const triggerPrice = conditional ? priceText(bound) : undefined;
-  const price = market ? (buy ? quote.ask : quote.bid) :
+  const price = crossing ? (buy ? quote.ask : quote.bid) :
     priceText(conditional ? bound : buy ? plan.min : plan.max);
   const reference = Number(price);
   const quantity = Number(config.quantity);
@@ -82,12 +84,12 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   if (!onGrid(stopLossPrice, rules.price) || !onGrid(takeProfitPrice, rules.price)) return "止盈或止损价格不符合交易所价格步长与上下限。";
   const risk = Math.abs(reference - plan.stop) * quantity;
   const notional = reference * quantity;
-  if (!rules.kinds.includes(TYPES[kind]) || (!market && !rules.times.includes(conditional ? "GTC" : "GTX"))) return "交易所未开放此委托类型。";
-  if (reference < plan.min || reference > plan.max || (market && (mark < plan.min || mark > plan.max))) return "预计入场价格须在研究入场区内。";
+  if (!rules.kinds.includes(TYPES[kind]) || (!market && !rules.times.includes(immediate ? "IOC" : conditional ? "GTC" : "GTX"))) return "交易所未开放此委托类型。";
+  if (reference < plan.min || reference > plan.max || (crossing && (mark < plan.min || mark > plan.max))) return "预计入场价格须在研究入场区内。";
   if (market && Number(buy ? quote.askQty : quote.bidQty) < quantity) {
     return "盘口深度不足或盘口价格已变化。";
   }
-  if (kind === "limit" && (buy ? reference >= higher : reference <= lower)) return "限价已经跨过对手价，无法提交只挂单委托。";
+  if (kind === "limit" && !immediate && (buy ? reference >= higher : reference <= lower)) return "限价已经跨过对手价，无法提交只挂单委托。";
   if (conditional && (triggerPrice !== price || (buy ? Number(triggerPrice) <= mark : Number(triggerPrice) >= mark))) return "标记价格已到达或越过条件触发价。";
   if (!onGrid(config.quantity, rules.lot) || (market && !onGrid(config.quantity, rules.marketLot)) || (!market && !onGrid(price, rules.price))) {
     return "数量或价格不符合交易所步长与上下限。";
@@ -95,5 +97,5 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   if ((!market && (reference > mark * Number(rules.multiplierUp) || reference < mark * Number(rules.multiplierDown))) ||
     (market ? mark * quantity : notional) + 1e-9 < Number(rules.notional)) return "价格或名义金额不符合交易所过滤器。";
   if (risk > config.maxRisk + 1e-9) return "按研究失效价估算的价差风险超过配置上限。";
-  return { kind, price, ...(triggerPrice ? { triggerPrice } : {}), stopLossPrice, takeProfitPrice, risk, notional };
+  return { kind, price, ...(immediate ? { timeInForce: "IOC" as const } : {}), ...(triggerPrice ? { triggerPrice } : {}), stopLossPrice, takeProfitPrice, risk, notional };
 }

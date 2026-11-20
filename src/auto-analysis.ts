@@ -1,8 +1,11 @@
 import { analyze, type AnalysisStage } from "./analysis.js";
 import { loadConfig, type Config, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
-import { autoOutcomePath, type AutoAnalysisOutcome, type ScanEvidence } from "./market-scanner.js";
-import { analyzeWithModel, AUTO_SCAN_PROMPT_VERSION } from "./model.js";
+import { autoOutcomePath, type AutoAnalysisOutcome, type AutoOrderOutcome, type ScanEvidence } from "./market-scanner.js";
+import { analyzeWithModel, AUTO_ORDER_PROMPT_VERSION, AUTO_SCAN_PROMPT_VERSION } from "./model.js";
+import { loadOrderConfig, makeOrderPermit } from "./order-auth.js";
+import { makeOrderExchange } from "./order-binance.js";
+import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadOssConfig } from "./oss-config.js";
 import type { MarketDataProvider } from "./types.js";
@@ -76,6 +79,7 @@ async function archiveResult(store: Store, result: Awaited<ReturnType<typeof ana
 export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, options: {
   env: Env; now: () => number; request: typeof fetch; deadline: number; acquire: () => (() => void) | undefined;
   market: (config: Config) => MarketDataProvider; logger: Pick<Console, "info" | "error">;
+  orderRequest: typeof fetch; orderDeadline: number; orderBase?: string | undefined;
 }): Promise<AutoAnalysisOutcome> {
   const { env, now, request, deadline, acquire, market, logger } = options;
   const start = now();
@@ -94,6 +98,32 @@ export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, opti
       marketHttpStatus: original?.marketHttpStatus, exception: exceptionChain(error) }));
     return { status: "failed", stage: failureStage, errorCode: safe.code } as const;
   };
+
+  async function placeOrder(result: Awaited<ReturnType<typeof analyze>>): Promise<AutoOrderOutcome> {
+    if (env.SIGNAL_ORDER_EXECUTE !== "true") return { status: "skipped", code: "ORDER_EXECUTION_DISABLED" };
+    const plan = result.status === "candidate" && makeOrderPermit(result, "owner", now());
+    if (!plan) return { status: "skipped", code: result.status === "candidate" ? "ORDER_DRAFT_EXPIRED" : "AUTO_ORDER_NOT_CANDIDATE" };
+    if (!evidence.rules.some(rule => rule.status === "passed" && rule.direction === plan.direction)) {
+      return { status: "skipped", code: "AUTO_ORDER_SCAN_DIRECTION_MISMATCH" };
+    }
+    try {
+      const settings = loadOrderConfig(env);
+      if (settings.base !== options.orderBase) throw new AppError("AUTO_ORDER_MARKET_MISMATCH", "扫描行情和下单端点不一致。", 409);
+      const request = options.orderRequest;
+      const execution = makeProtectedExecution(settings, makeOrderStore(settings, now, request), makeOrderExchange(settings, now, request),
+        now, event => logger.info(JSON.stringify({ ...ids, ...event })));
+      const order = await execution.submitAutomatic(plan, options.orderDeadline);
+      return { status: order.state, clientId: order.clientId, protection: order.protection.state,
+        exchangeStatus: order.exchangeStatus, executedQty: order.executedQty, exchangeCode: order.exchangeCode, code: order.reason };
+    } catch (error) {
+      const safe = publicError(error);
+      const original = error instanceof AppError ? error : undefined;
+      logger.error(JSON.stringify({ event: "market_auto_order_failed", ...ids, analysisId: result.analysisId,
+        code: safe.code, httpStatus: safe.status, configurationField: original?.configurationField,
+        ...original?.upstream, exception: exceptionChain(error) }));
+      return { status: "failed", code: safe.code };
+    }
+  }
 
   async function execute(): Promise<AutoAnalysisOutcome> {
     const limit = autoAnalysisLimit(env);
@@ -132,17 +162,21 @@ export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, opti
           stage = "model";
           modelStarted = true;
           return request(input, init);
-        }, evidence);
+        }, evidence, !!options.orderBase);
       }, now, value => { stage = value; });
       analysisId = result.analysisId;
       stage = "archive";
-      const model = { ...result.model, promptVersion: AUTO_SCAN_PROMPT_VERSION };
-      await archiveResult(history, { ...result, model, requestId: evidence.scanId, scanEvidence: evidence });
+      const model = { ...result.model, promptVersion: options.orderBase ? AUTO_ORDER_PROMPT_VERSION : AUTO_SCAN_PROMPT_VERSION };
+      const notes = options.orderBase ? ["同向候选通过即时委托复核后可自动提交，实际结果以订单记录为准。", ...result.notes.slice(1)] : result.notes;
+      await archiveResult(history, { ...result, model, notes, requestId: evidence.scanId, scanEvidence: evidence });
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
         modelStatus: result.decision.modelStatus, modelDirection: result.decision.modelDirection,
         decisionReasons: result.decision.reasons.map(reason => reason.code),
         ...model, elapsedMs: now() - start }));
-      return { status: "completed", analysisId };
+      if (env.SIGNAL_AUTO_ORDER_EXECUTE !== "true") return { status: "completed", analysisId };
+      const order = await placeOrder(result);
+      logger.info(JSON.stringify({ event: "market_auto_order_outcome", ...ids, analysisId, ...order }));
+      return { status: "completed", analysisId, order };
     } finally {
       release();
     }

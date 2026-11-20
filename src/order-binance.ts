@@ -160,11 +160,12 @@ export function makeOrderExchange(config: OrderConfig, now: () => number, fetchI
           if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) || data.orderType !== "STOP") throw invalid();
           return parseOrder(data, clientId, true);
         }
+        const immediate = option.timeInForce === "IOC";
         const params: Record<string, string> = option.kind === "market" ? { type: "MARKET", newOrderRespType: "RESULT" } :
-          { type: "LIMIT", timeInForce: "GTX", price: option.price, newOrderRespType: "ACK" };
+          { type: "LIMIT", timeInForce: immediate ? "IOC" : "GTX", price: option.price, newOrderRespType: immediate ? "RESULT" : "ACK" };
         const data = await call("/fapi/v1/order", { ...common, ...params, newClientOrderId: clientId }, true, "POST", issuedAt);
         if (!object(data) || data.positionSide !== side || data.side !== openingSide(side) ||
-          option.kind === "market" && !decimal(data.executedQty, true)) throw invalid();
+          (option.kind === "market" || immediate) && !decimal(data.executedQty, true)) throw invalid();
         return parseOrder(data, clientId, false);
       } catch (error) {
         if (!hasCode(error, -1013, -1021, -1022, -1100, -1102, -1111, -1116, -1121, -2019, -2021, -4061, -4164, -5022)) throw error;

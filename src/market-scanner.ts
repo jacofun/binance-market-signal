@@ -28,10 +28,14 @@ export interface ScanEvidence {
   scanId: string; symbol: typeof symbol; scannedAt: number; candleClosedAt: number; rulesVersion: typeof rulesVersion;
   close: number; rvol20: number | null; trend4h: Frame["trend"]; rules: Rule[];
 }
+export type AutoOrderOutcome =
+  { status: "skipped" | "failed"; code: string } |
+  { status: "accepted" | "rejected" | "unknown"; clientId: string; protection: string;
+    exchangeStatus?: string; executedQty?: string; exchangeCode?: number; code?: string };
 export type AutoAnalysisOutcome =
   { status: "disabled" | "duplicate" | "daily_limit" | "busy" | "stale" } |
   { status: "failed"; stage: string; errorCode: string } |
-  { status: "completed"; analysisId: string };
+  { status: "completed"; analysisId: string; order?: AutoOrderOutcome };
 
 export function scanRules(short: Frame, hourly: Frame, background: Frame): Rule[] {
   const [before, previous, last] = short.recentCandles.slice(-3);
@@ -117,7 +121,7 @@ export function validateScanTimer(input: Record<string, unknown>, now: number) {
 const asObject = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
-export function makeMarketScanner(env: Env, now: () => number, request: typeof fetch = fetch) {
+export function makeMarketScanner(env: Env, now: () => number, request: typeof fetch = fetch, base?: string) {
   const store = makeOrderStore({ ...loadOssConfig(env, "SCAN"), prefix: "private/market-signal-scanner/v1" }, now, request, "SCAN");
   async function listLegacy(input: Record<string, unknown>) {
     const latest = slotFor(now());
@@ -136,7 +140,7 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
   return {
     async run(id: string, followUp?: (evidence: ScanEvidence, scanStore: typeof store) => Promise<AutoAnalysisOutcome>) {
       const scannedAt = now();
-      const provider = new RestMarketDataProvider({ symbols: [symbol], maxPriceAgeMs: 5000, binanceTimeoutMs: 8000 }, request, now);
+      const provider = new RestMarketDataProvider({ symbols: [symbol], maxPriceAgeMs: 5000, binanceTimeoutMs: 8000 }, request, now, base);
       const signal = AbortSignal.timeout(26000);
       const basis = { id, time: scannedAt, scannedAt, symbol, rulesVersion, codeVersion: SOURCE_COMMIT };
       let candleClosedAt: number | null = null;

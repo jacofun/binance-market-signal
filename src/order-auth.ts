@@ -25,6 +25,18 @@ export interface OrderConfig extends ReturnType<typeof loadOssConfig> {
   issuer: string;
   audience: string;
 }
+function configuredOrderBase(env: Env): string | undefined {
+  const base = env.BINANCE_BASE_URL?.trim().replace(/\/$/, "");
+  if (env.SIGNAL_ORDER_MODE === "live" && base === "https://fapi.binance.com" ||
+    env.SIGNAL_ORDER_MODE === "demo" && (base === "https://demo-fapi.binance.com" || base === "https://testnet.binancefuture.com")) {
+    return base;
+  }
+}
+
+export function autoOrderBase(env: Env): string | undefined {
+  if (env.SIGNAL_AUTO_ORDER_EXECUTE === "true" && env.SIGNAL_ORDER_EXECUTE === "true") return configuredOrderBase(env);
+}
+
 export function loadOrderConfig(env: Env): OrderConfig {
   const mode = env.SIGNAL_ORDER_MODE;
   if (mode !== "demo" && mode !== "live") throw new AppError("ORDERS_DISABLED", "订单功能未启用。", 503);
@@ -35,9 +47,8 @@ export function loadOrderConfig(env: Env): OrderConfig {
     if (!pattern.test(value)) throw bad(field);
     return value;
   };
-  const base = required("BINANCE_BASE_URL", /^https:\/\/[a-z0-9.-]+\/?$/).replace(/\/$/, "");
-  if (mode === "live" ? base !== "https://fapi.binance.com" :
-    !["https://demo-fapi.binance.com", "https://testnet.binancefuture.com"].includes(base)) throw bad("BINANCE_BASE_URL");
+  const base = configuredOrderBase(env);
+  if (!base) throw bad("BINANCE_BASE_URL");
   const quantity = env.SIGNAL_ORDER_QUANTITY?.trim() || "0.001";
   const risk = env.SIGNAL_ORDER_MAX_RISK_USDT?.trim() || "1";
   const positiveDecimal = /^(?:0|[1-9]\d{0,4})(?:\.\d{1,8})?$/;

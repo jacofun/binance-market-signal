@@ -8,6 +8,7 @@ import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style }
 
 export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v5";
 export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
+export const AUTO_ORDER_PROMPT_VERSION = `${AUTO_SCAN_PROMPT_VERSION}-immediate-v1`;
 
 const text = { type: "string", minLength: 1, maxLength: 600 };
 const list = { type: "array", items: text, maxItems: 8 };
@@ -275,7 +276,7 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
 }
 
 export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal,
-  request: typeof fetch = fetch, scanEvidence?: import("./market-scanner.js").ScanEvidence): Promise<ModelResult> {
+  request: typeof fetch = fetch, scanEvidence?: import("./market-scanner.js").ScanEvidence, immediate = false): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
   const context = researchContext(snapshot);
   const marketInput = {
@@ -301,8 +302,8 @@ volumePrice 为最近5根的明细，量比以此前20根均量为分母，CLV �
 翻转明确发生在哪个周期。比较原方向两次推进时价格与量能的变化，量价背离用作动能减弱证据。判断 1h 结构翻转时，指出原方向在哪个关键区推进失败，以及哪根 1h K 线收盘收复或跌破了哪个结构位。仅有 15m 背离、单根长影线或小周期回收时，等待相应级别确认。4h 方向不清时，按区间或转换分析，避免强行判为趋势延续。
 
 summary 首句明确写出做多候选、做空候选、等待确认或放弃。research 交代 marketRegime、scenario、三个周期的证据、风险和 researchHorizon（4、12或24小时）。历史分位数来自不重叠的成交 K 线窗口，属于历史描述。validForSeconds 在30至300之间，用于本次报价复核，与研究窗口独立。
-candidate 表示快照中已有时机证据，实际入场仍须人工复核 triggerConditions。只要 direction 是 long 或 short，就必须提供完整计划，entry 必须是含数值 min 和 max 的对象，并给出 stopLoss、至少一个 target 及对应区间。只有方向参考、还没有可用入场区间时，输出无计划的 watch，在 summary 和周期解读中说明方向倾向以及仍需确认的条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 全部为 null，targets 为空数组，research.scenario 为 none。
-有计划时，在 triggerConditions 写明入场前仍需核对的价格区和可观察的收盘条件，注明周期和价位。止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
+candidate 表示快照中已有时机证据，${immediate ? "本次候选会进入即时下单复核。只有已收盘数据确认入场时机、当前报价在入场区内，且无需等待下一根 K 线、回测或其他条件时才给 candidate。" : "实际入场仍须人工复核 triggerConditions。"}只要 direction 是 long 或 short，就必须提供完整计划，entry 必须是含数值 min 和 max 的对象，并给出 stopLoss、至少一个 target 及对应区间。只有方向参考、还没有可用入场区间时，输出无计划的 watch，在 summary 和周期解读中说明方向倾向以及仍需确认的条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 全部为 null，targets 为空数组，research.scenario 为 none。
+有计划时，在 triggerConditions 写明${immediate ? "已出现的收盘证据和下单前须复核的入场区间。任何仍待确认的条件都应返回 watch 或 none。" : "入场前仍需核对的价格区和可观察的收盘条件，注明周期和价位。"}止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
 
 有计划时，从 frames.zones 引用区域 ID。入场两端和每个目标价须落在各自引用区域的 selectablePriceRange.min 至 max 之间（含端点）。这是程序按 tickSize 向区间内取整的可用范围。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
 止损须在 stopZoneId 原始区域不利侧边界外，离边界不超过1h ATR。做多止损区为支撑，目标区为阻力，做空相反。按区域的 effectiveKind 识别有效支阻，broken 区域不可用。

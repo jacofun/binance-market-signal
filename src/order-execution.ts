@@ -10,6 +10,7 @@ const legs = ["stop", "target"] as const;
 const maxProtectionAttempts = 4;
 const retryMs = 10000;
 const recoverySlotMs = 60000;
+const autoProtectionBudgetMs = 20000;
 const terminalEntry = new Set(["FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"]);
 export const pendingEntryMs = 120000;
 const terminalProtection = new Set(["FINISHED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"]);
@@ -163,70 +164,78 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     }
     return entry;
   }
+  async function submit(plan: OrderPlan, expiresAt: number, draft?: ProtectedDraft, deadline = Infinity) {
+    if (deadline - now() <= autoProtectionBudgetMs + 3000) {
+      throw new AppError("AUTO_ORDER_DEADLINE", "扫描调用剩余时间不足以开仓并提交保护单。", 409);
+    }
+    if (!await ready()) throw new AppError("ORDER_RECOVERY_NOT_READY", "订单保护恢复任务未就绪，暂时禁止开仓。", 503);
+    const quantity = draft?.quantity ?? config.quantity;
+    if (quantity !== config.quantity || expiresAt <= now()) {
+      throw new AppError("ORDER_DRAFT_EXPIRED", "草稿报价已失效，请刷新。", 409);
+    }
+    if (await store.read(`${orderPath(plan.owner, plan.id)}/intent.json`)) {
+      throw new AppError("ORDER_ALREADY_RESERVED", "本次研究已有委托记录，请查单。", 409);
+    }
+    const [rules] = await Promise.all([exchange.rules(), exchange.assertFlat(), store.assertAtomicWrites()]);
+    const quote = await exchange.quote();
+    assertQuote(plan, quote, now());
+    const option = orderOption(draft?.option.kind ?? "limit", plan, quote, rules, config, !draft);
+    if (!supportsExits(rules) || typeof option === "string" ||
+      draft && (option.stopLossPrice !== draft.option.stopLossPrice || option.takeProfitPrice !== draft.option.takeProfitPrice)) {
+      throw new AppError("ORDER_RULE_CHANGED", typeof option === "string" ? option : "止盈或止损未通过复核。", 409);
+    }
+    if (draft && (option.kind === "market" ? Math.abs(Number(option.price) - Number(draft.option.price)) / Number(draft.option.price) > 0.003 :
+      option.price !== draft.option.price || option.triggerPrice !== draft.option.triggerPrice)) {
+      throw new AppError("ORDER_QUOTE_CHANGED", "盘口相较确认草稿变化过大，请刷新。", 409);
+    }
+    const intent: Intent = { ...(option.kind === "market" ? { version: 2, kind: "market" } :
+      { version: 3, kind: option.kind, entryExpiresAt: now() + pendingEntryMs }),
+      analysisId: plan.id, owner: plan.owner,
+      clientId: `mse${digest(`${config.mode}/${plan.owner}/${plan.id}`).slice(0, 30)}`,
+      apiKeyHash: credentials, side: plan.direction === "long" ? "LONG" : "SHORT", quantity,
+      stop: option.stopLossPrice, target: option.takeProfitPrice,
+      openingUntil: Math.min(expiresAt, plan.expiresAt, now() + 15000, deadline - autoProtectionBudgetMs) };
+    if (deadline - now() <= autoProtectionBudgetMs + 3000) {
+      throw new AppError("AUTO_ORDER_DEADLINE", "扫描调用剩余时间不足以开仓并提交保护单。", 409);
+    }
+    if (intent.openingUntil - now() <= 3000) throw new AppError("ORDER_DRAFT_EXPIRED", "草稿剩余时间不足，请刷新。", 409);
+    if (!await store.create(activePath, intent)) {
+      throw new AppError("ORDER_SUBMISSION_LOCKED", "已有 BTCUSDT 委托正在处理或持仓尚未结束。", 409);
+    }
+    if (!await store.create(`${path(intent)}/intent.json`, intent)) {
+      // This invocation owns the new lock and has not sent anything. A
+      // conflict here means a previous attempt completed during preflight.
+      await store.removeLock(activePath);
+      throw new AppError("ORDER_ALREADY_RESERVED", "本次研究已有委托记录，请查单。", 409);
+    }
+    const issuedAt = now();
+    let entry: ExchangeOrder;
+    if (issuedAt + 3000 >= intent.openingUntil || issuedAt - Math.min(quote.bookTime, quote.markTime) > 5000) {
+      entry = { state: "rejected", reason: "ORDER_DRAFT_EXPIRED" };
+    } else {
+      try { entry = await exchange.enter(intent.side, quantity, intent.clientId, issuedAt, option); }
+      catch (error) {
+        report({ event: "order_entry_unknown", ...context(intent), ...detailedError(error) });
+        return result(intent, protectedStatus(intent, "pending"));
+      }
+    }
+    // The recovery task can query a filled order using its persisted client ID.
+    // Give the stop request priority over persisting any post-trade receipt.
+    if (entry.state === "rejected") await rememberEntry(intent, entry);
+    // The timer may take over after this deadline. Keep both submit paths
+    // in the same window when reconciling fills and placing protection.
+    const until = intent.openingUntil + retryMs;
+    entry = await reconcileEntry(intent, entry, until);
+    const outcome = await settle(intent, entry, true, until);
+    if (entry.state !== "rejected") await rememberEntry(intent, entry);
+    report({ event: "order_execution_completed", ...context(intent), entry: entry.state,
+      executedQty: entry.executedQty, protection: outcome.protection.state });
+    return outcome;
+  }
   return {
     ready,
-    async submit(draft: ProtectedDraft) {
-      if (!await ready()) throw new AppError("ORDER_RECOVERY_NOT_READY", "订单保护恢复任务未就绪，暂时禁止开仓。", 503);
-      const { plan, quantity } = draft;
-      if (quantity !== config.quantity || draft.expiresAt <= now()) {
-        throw new AppError("ORDER_DRAFT_EXPIRED", "草稿报价已失效，请刷新。", 409);
-      }
-      if (await store.read(`${orderPath(plan.owner, plan.id)}/intent.json`)) {
-        throw new AppError("ORDER_ALREADY_RESERVED", "本次研究已有委托记录，请查单。", 409);
-      }
-      const [rules] = await Promise.all([exchange.rules(), exchange.assertFlat(), store.assertAtomicWrites()]);
-      const quote = await exchange.quote();
-      assertQuote(plan, quote, now());
-      const option = orderOption(draft.option.kind, plan, quote, rules, config);
-      if (!supportsExits(rules) || typeof option === "string" ||
-        option.stopLossPrice !== draft.option.stopLossPrice || option.takeProfitPrice !== draft.option.takeProfitPrice) {
-        throw new AppError("ORDER_RULE_CHANGED", typeof option === "string" ? option : "止盈或止损未通过复核。", 409);
-      }
-      if (option.kind === "market" ? Math.abs(Number(option.price) - Number(draft.option.price)) / Number(draft.option.price) > 0.003 :
-        option.price !== draft.option.price || option.triggerPrice !== draft.option.triggerPrice) {
-        throw new AppError("ORDER_QUOTE_CHANGED", "盘口相较确认草稿变化过大，请刷新。", 409);
-      }
-      const intent: Intent = { ...(option.kind === "market" ? { version: 2, kind: "market" } :
-        { version: 3, kind: option.kind, entryExpiresAt: now() + pendingEntryMs }),
-        analysisId: plan.id, owner: plan.owner,
-        clientId: `mse${digest(`${config.mode}/${plan.owner}/${plan.id}`).slice(0, 30)}`,
-        apiKeyHash: credentials, side: plan.direction === "long" ? "LONG" : "SHORT", quantity,
-        stop: option.stopLossPrice, target: option.takeProfitPrice,
-        openingUntil: Math.min(draft.expiresAt, plan.expiresAt, now() + 15000) };
-      if (intent.openingUntil - now() <= 3000) throw new AppError("ORDER_DRAFT_EXPIRED", "草稿剩余时间不足，请刷新。", 409);
-      if (!await store.create(activePath, intent)) {
-        throw new AppError("ORDER_SUBMISSION_LOCKED", "已有 BTCUSDT 委托正在处理或持仓尚未结束。", 409);
-      }
-      if (!await store.create(`${path(intent)}/intent.json`, intent)) {
-        // This invocation owns the new lock and has not sent anything. A
-        // conflict here means a previous attempt completed during preflight.
-        await store.removeLock(activePath);
-        throw new AppError("ORDER_ALREADY_RESERVED", "本次研究已有委托记录，请查单。", 409);
-      }
-      const issuedAt = now();
-      let entry: ExchangeOrder;
-      if (issuedAt + 3000 >= intent.openingUntil || issuedAt - Math.min(quote.bookTime, quote.markTime) > 5000) {
-        entry = { state: "rejected", reason: "ORDER_DRAFT_EXPIRED" };
-      } else {
-        try { entry = await exchange.enter(intent.side, quantity, intent.clientId, issuedAt, option); }
-        catch (error) {
-          report({ event: "order_entry_unknown", ...context(intent), ...detailedError(error) });
-          return result(intent, protectedStatus(intent, "pending"));
-        }
-      }
-      // The recovery task can query a filled order using its persisted client ID.
-      // Give the stop request priority over persisting any post-trade receipt.
-      if (entry.state === "rejected") await rememberEntry(intent, entry);
-      // The timer may take over after this deadline. Keep both submit paths
-      // in the same window when reconciling fills and placing protection.
-      const until = intent.openingUntil + retryMs;
-      entry = await reconcileEntry(intent, entry, until);
-      const outcome = await settle(intent, entry, true, until);
-      if (entry.state !== "rejected") await rememberEntry(intent, entry);
-      report({ event: "order_execution_completed", ...context(intent), entry: entry.state,
-        executedQty: entry.executedQty, protection: outcome.protection.state });
-      return outcome;
-    },
+    submit: (draft: ProtectedDraft) => submit(draft.plan, draft.expiresAt, draft),
+    submitAutomatic: (plan: OrderPlan, deadline: number) => submit(plan, plan.expiresAt, undefined, deadline),
     async inspect(intent: Intent) {
       const closed = await store.read(`${path(intent)}/closed.json`);
       const cached = await knownOrder(intent);

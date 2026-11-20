@@ -4,13 +4,14 @@ import test from "node:test";
 import { autoAnalysisLimit, reserveAutoAnalysisQuota } from "../build/auto-analysis.js";
 import { INTERVAL_MS, parseCandles } from "../build/market.js";
 import { makeServer } from "../build/server.js";
-import { env, jwt, klines, NOW, proposal, provider, quote, snapshot } from "./fixtures.mjs";
+import { env, jwt, klines, marketFetch, NOW, proposal, provider, quote, snapshot } from "./fixtures.mjs";
 
 const period = INTERVAL_MS["15m"];
 const storage = "/private/market-signal-scanner/v1/BTCUSDT/auto-analysis";
 const archive = "/private/.trading/owner/market-signals";
 const noSetup = proposal({ status: "none", direction: null, entry: null, stopLoss: null, targets: [] });
 const upstreamId = "f33b92e5-7ade-471a-b3c4-d638b5e1b542";
+const demoHost = "demo-fapi.binance.com";
 
 function scannerCandles(frame, at) {
   const rows = klines(INTERVAL_MS[frame], at);
@@ -33,6 +34,10 @@ function scannerCandles(frame, at) {
 async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new Map()) {
   const requests = [];
   const logs = [];
+  const marketHosts = new Set();
+  const submissions = [];
+  const orders = new Map();
+  const protection = new Map();
   const scannerFetch = async (input, options) => {
     const url = new URL(input);
     if (url.hostname.endsWith("aliyuncs.com") && url.hostname.startsWith("auto-analysis-test.")) {
@@ -49,8 +54,9 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
         return new Response(null);
       }
       if (options.method === "PUT") {
-        assert.equal(options.headers["x-oss-forbid-overwrite"], "true");
-        if (current) return new Response(null, { status: 409 });
+        const heartbeat = url.pathname.endsWith("/protection/heartbeat.json");
+        if (!heartbeat) assert.equal(options.headers["x-oss-forbid-overwrite"], "true");
+        if (current && !heartbeat) return new Response(null, { status: 409 });
         objects.set(url.pathname, options.body);
         return new Response(null);
       }
@@ -59,13 +65,66 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     if (url.hostname === "dashscope.aliyuncs.com") {
       requests.push(JSON.parse(options.body));
       if (state.modelTimeout) throw new Error("simulated transport failure");
+      state.now += state.modelElapsed ?? 0;
       return Response.json({ request_id: upstreamId, usage: { prompt_tokens: 123, completion_tokens: 54 },
-        choices: [{ finish_reason: "stop", message: { content: JSON.stringify(state.invalidModel ? {} : noSetup) } }] });
+        choices: [{ finish_reason: "stop", message: { content: JSON.stringify(state.invalidModel ? {} : state.proposal ?? noSetup) } }] });
     }
-    assert.equal(url.hostname, "fapi.binance.com");
+    marketHosts.add(url.hostname);
+    assert.equal(url.hostname, state.autoOrder && state.execution ? demoHost : "fapi.binance.com");
     if (url.pathname.endsWith("/time")) return Response.json({ serverTime: state.now });
+    if (!url.pathname.endsWith("/klines")) return marketFetch(input);
     const timeframe = url.searchParams.get("interval");
     return Response.json(scannerCandles(timeframe, Number(url.searchParams.get("endTime"))));
+  };
+  const orderFetch = async (input, options) => {
+    const url = new URL(input);
+    if (url.search === "?versioning") return new Response("<VersioningConfiguration/>");
+    if (url.hostname.endsWith(".aliyuncs.com")) {
+      if (options.method === "DELETE") {
+        assert.match(url.pathname, /locks\/btcusdt\.json$/);
+        objects.delete(url.pathname);
+        return new Response(null, { status: 204 });
+      }
+      return scannerFetch(input, options);
+    }
+    assert.equal(url.hostname, demoHost);
+    if (url.pathname.endsWith("/exchangeInfo")) {
+      const lot = { minQty: "0.001", maxQty: "20", stepSize: "0.001" };
+      return Response.json({ symbols: [{ symbol: "BTCUSDT", baseAsset: "BTC", quoteAsset: "USDT", status: "TRADING",
+        contractType: "PERPETUAL", orderTypes: ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"], timeInForce: ["IOC"],
+        filters: [{ filterType: "PRICE_FILTER", minPrice: "1", maxPrice: "1000000", tickSize: "0.1" },
+          { filterType: "LOT_SIZE", ...lot }, { filterType: "MARKET_LOT_SIZE", ...lot },
+          { filterType: "MIN_NOTIONAL", notional: "5" }, { filterType: "PERCENT_PRICE", multiplierUp: "1.1", multiplierDown: "0.9" }] }] });
+    }
+    if (url.pathname.endsWith("/premiumIndex")) return Response.json({ symbol: "BTCUSDT", markPrice: "10000", time: state.now });
+    if (url.pathname.endsWith("/bookTicker")) return Response.json({ symbol: "BTCUSDT", bidPrice: "9999.9", bidQty: "1",
+      askPrice: state.askPrice ?? "10000.1", askQty: "1", time: state.now });
+    if (url.pathname.endsWith("/dual")) return Response.json({ dualSidePosition: true });
+    if (url.pathname.endsWith("/positionRisk")) return Response.json([...orders.values()].filter(order => Number(order.executedQty) > 0)
+      .map(order => ({ symbol: "BTCUSDT", positionSide: order.positionSide,
+        positionAmt: order.positionSide === "LONG" ? order.executedQty : "-" + order.executedQty })));
+    if (url.pathname.endsWith("/openOrders") || url.pathname.endsWith("/openAlgoOrders")) return Response.json([]);
+    const algo = url.pathname.endsWith("/algoOrder");
+    assert.ok(algo || url.pathname.endsWith("/order"));
+    if (options.method === "POST") {
+      const params = Object.fromEntries(new URLSearchParams(options.body));
+      submissions.push(params);
+      if (algo) {
+        const event = { symbol: "BTCUSDT", algoId: 52, clientAlgoId: params.clientAlgoId, algoStatus: "NEW", orderType: params.type,
+          positionSide: params.positionSide, side: params.side, workingType: params.workingType,
+          closePosition: params.closePosition === "true", triggerPrice: params.triggerPrice };
+        protection.set(params.clientAlgoId, event);
+        return Response.json(event);
+      }
+      assert.ok([...objects.keys()].some(path => path.startsWith(archive + "/index/")));
+      assert.ok([...objects.keys()].some(path => path.endsWith("/intent.json")));
+      const entry = { symbol: "BTCUSDT", orderId: 45, clientOrderId: params.newClientOrderId, status: state.entryStatus ?? "FILLED",
+        positionSide: params.positionSide, side: params.side, executedQty: state.entryQty ?? "0.001", avgPrice: "10000.1" };
+      orders.set(params.newClientOrderId, entry);
+      return state.unknownEntry ? Response.json({ code: -1007 }, { status: 503 }) : Response.json(entry);
+    }
+    const row = algo ? protection.get(url.searchParams.get("clientAlgoId")) : orders.get(url.searchParams.get("origClientOrderId"));
+    return row ? Response.json(row) : Response.json({ code: -2013 }, { status: 400 });
   };
   const market = provider({
     snapshot: async () => {
@@ -73,17 +132,24 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
       const current = snapshot();
       current.asOf = state.now;
       current.quote.time = state.now;
+      if (state.proposal?.direction === "short") current.frames[1].zones.push({
+        ...current.frames[1].zones[0], id: "short-entry", kind: "resistance", lower: 9980, upper: 10020,
+      });
       for (const frame of current.frames) frame.recentCandles =
         parseCandles(klines(INTERVAL_MS[frame.interval], state.now), frame.interval, state.now);
       current.frames[2].lastCloseTime = Math.floor(state.now / period) * period - 1 + (state.stale ? period : 0);
       return current;
     },
-    quote: async () => quote({ time: state.now }),
+    quote: async () => quote({ time: state.now, price: state.finalMark ?? 10000 }),
   });
   const runtime = makeServer({
     env: { ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", OSS_BUCKET: "auto-analysis-test", OSS_REGION: "cn-hangzhou",
-      ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT: limit },
-    now: () => state.now, provider: market, scannerFetch,
+      ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT: limit,
+      SIGNAL_AUTO_ORDER_EXECUTE: state.autoOrder ? "true" : undefined,
+      SIGNAL_MAX_ANALYSIS_AGE_MS: state.modelElapsed ? "100000" : undefined,
+      SIGNAL_ORDER_EXECUTE: state.execution ? "true" : undefined, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: `https://${demoHost}`,
+      BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret" },
+    now: () => state.now, provider: state.realMarket ? undefined : market, scannerFetch, orderFetch,
     logger: { info: line => logs.push(JSON.parse(line)), error: line => logs.push(JSON.parse(line)) },
   });
   runtime.listen(0, "127.0.0.1");
@@ -97,10 +163,14 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     return response.json();
   }
   return {
-    requests, objects, logs, state,
+    requests, objects, logs, state, marketHosts, submissions,
     invoke: () => post("/invoke", { triggerName: "binance-market-scanner", triggerTime: new Date(state.now).toISOString() },
       { "x-fc-control-path": "/invoke", "x-fc-request-id": "test-trigger" }),
     list: () => post("/scans", { version: 2 }, { "X-JWT-Token": jwt() }),
+    recover: () => post("/invoke", { triggerName: "market-order-protection", triggerTime: new Date(state.now).toISOString() },
+      { "x-fc-control-path": "/invoke", "x-fc-request-id": "test-trigger" }),
+    lookup: analysisId => post("/orders", { action: "status", analysisId },
+      { "X-JWT-Token": jwt({ scope: "trading:orders:read", iat: Math.floor(state.now / 1000), exp: Math.floor(state.now / 1000) + 120 }) }),
   };
 }
 
@@ -116,6 +186,84 @@ test("automatic quota has no default and rejects invalid values", async t => {
     assert.equal(result.autoAnalysis.status, limit === "garbage" ? "failed" : "disabled");
     assert.equal(app.requests.length, 0);
   }
+});
+
+test("a qualified timer sends one protected IOC, archives the decision and supports owner lookup", async t => {
+  const app = await testServer(t, "3", { now: NOW + 5000, autoOrder: true, execution: true, proposal: proposal(),
+    entryStatus: "EXPIRED", entryQty: "0.0005" });
+  await app.recover();
+  const { autoAnalysis } = await app.invoke();
+  assert.equal(autoAnalysis.status, "completed", JSON.stringify(autoAnalysis));
+  assert.deepEqual(autoAnalysis.order, { status: "accepted", clientId: app.submissions[0].newClientOrderId,
+    protection: "active", exchangeStatus: "EXPIRED", executedQty: "0.0005" });
+  assert.deepEqual([...app.marketHosts], [demoHost]);
+  assert.match(app.requests[0].messages[0].content, /本次候选会进入即时下单复核/);
+  assert.equal(app.submissions[0].timeInForce, "IOC");
+  assert.equal(app.submissions[0].newOrderRespType, "RESULT");
+  assert.equal(app.submissions[0].price, "10000.1");
+  assert.equal(app.submissions[0].quantity, "0.001");
+  assert.deepEqual(app.submissions.slice(1).map(order => [order.type, order.triggerPrice, order.closePosition]),
+    [["STOP_MARKET", "9900", "true"], ["TAKE_PROFIT_MARKET", "10200", "true"]]);
+  assert.equal((await app.lookup(autoAnalysis.analysisId)).protection.state, "active");
+  assert.equal((await app.list()).records[0].autoAnalysis.order.clientId, autoAnalysis.order.clientId);
+  assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
+  assert.equal(app.requests.length, 1);
+  assert.equal(app.submissions.length, 3);
+});
+
+test("auto ordering is gated by the two switches, market eligibility, heartbeat and deadline", async t => {
+  const short = proposal({ direction: "short", stopLoss: 10100, targets: [{ price: 9700, reason: "支撑", zoneId: "down" }] });
+  short.research.entryZoneId = "short-entry";
+  for (const [override, expected, status = "completed"] of [
+    [{ autoOrder: false }, undefined],
+    [{ execution: false }, "ORDER_EXECUTION_DISABLED"],
+    [{ proposal: noSetup }, "AUTO_ORDER_NOT_CANDIDATE"],
+    [{ finalMark: 10020 }, "AUTO_ORDER_NOT_CANDIDATE"],
+    [{ proposal: short }, "AUTO_ORDER_SCAN_DIRECTION_MISMATCH"],
+    [{ noHeartbeat: true }, "ORDER_RECOVERY_NOT_READY"],
+    [{ askPrice: "10020.1" }, "ORDER_RULE_CHANGED"],
+    [{ modelElapsed: 94000 }, "AUTO_ORDER_DEADLINE"],
+    [{ rejectArchive: true }, undefined, "failed"],
+    [{ invalidModel: true }, undefined, "failed"],
+  ]) {
+    const state = { now: NOW + 5000, autoOrder: true, execution: true, proposal: proposal(), ...override };
+    const app = await testServer(t, "1", state);
+    if (!state.noHeartbeat) await app.recover();
+    const { autoAnalysis } = await app.invoke();
+    assert.equal(autoAnalysis.status, status, JSON.stringify({ override, autoAnalysis }));
+    assert.equal(autoAnalysis.order?.code, expected, JSON.stringify({ override, autoAnalysis }));
+    assert.equal(app.submissions.length, 0);
+  }
+});
+
+test("an IOC without a fill exits without protection and an ambiguous response recovers without resubmitting", async t => {
+  const state = { now: NOW + 5000, autoOrder: true, execution: true, proposal: proposal(), entryStatus: "EXPIRED", entryQty: "0" };
+  const unfilled = await testServer(t, "1", state);
+  await unfilled.recover();
+  assert.equal((await unfilled.invoke()).autoAnalysis.order.protection, "not_required");
+  assert.equal(unfilled.submissions.length, 1);
+  assert.ok(![...unfilled.objects.keys()].some(path => path.endsWith("/locks/btcusdt.json")));
+
+  const ambiguous = await testServer(t, "2", { ...state, entryStatus: "FILLED", entryQty: "0.001", unknownEntry: true });
+  await ambiguous.recover();
+  const { autoAnalysis } = await ambiguous.invoke();
+  assert.equal(autoAnalysis.order.status, "unknown");
+  assert.equal(ambiguous.submissions.length, 1);
+  ambiguous.state.now = NOW + 60000;
+  const recovered = await ambiguous.recover();
+  assert.equal(recovered.protection.state, "active");
+  assert.equal(recovered.clientId, autoAnalysis.order.clientId);
+  assert.equal((await ambiguous.invoke()).autoAnalysis.status, "duplicate");
+  assert.deepEqual(ambiguous.submissions.map(order => order.type), ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
+});
+
+test("armed demo scanning and actual REST analysis use the demo endpoint", async t => {
+  const app = await testServer(t, "1", { now: NOW + 5000, autoOrder: true, execution: true, realMarket: true });
+  const result = await app.invoke();
+  assert.equal(result.autoAnalysis.status, "completed", JSON.stringify(result));
+  assert.equal(result.autoAnalysis.order.code, "AUTO_ORDER_NOT_CANDIDATE");
+  assert.deepEqual([...app.marketHosts], [demoHost]);
+  assert.equal(app.requests[0].messages[1].content.includes("\"source\":\"rest\""), true);
 });
 
 test("qualified timer sends the actual checks once and archives the independent decision for the review worker", async t => {
