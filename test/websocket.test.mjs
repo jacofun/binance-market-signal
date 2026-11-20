@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { WebSocketMarketDataProvider } from "../build/websocket-market.js";
 import { loadConfig } from "../build/config.js";
-import { env, NOW, marketFetch } from "./fixtures.mjs";
+import { env, klines, NOW, marketFetch } from "./fixtures.mjs";
+import { INTERVAL_MS } from "../build/market.js";
 
 class Socket extends EventTarget {
   closed = false;
@@ -45,4 +46,37 @@ test("malformed stream events close the socket and shutdown prevents reconnect",
   market.close();
   await new Promise(r => setTimeout(r, 5));
   assert.equal(connections, 1);
+});
+
+test("a provisional WebSocket bar cannot replace a missing final bar at the new close", async t => {
+  const socket = new Socket();
+  let now = NOW + 2000;
+  let pendingClose = true;
+  const boundary = NOW + INTERVAL_MS["15m"];
+  const market = new WebSocketMarketDataProvider(loadConfig(env), async url => {
+    if (url.pathname.endsWith("/time")) return Response.json({ serverTime: now });
+    if (url.pathname.endsWith("/klines")) {
+      const interval = url.searchParams.get("interval");
+      const end = Number(url.searchParams.get("endTime"));
+      const rows = klines(INTERVAL_MS[interval], end);
+      if (end === boundary && pendingClose) {
+        pendingClose = false;
+        return Response.json(rows.slice(0, -2));
+      }
+      rows.at(-2)[4] = end === boundary ? "10050" : "10010";
+      return Response.json(rows);
+    }
+    if (url.pathname.endsWith("/premiumIndex")) return Response.json({ symbol: "BTCUSDT", markPrice: "10000",
+      indexPrice: "10000", lastFundingRate: "0", time: now, nextFundingTime: now + INTERVAL_MS["1h"] });
+    return marketFetch(url);
+  }, () => now, () => socket);
+  t.after(() => market.close());
+  await market.snapshot("BTCUSDT", AbortSignal.timeout(2500));
+  now = boundary + 2000;
+  market.ingest({ e: "kline", s: "BTCUSDT", k: { i: "15m", x: false, t: NOW, T: boundary - 1, c: "10088" } });
+  const result = await market.snapshot("BTCUSDT", AbortSignal.timeout(2500));
+  const short = result.frames.find(frame => frame.interval === "15m");
+  assert.equal(short.lastCloseTime, boundary - 1);
+  assert.equal(short.close, 10050);
+  assert.equal(pendingClose, false);
 });

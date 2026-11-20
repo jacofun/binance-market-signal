@@ -38,6 +38,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
   const submissions = [];
   const orders = new Map();
   const protection = new Map();
+  let reads15m = 0;
   const scannerFetch = async (input, options) => {
     const url = new URL(input);
     if (url.hostname.endsWith("aliyuncs.com") && url.hostname.startsWith("auto-analysis-test.")) {
@@ -74,7 +75,9 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     if (url.pathname.endsWith("/time")) return Response.json({ serverTime: state.now });
     if (!url.pathname.endsWith("/klines")) return marketFetch(input);
     const timeframe = url.searchParams.get("interval");
-    return Response.json(scannerCandles(timeframe, Number(url.searchParams.get("endTime"))));
+    const candles = scannerCandles(timeframe, Number(url.searchParams.get("endTime")));
+    if (timeframe === "15m" && ++reads15m === 2 && state.delayAnalysisClose) return Response.json(candles.slice(0, -2));
+    return Response.json(candles);
   };
   const orderFetch = async (input, options) => {
     const url = new URL(input);
@@ -198,6 +201,7 @@ test("a qualified timer sends one protected IOC, archives the decision and suppo
     protection: "active", exchangeStatus: "EXPIRED", executedQty: "0.0005" });
   assert.deepEqual([...app.marketHosts], [demoHost]);
   assert.match(app.requests[0].messages[0].content, /本次候选会进入即时下单复核/);
+  assert.match(app.requests[0].messages[0].content, /如果某个尚未发生的条件是交易成立的必要前提，才为该条件等待/);
   assert.equal(app.submissions[0].timeInForce, "IOC");
   assert.equal(app.submissions[0].newOrderRespType, "RESULT");
   assert.equal(app.submissions[0].price, "10000.1");
@@ -258,13 +262,18 @@ test("an IOC without a fill exits without protection and an ambiguous response r
   assert.deepEqual(ambiguous.submissions.map(order => order.type), ["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
 });
 
-test("armed demo scanning and actual REST analysis use the demo endpoint", async t => {
-  const app = await testServer(t, "1", { now: NOW + 5000, autoOrder: true, execution: true, realMarket: true });
+test("demo REST analysis retries a delayed response and gives Kimi the same close as the scanner", async t => {
+  const app = await testServer(t, "1", { now: NOW + 5000, autoOrder: true, execution: true, realMarket: true, delayAnalysisClose: true });
   const result = await app.invoke();
   assert.equal(result.autoAnalysis.status, "completed", JSON.stringify(result));
   assert.equal(result.autoAnalysis.order.code, "AUTO_ORDER_NOT_CANDIDATE");
   assert.deepEqual([...app.marketHosts], [demoHost]);
-  assert.equal(app.requests[0].messages[1].content.includes("\"source\":\"rest\""), true);
+  const { snapshot, scanEvidence } = JSON.parse(app.requests[0].messages[1].content);
+  const short = snapshot.frames.find(frame => frame.interval === "15m");
+  assert.equal(snapshot.source, "rest");
+  assert.equal(short.latestClosedAt, scanEvidence.candleClosedAt);
+  assert.equal(short.recentCandles.at(-1)[0], scanEvidence.candleClosedAt - period);
+  assert.equal(short.recentCandles.at(-1)[4], scanEvidence.close);
 });
 
 test("qualified timer sends the actual checks once and archives the independent decision for the review worker", async t => {
@@ -296,7 +305,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   assert.equal(completed.modelStatus, "none");
   assert.deepEqual(completed.decisionReasons, ["model_none"]);
   assert.equal(completed.modelSummary, undefined);
-  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v6-auto-scan");
+  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v7-auto-scan");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));

@@ -1,8 +1,7 @@
-import { setTimeout as delay } from "node:timers/promises";
 import { AppError } from "./errors.js";
 import type { Env } from "./config.js";
 import { limited } from "./http.js";
-import { frame, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
+import { closedCandleBoundary, frame, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadOssConfig } from "./oss-config.js";
 import { effectiveKind } from "./price-zones.js";
@@ -20,8 +19,6 @@ const rulesVersion = "v1";
 const minimumRvol = 1.5;
 const maximumDistanceAtr = 1;
 const minimumRoomAtr = 1;
-const closePublicationGraceMs = 1000;
-const closeRetryDelaysMs = [0, 400, 1000, 2000];
 
 type Direction = "long" | "short";
 type Decision = "passed" | "watch" | "filtered" | "none";
@@ -109,27 +106,10 @@ export function scanRules(short: Frame, hourly: Frame, background: Frame): Rule[
 
 const scanError = (code: string, message: string, status = 400) => new AppError(code, message, status);
 const hourFor = (time: number) => Math.floor(time / hour) * hour;
-const slotFor = (time: number) => Math.floor(time / interval) * interval;
+const slotFor = (time: number) => closedCandleBoundary(time, "15m");
 const legacyKey = (slot: number) => `${symbol}/${slot}.json`;
 const logKey = (time: number) => `${symbol}/runs/${hourFor(time)}.ndjson`;
 const cursorFormat = /^(\d{13}):([a-z0-9-]{0,60})$/;
-
-async function latestScanCandles(provider: RestMarketDataProvider, serverTime: number, expectedClose: number, signal: AbortSignal) {
-  const settledAt = expectedClose + closePublicationGraceMs;
-  if (serverTime < settledAt) await delay(settledAt - serverTime, undefined, { signal });
-  for (const wait of closeRetryDelaysMs) {
-    if (wait) await delay(wait, undefined, { signal });
-    if (serverTime < expectedClose) {
-      serverTime = await provider.serverTime(signal);
-      if (serverTime < expectedClose) continue;
-    }
-    // Keep the requested close fixed across retries. A continuous response ending
-    // one bar early identifies publication lag but cannot drive a scan.
-    const candles = await provider.candles(symbol, "15m", expectedClose, signal, true);
-    if (candles.at(-1)?.closeTime === expectedClose - 1) return candles;
-  }
-  throw scanError("SCAN_CANDLE_NOT_READY", "本次应收盘的 15m K 线尚未发布。", 503);
-}
 
 export function validateScanTimer(input: Record<string, unknown>, now: number) {
   const time = typeof input.triggerTime === "string" ? Date.parse(input.triggerTime) : NaN;
@@ -170,7 +150,8 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
       try {
         const serverTime = await provider.serverTime(signal);
         expectedCandleClosedAt = slotFor(Math.max(now(), serverTime));
-        const short = frame(await latestScanCandles(provider, serverTime, expectedCandleClosedAt, signal), "15m");
+        await provider.waitForClose(serverTime, expectedCandleClosedAt, signal);
+        const short = frame(await provider.latestClosedCandles(symbol, "15m", expectedCandleClosedAt, signal), "15m");
         candleClosedAt = short.lastCloseTime + 1;
         // Keep the higher-timeframe zones fixed at the start of the pattern.
         const contextAt = candleClosedAt - 2 * interval;
@@ -188,7 +169,9 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
           record.autoAnalysis = { status: followUp ? "pending" : "disabled" };
         }
       } catch (error) {
-        record = { ...basis, candleClosedAt, expectedCandleClosedAt, status: "error", errorCode: error instanceof AppError ? error.code : "SCAN_FAILED" };
+        const code = error instanceof AppError ? error.code : "SCAN_FAILED";
+        record = { ...basis, candleClosedAt, expectedCandleClosedAt, status: "error",
+          errorCode: code === "MARKET_CANDLE_NOT_READY" ? "SCAN_CANDLE_NOT_READY" : code };
       }
       await store.appendJsonLine(logKey(scannedAt), record);
       const autoAnalysis = evidence && followUp ? await followUp(evidence, store) : record.autoAnalysis;

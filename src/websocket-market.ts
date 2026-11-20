@@ -83,7 +83,7 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
       if (!rows.length || c.openTime > rows.at(-1)!.openTime) this.bars.set(key, [...rows, c].slice(-CANDLE_LIMIT));
     }
   }
-  override async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
+  override async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
     const key = `${symbol}:${interval}`;
     const rows = this.bars.get(key) || [];
     try {
@@ -92,7 +92,7 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
     } catch {
       // Fall back to REST when cached bars are stale or have gaps.
     }
-    const repaired = await super.candles(symbol, interval, at, signal);
+    const repaired = await super.candles(symbol, interval, at, signal, allowOneMissingClose);
     const merged = new Map([...repaired, ...(this.bars.get(key) || [])].map(c => [c.openTime, c]));
     this.bars.set(key, [...merged.values()].sort((a, b) => a.openTime - b.openTime).slice(-CANDLE_LIMIT));
     return repaired;

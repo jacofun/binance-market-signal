@@ -45,8 +45,12 @@ test("Kimi receives the snapshot metric enum, price rules and a larger default o
     assert.match(prompt, /只能引用1个枚举指标/);
     assert.match(prompt, /做空可以在阻力区内或其下方设置更近的止损/);
     assert.match(prompt, /同一周期和同一成交量口径下，对比前一段趋势推进、反向调整和当前尝试恢复三段/);
-    assert.match(prompt, /用 15m 判断反向调整处于进行中、趋于停顿还是已确认顺势恢复/);
-    assert.match(prompt, /判断 1h 结构翻转时.*哪根 1h K 线收盘/);
+    assert.match(prompt, /用 15m 判断反向调整处于进行中、趋于停顿还是已恢复/);
+    assert.match(prompt, /已经发生的 1h 结构翻转须指出哪根 1h K 线收盘/);
+    assert.match(prompt, /15m 早期翻转候选/);
+    assert.match(prompt, /1\/\(1\+R\).*盈亏平衡门槛/);
+    assert.match(prompt, /现有证据和盈亏比足以支持尝试时，给出 candidate/);
+    assert.match(prompt, /勿编造概率/);
     assert.match(prompt, /只有方向参考、还没有可用入场区间时，输出无计划的 watch/);
     assert.match(prompt, /只要 direction 是 long 或 short，就必须提供完整计划/);
     assert.match(prompt, /invalidationConditions 区分【未入场失效】和【持仓提前退出】/);
@@ -133,7 +137,7 @@ test("manual analysis exposes labelled timing conditions and the prompt version 
   const result = await analyze(loadConfig(env), provider(), "BTCUSDT", "trend", AbortSignal.timeout(1000),
     async () => modelResult(proposal({ triggerConditions, invalidationConditions })), () => NOW);
   assert.equal(result.schemaVersion, 4);
-  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v6");
+  assert.equal(result.model.promptVersion, "market-research-v4-volume-timing-v7");
   assert.deepEqual(result.opportunity.triggerConditions, triggerConditions);
   assert.deepEqual(result.opportunity.invalidationConditions, invalidationConditions);
   assert.equal(result.opportunity.triggerVerified, false);
@@ -306,7 +310,7 @@ test("Bailian request disables thinking, asks for JSON, and never retries errors
 });
 test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps its fixed sampling", async () => {
   const config = loadConfig({ ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", DASHSCOPE_BASE_URL: "https://ws-example.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1" });
-  const input = await new RestMarketDataProvider(config, marketFetch, () => NOW).snapshot("BTCUSDT", AbortSignal.timeout(1000));
+  const input = await new RestMarketDataProvider(config, marketFetch, () => NOW).snapshot("BTCUSDT", AbortSignal.timeout(2500));
   let modelFrames;
   let calls = 0;
   const request = async (url, options) => {
@@ -322,6 +326,7 @@ test("Bailian Kimi K3.1 Pro receives 200 closed candles per timeframe and keeps 
     assert.deepEqual(sent.frames.map(f => [f.interval, f.recentCandles.length]), [["4h", 200], ["1h", 200], ["15m", 200]]);
     for (const [i, f] of sent.frames.entries()) {
       assert.equal(f.recentCandles[0][0], input.frames[i].recentCandles[0].openTime);
+      assert.equal(f.latestClosedAt, input.frames[i].recentCandles.at(-1).closeTime + 1);
       assert.deepEqual(f.recentCandles.at(-1).slice(1), [10000, 10100, 9900, 10010, 10, 4]);
       assert.equal(f.volumePrice.length, 5);
       assert.equal(f.priceLevels.high200, 10100);

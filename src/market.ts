@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { atrSeries, emaSeries, frameTrend, historicalRanges, volumeBars, volumeWindows } from "./features.js";
 import { confirmedPivots, priceZones, selectZones } from "./price-zones.js";
 import { AppError } from "./errors.js";
@@ -8,8 +9,13 @@ import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot } fro
 export const ANALYSIS_INTERVALS = ["4h", "1h", "15m"] as const satisfies readonly Interval[];
 export const INTERVAL_MS: Record<Interval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000 };
 export const CANDLE_LIMIT = 200;
+const candlePublicationGraceMs = 1000;
+const candleRetryDelaysMs = [0, 400, 1000, 2000];
+export const closedCandleBoundary = (at: number, interval: Interval) => Math.floor(at / INTERVAL_MS[interval]) * INTERVAL_MS[interval];
 export const candleRow = (c: Candle) => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.takerBuyVolume];
 const badData = () => new AppError("INVALID_MARKET_DATA", "行情缺失、时间不连续或字段无效，本次不生成交易机会。", 502);
+const candleNotReady = (interval: Interval) => new AppError("MARKET_CANDLE_NOT_READY",
+  `最新 ${interval} K 线的收盘数据尚未发布，请稍后重试。`, 503, undefined, undefined, { marketEndpoint: "/fapi/v1/klines" });
 export function numeric(value: unknown, positive = false): number {
   if (typeof value !== "number" && (typeof value !== "string" || !/^-?\d+(\.\d+)?$/.test(value))) throw badData();
   const n = Number(value);
@@ -33,7 +39,7 @@ export function parseCandles(raw: unknown, interval: Interval, serverTime: numbe
       c.takerBuyVolume > c.volume + 1e-8) throw badData();
     return c;
   }).filter(c => c.closeTime < serverTime);
-  const expectedClose = Math.floor(serverTime / period) * period - 1;
+  const expectedClose = closedCandleBoundary(serverTime, interval) - 1;
   if (rows.length < 60 || rows.some((c, i) => i > 0 && c.openTime !== rows[i - 1]!.openTime + period) ||
     rows.at(-1)!.closeTime < expectedClose - (allowOneMissingClose ? period : 0)) throw badData();
   return rows.slice(-CANDLE_LIMIT);
@@ -117,6 +123,17 @@ export class RestMarketDataProvider implements MarketDataProvider {
     if (Math.abs(this.offset) > 30000) throw new AppError("CLOCK_SKEW", "函数与币安服务器时间偏差过大。", 503);
     return time;
   }
+  async waitForClose(serverTime: number, expectedClose: number, signal: AbortSignal): Promise<number> {
+    const settleIn = expectedClose + candlePublicationGraceMs - serverTime;
+    if (settleIn > 0) await delay(settleIn, undefined, { signal });
+    if (serverTime >= expectedClose) return serverTime;
+    for (const wait of candleRetryDelaysMs) {
+      if (wait) await delay(wait, undefined, { signal });
+      const current = await this.serverTime(signal);
+      if (current >= expectedClose) return current;
+    }
+    throw candleNotReady("15m");
+  }
   async quote(symbol: string, signal: AbortSignal): Promise<Quote> {
     const raw = await this.get("/fapi/v1/premiumIndex", { symbol }, signal) as Record<string, unknown>;
     if (raw?.symbol !== symbol) throw badData();
@@ -128,6 +145,16 @@ export class RestMarketDataProvider implements MarketDataProvider {
   }
   async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
     return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(CANDLE_LIMIT + 1), endTime: String(at) }, signal), interval, at, allowOneMissingClose);
+  }
+  async latestClosedCandles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
+    const boundary = closedCandleBoundary(at, interval);
+    for (const wait of candleRetryDelaysMs) {
+      if (wait) await delay(wait, undefined, { signal });
+      // One missing candle can be a publication delay. It is never used in a snapshot.
+      const candles = await this.candles(symbol, interval, boundary, signal, true);
+      if (candles.at(-1)?.closeTime === boundary - 1) return candles;
+    }
+    throw candleNotReady(interval);
   }
   async openInterest(symbol: string, at: number, signal: AbortSignal): Promise<Snapshot["openInterest"]> {
     const raw = await this.get("/futures/data/openInterestHist", { symbol, period: "1h", limit: "12" }, signal);
@@ -158,10 +185,20 @@ export class RestMarketDataProvider implements MarketDataProvider {
     return tick;
   }
   async snapshot(symbol: string, signal: AbortSignal): Promise<Snapshot> {
-    const at = await this.serverTime(signal);
+    const time = await this.serverTime(signal);
+    const at = await this.waitForClose(time, closedCandleBoundary(Math.max(this.now(), time), "15m"), signal);
+    const result = await this.loadSnapshot(symbol, at, signal);
+    const now = this.now();
+    const boundary = closedCandleBoundary(Math.max(now, now + this.offset), "15m");
+    if (boundary <= closedCandleBoundary(at, "15m")) return result;
+    // An analysis started just before a close can cross it while loading data.
+    const refreshedAt = await this.waitForClose(await this.serverTime(signal), boundary, signal);
+    return this.loadSnapshot(symbol, refreshedAt, signal);
+  }
+  private async loadSnapshot(symbol: string, at: number, signal: AbortSignal): Promise<Snapshot> {
     const warnings: string[] = [];
     // At most two outbound market calls at a time on the 0.35-vCPU instance.
-    const tasks: (() => Promise<unknown>)[] = ANALYSIS_INTERVALS.map(interval => async () => frame(await this.candles(symbol, interval, at, signal), interval));
+    const tasks: (() => Promise<unknown>)[] = ANALYSIS_INTERVALS.map(interval => async () => frame(await this.latestClosedCandles(symbol, interval, at, signal), interval));
     tasks.push(() => this.quote(symbol, signal));
     tasks.push(async () => {
       try { return await this.openInterest(symbol, at, signal); }
