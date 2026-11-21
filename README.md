@@ -236,7 +236,7 @@ CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` �
 | `private/market-signal-scanner/v1/BTCUSDT/auto-analysis/` | 去重、每日调用配额和扫描跟进状态，使用现有扫描桶，需 `oss:GetObject` 与 `oss:PutObject`。配额、去重对象至少保留至相关扫描时段结束，启用期间勿重置正在使用的对象。 |
 | `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | 复用网站私有分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。根目录默认 `/private`，若网站使用其他根目录，在本函数配置相同的 `PRIVATE_RESOURCE_ROOT`。 |
 
-归档默认使用扫描桶。如果网站内容桶与扫描桶分开，在本函数配置网站的 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`，由现有 `ACCESS_KEY_ID` 和 `ACCESS_KEY_SECRET` 写入授权前缀。跨地域归档使用公网端点。触发器、历史读取权限和复盘函数沿用现有设置。
+归档默认使用扫描桶。如果网站内容桶与扫描桶分开，在本函数配置网站的 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`，让自动分析进入网站分析历史和复盘队列。跨地域归档使用公网端点。从自动扫描表打开详情时，如果网站的归档读取失败，浏览器通过既有所有者凭证在 `/scans` 读取已关联的自动分析原件。该读取需要现有扫描凭证具有归档 `records/` 前缀的 `oss:GetObject` 权限。
 
 在交易日志的扫描表查看自动分析状态和研究详情，归档结果也会出现在分析历史。日志事件 `market_auto_analysis_completed` 记录模型和 Token 用量，`market_auto_analysis_failed` 记录失败阶段、请求编号、异常来源和已有的百炼诊断信息。归档失败时，可用扫描请求编号定位诊断，无需重调模型。
 

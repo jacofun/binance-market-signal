@@ -7,7 +7,7 @@ export interface OrderStore {
   assertAtomicWrites(): Promise<void>;
   create(path: string, value: unknown): Promise<boolean>;
   write(path: string, value: unknown): Promise<void>;
-  read(path: string): Promise<unknown>;
+  read(path: string, limit?: number): Promise<unknown>;
   removeLock(path: string): Promise<void>;
 }
 
@@ -106,14 +106,14 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
       }
       return boundedJsonLines(response, limit, storageCode);
     },
-    async read(path) {
+    async read(path, limit = 8192) {
       const response = await request("GET", path);
       if (!response.ok) {
         await response.body?.cancel().catch(() => {});
         if (response.status === 404 && response.headers.get("x-oss-request-id")) return null;
         throw unavailable(response);
       }
-      return boundedJson(response, 8192, storageCode);
+      return boundedJson(response, limit, storageCode);
     },
     async removeLock(path) {
       const response = await request("DELETE", path);

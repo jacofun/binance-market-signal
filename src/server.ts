@@ -14,7 +14,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeMarketScanner, validateScanTimer, SCANNER_TRIGGER } from "./market-scanner.js";
-import { runAutoAnalysis } from "./auto-analysis.js";
+import { analysisIdPattern, readAutoAnalysisArchive, runAutoAnalysis } from "./auto-analysis.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -64,7 +64,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
     let isOrder = false;
-    let scanAction: "list" | "run" | undefined;
+    let scanAction: "list" | "run" | "analysis" | undefined;
+    let archiveId: string | undefined;
     let orderAction: string | undefined;
     let acquired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -154,9 +155,22 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         send(200, { requestId, ...result });
         return;
       }
-      const { sub } = gatewayClaims(token, Math.floor(now() / 1000));
+      const claims = gatewayClaims(token, Math.floor(now() / 1000));
+      const { sub } = claims;
       const input = await body(req);
       if (scanAction === "list") {
+        if (input.action === "analysis") {
+          scanAction = "analysis";
+          if (claims.scope !== "trading:sync") throw new AppError("UNAUTHORIZED", "请通过站点所有者会话获取分析归档凭证。", 401);
+          const { analysisId, scanId } = input;
+          if (Object.keys(input).length !== 3 || typeof analysisId !== "string" || !analysisIdPattern.test(analysisId) ||
+            typeof scanId !== "string" || !analysisIdPattern.test(scanId)) {
+            throw new AppError("INVALID_REQUEST", "分析编号或扫描编号无效。", 400);
+          }
+          archiveId = analysisId;
+          const result = await readAutoAnalysisArchive(env, now, scannerFetch, scanId, analysisId);
+          send(200, { requestId, result }); return;
+        }
         const result = await makeMarketScanner(env, now, scannerFetch).list(input);
         send(200, { requestId, ...result }); return;
       }
@@ -206,7 +220,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const original = error instanceof AppError ? error : undefined;
       if (scanAction) {
         logger.error(JSON.stringify({ event: "market_scan_request_failed", requestId, action: scanAction, code: safe.code,
-          httpStatus: safe.status, elapsedMs: now() - startedAt, configurationField: original?.configurationField,
+          analysisId: archiveId, httpStatus: safe.status, elapsedMs: now() - startedAt, configurationField: original?.configurationField,
           ...original?.upstream, exception: exceptionChain(error) }));
         return;
       }

@@ -124,8 +124,11 @@ export function validateScanTimer(input: Record<string, unknown>, now: number) {
 const asObject = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
+export const makeScanStore = (env: Env, now: () => number, request: typeof fetch) =>
+  makeOrderStore({ ...loadOssConfig(env, "SCAN"), prefix: "private/market-signal-scanner/v1" }, now, request, "SCAN");
+
 export function makeMarketScanner(env: Env, now: () => number, request: typeof fetch = fetch, base?: string) {
-  const store = makeOrderStore({ ...loadOssConfig(env, "SCAN"), prefix: "private/market-signal-scanner/v1" }, now, request, "SCAN");
+  const store = makeScanStore(env, now, request);
   async function listLegacy(input: Record<string, unknown>) {
     const latest = slotFor(now());
     const oldest = latest - historyDays * 24 * hour;

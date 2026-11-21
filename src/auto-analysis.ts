@@ -1,7 +1,7 @@
 import { analyze, type AnalysisStage } from "./analysis.js";
 import { loadConfig, type Config, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
-import { autoOutcomePath, type AutoAnalysisOutcome, type AutoOrderOutcome, type ScanEvidence } from "./market-scanner.js";
+import { autoOutcomePath, makeScanStore, type AutoAnalysisOutcome, type AutoOrderOutcome, type ScanEvidence } from "./market-scanner.js";
 import { analyzeWithModel, AUTO_ORDER_PROMPT_VERSION, AUTO_SCAN_PROMPT_VERSION } from "./model.js";
 import { loadOrderConfig, makeOrderPermit } from "./order-auth.js";
 import { makeOrderExchange } from "./order-binance.js";
@@ -14,6 +14,7 @@ import { claimBlock, episodeMs, minuteMs, ordinaryAnalysisLimit, type AnalysisCl
 const limitField = "SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT";
 const hourMs = 3_600_000;
 const maxHistoryTime = 9_999_999_999_999;
+export const analysisIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const limitError = () => new AppError("AUTO_ANALYSIS_CONFIGURATION", `${limitField} 必须为非负整数。`, 503,
   undefined, undefined, { configurationField: limitField });
 const beijingDay = (time: number) => new Date(time + 8 * hourMs).toISOString().slice(0, 10);
@@ -85,6 +86,22 @@ function historyStore(env: Env, now: () => number, request: typeof fetch) {
   }
   const settings = bucket ? { ...env, OSS_BUCKET: bucket, OSS_REGION: region, OSS_NETWORK: "public" } : env;
   return makeOrderStore({ ...loadOssConfig(settings, "SCAN"), prefix: `${root.slice(1)}/.trading/owner/market-signals` }, now, request, "SCAN");
+}
+
+export async function readAutoAnalysisArchive(env: Env, now: () => number, request: typeof fetch,
+  scanId: string, analysisId: string) {
+  const missing = () => new AppError("SIGNAL_NOT_FOUND", "未找到与这次扫描匹配的分析归档。", 404);
+  const outcome = await makeScanStore(env, now, request).read(autoOutcomePath(scanId)) as
+    { status?: unknown; analysisId?: unknown } | null;
+  if (outcome?.status !== "completed" || outcome.analysisId !== analysisId) throw missing();
+  const saved = await historyStore(env, now, request).read(`records/${analysisId}.json`, 512 * 1024) as
+    (Record<string, unknown> & { orderPermit?: unknown }) | null;
+  if (!saved) throw missing();
+  if (saved.schemaVersion !== 4 || saved.analysisId !== analysisId || saved.requestId !== scanId) {
+    throw new AppError("SIGNAL_ARCHIVE_INVALID", "分析归档与扫描记录不一致。", 502);
+  }
+  const { orderPermit: _permit, ...result } = saved;
+  return result;
 }
 
 async function archiveResult(store: Store, result: Awaited<ReturnType<typeof analyze>> & { requestId: string; scanEvidence: ScanEvidence }) {

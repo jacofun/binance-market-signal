@@ -180,6 +180,13 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     invoke: () => post("/invoke", { triggerName: "binance-market-scanner", triggerTime: new Date(state.now).toISOString() },
       { "x-fc-control-path": "/invoke", "x-fc-request-id": "test-trigger" }),
     list: () => post("/scans", { version: 2 }, { "X-JWT-Token": jwt() }),
+    readArchive: (input, scope = "trading:sync") => {
+      const iat = Math.floor(state.now / 1000);
+      return fetch(`http://127.0.0.1:${runtime.address().port}/scans`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(scope ? { "X-JWT-Token": jwt({ iat, exp: iat + 120, scope }) } : {}) },
+        body: JSON.stringify({ action: "analysis", ...input }),
+      });
+    },
     recover: () => post("/invoke", { triggerName: "market-order-protection", triggerTime: new Date(state.now).toISOString() },
       { "x-fc-control-path": "/invoke", "x-fc-request-id": "test-trigger" }),
     lookup: analysisId => post("/orders", { action: "status", analysisId },
@@ -423,6 +430,34 @@ test("ordinary alerts leave a slot for a later severe move", async t => {
   app.state.now += 30 * 60000;
   assert.equal((await app.invoke()).autoAnalysis.status, "daily_limit");
   assert.equal(app.requests.length, 2);
+});
+
+test("the owner reads a linked automatic archive with full candles and without credentials or a second model call", async t => {
+  const app = await testServer(t, "3", { now: NOW + 185000, movementPct: -1.3 });
+  const scan = await app.invoke();
+  const analysisId = scan.autoAnalysis.analysisId;
+  const scanId = scan.requestId;
+  const input = { analysisId, scanId };
+  const key = `${archive}/records/${analysisId}.json`;
+  const saved = JSON.parse(app.objects.get(key));
+  app.objects.set(key, JSON.stringify({ ...saved, orderPermit: "private-permit" }));
+  assert.ok(Buffer.byteLength(app.objects.get(key)) > 8192);
+
+  assert.equal((await app.readArchive(input, null)).status, 401);
+  assert.equal((await app.readArchive(input, "trading:orders:read")).status, 401);
+  assert.equal((await app.readArchive({ ...input, scanId: "../../private" })).status, 400);
+  assert.equal((await app.readArchive({ ...input, analysisId: upstreamId })).status, 404);
+  const response = await app.readArchive(input);
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).result, saved);
+  app.objects.set(key, JSON.stringify({ ...saved, requestId: upstreamId }));
+  const mismatch = await app.readArchive(input);
+  assert.equal(mismatch.status, 502);
+  assert.equal((await mismatch.json()).error.code, "SIGNAL_ARCHIVE_INVALID");
+  app.objects.delete(key);
+  assert.equal((await app.readArchive(input)).status, 404);
+  assert.equal(app.requests.length, 1);
+  assert.deepEqual(app.submissions, []);
 });
 
 test("a low-volume crossing triggers research but fails the order gate", async t => {
