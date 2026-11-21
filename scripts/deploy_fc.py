@@ -40,6 +40,8 @@ def target_from_yaml(path):
             raise ValueError()
         if props["timeout"] != 120 or props["cpu"] != 0.35 or props["memorySize"] != 512 or props["diskSize"] != 10240:
             raise ValueError()
+        if not re.fullmatch(r"(?:[0-9]|[1-5][0-9]) \* \* \* \* \*", props["scannerCron"]):
+            raise ValueError()
         return props
     except (KeyError, TypeError, ValueError, AttributeError):
         raise DeployError("s.yaml deployment target is invalid.") from None
@@ -224,14 +226,46 @@ def main():
     package = load_zip(root / target["code"])
     print(f"Deploying {target['functionName']} in {target['region']}; preserving environment variables, role, layers and resources.")
     result = deploy(client, target, package)
+    result["scannerSchedule"] = update_scanner_schedule(client, target)
     (root / "dist/deploy-result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"scanner_schedule={result['scannerSchedule']}\n")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
             output.write("## FC deployment verified\n\n")
             for key, value in result.items():
                 output.write(f"- {key}: `{value}`\n")
     return 0
+
+
+def update_scanner_schedule(client, target):
+    """Change only the existing scanner timer's cadence after code verification."""
+    name = target["functionName"]
+    trigger = "binance-market-scanner"
+    cron = target["scannerCron"]
+    try:
+        current = client.get_trigger(name, trigger).body
+        if current.trigger_type != "timer":
+            return "unexpected_trigger_type"
+        config = json.loads(current.trigger_config)
+        if not isinstance(config, dict) or "cronExpression" not in config:
+            return "unrecognized_trigger_config"
+        if config["cronExpression"] != cron:
+            config["cronExpression"] = cron
+            client.update_trigger(name, trigger, models.UpdateTriggerRequest(
+                body=models.UpdateTriggerInput(trigger_config=json.dumps(config))))
+            deployed = json.loads(client.get_trigger(name, trigger).body.trigger_config)
+            if deployed != config:
+                return "readback_mismatch"
+        return "verified" if config.get("enable") is True else "trigger_disabled"
+    except Exception as error:
+        # A project that previously deployed code only may lack trigger permissions.
+        code = getattr(error, "code", "")
+        code = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", code) else type(error).__name__
+        print(f"::warning title=Scanner schedule::Could not verify the one-minute timer ({code}).")
+        return f"unverified_{code}"
 
 
 if __name__ == "__main__":

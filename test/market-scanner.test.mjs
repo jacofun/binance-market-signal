@@ -145,7 +145,7 @@ test("every invocation scans the latest closed candle and produces a separate ro
   assert.notEqual(rowsAt(app)[0].id, rowsAt(app)[1].id);
   assert.equal(app.modelCalls(), 0);
   const market = app.calls.filter(call => call.host === "fapi.binance.com");
-  assert.equal(market.length, 8);
+  assert.equal(market.length, 10);
   assert.deepEqual(market.filter(call => call.params.get("interval") === "15m").map(call => call.params.get("endTime")),
     [String(NOW), String(NOW)]);
   assert.ok(market.filter(call => ["1h", "4h"].includes(call.params.get("interval"))).every(call =>

@@ -1,5 +1,5 @@
-# CI preserves environment variables, role, layers, CPU, memory, disk and triggers.
-# Only code, the startup command and timeout are managed here.
+# CI preserves environment variables, role, layers and resources. Only the
+# scanner timer cadence is managed separately after code verification.
 edition: 3.0.0
 name: binance-market-signal
 access: default
@@ -19,3 +19,4 @@ resources:
         args: []
         port: 9000
       code: ./dist/binance-market-signal.zip
+      scannerCron: "5 * * * * *"

@@ -7,7 +7,7 @@ import type { Config } from "./config.js";
 import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
 export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v8";
-export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan`;
+export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan-movement-v2`;
 export const AUTO_ORDER_PROMPT_VERSION = `${AUTO_SCAN_PROMPT_VERSION}-immediate-v1`;
 
 const text = { type: "string", minLength: 1, maxLength: 600 };
@@ -316,7 +316,7 @@ candidate 表示现有证据和风险收益已支持尝试，不要求形态完�
 stopZoneId 引用有效结构作为止损参考，做多引用支撑、做空引用阻力。综合量价、局部失效位和 1h ATR 自主决定 stopLoss，区域边缘和 ATR 是研究参考。做空可以在阻力区内或其下方设置更近的止损，前提是止损严格高于 entry.max；做多止损严格低于 entry.min。解释为什么这个价位代表失效，以及较近止损被正常波动触发的风险。目标区做多选阻力，做空选支撑。按 effectiveKind 识别有效支阻，broken 区域不可用。
 目标按价格路径由近至远，合并查看全部周期。做空从 entry.min 向下，按有效支撑区的上沿由高到低考虑。做多从 entry.max 向上，按有效阻力区的下沿由低到高考虑。每个远端目标之前，若有整个区域位于入场边界和该目标之间、与引用目标区不重叠且 importantObstacle 为 true 的区域，目标列表必须先有一个价位落在该近端区域。即使近端是 15m、远端是 1h 或 4h，也按同一规则。无法先给出有依据的近端目标时，返回无计划的 watch 或 none。结合目标距离、历史波幅和反对证据说明依据，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
-${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测，包含每条规则的命中状态、方向、区域和逐项检查。逐项核对关键证据，明确写出接受、否定或需要确认的理由。扫描方向和 style 是研究线索，由你根据完整行情决定是否采纳。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
+${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测。trigger 说明启动原因，movement 给出 1m 已收盘数据计算的 5m/15m 涨跌幅、基线和相邻同长度区间成交量比。rules 是可用的 15m 结构事件及检查，盘中两次结构扫描之间可为空。异动方向用于提示关注，结合完整快照判断延续、回收或观望。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
 ` : ""}按此 JSON Schema 输出：${JSON.stringify(schema)}`;
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);

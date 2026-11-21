@@ -14,7 +14,7 @@ const upstreamId = "f33b92e5-7ade-471a-b3c4-d638b5e1b542";
 const demoHost = "demo-fapi.binance.com";
 
 function scannerCandles(frame, at) {
-  const rows = klines(INTERVAL_MS[frame], at);
+  const rows = klines(INTERVAL_MS[frame], at, frame === "1m" ? 212 : 201);
   if (frame === "1h") {
     rows[170][2] = "12000";
     rows[180][2] = "10200";
@@ -22,7 +22,7 @@ function scannerCandles(frame, at) {
     rows[199][2] = "10300";
     rows[199][4] = "10280";
     rows[199][5] = "30";
-  } else {
+  } else if (frame === "4h") {
     rows.forEach((row, i) => {
       const close = 9700 + 2 * i;
       [row[1], row[2], row[3], row[4]] = [close, close + 4, close - 4, close].map(String);
@@ -76,7 +76,17 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     if (!url.pathname.endsWith("/klines")) return marketFetch(input);
     const timeframe = url.searchParams.get("interval");
     const candles = scannerCandles(timeframe, Number(url.searchParams.get("endTime")));
-    if (timeframe === "15m" && ++reads15m === 2 && state.delayAnalysisClose) return Response.json(candles.slice(0, -2));
+    if (timeframe === "1m" && state.movementPct) {
+      const close = 10010 * (1 + state.movementPct / 100);
+      const latestClosed = candles.at(-2);
+      latestClosed[4] = String(close);
+      latestClosed[2] = String(Math.max(10100, close));
+      latestClosed[3] = String(Math.min(9900, close));
+    }
+    if (timeframe === "15m") {
+      if (state.lowVolumeBreakout) candles[199][5] = "10";
+      if (++reads15m === 2 && state.delayAnalysisClose) return Response.json(candles.slice(0, -2));
+    }
     return Response.json(candles);
   };
   const orderFetch = async (input, options) => {
@@ -311,7 +321,7 @@ test("qualified timer sends the actual checks once and archives the independent 
   assert.equal(completed.modelStatus, "none");
   assert.deepEqual(completed.decisionReasons, ["model_none"]);
   assert.equal(completed.modelSummary, undefined);
-  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v8-auto-scan");
+  assert.equal(saved.model.promptVersion, "market-research-v4-volume-timing-v8-auto-scan-movement-v2");
   assert.equal(saved.orderPermit, undefined);
   assert.deepEqual(saved.scanEvidence, scanEvidence);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));
@@ -325,22 +335,25 @@ test("qualified timer sends the actual checks once and archives the independent 
 });
 
 test("quota is atomic across invocations and resets at the Beijing day boundary", async t => {
-  let bytes = 0;
-  const mockStore = { appendJsonLineAt: async (_key, token, position) => {
-    assert.equal(token, 1);
-    if (position !== bytes) return bytes;
-    bytes += 2;
+  let body = "1\n";
+  const mockStore = { readJsonLines: async () => body.trim().split("\n").map(JSON.parse), appendJsonLineAt: async (_key, row, position) => {
+    if (position !== Buffer.byteLength(body)) return Buffer.byteLength(body);
+    body += JSON.stringify(row) + "\n";
     return null;
   } };
-  const concurrent = await Promise.all(Array.from({ length: 7 }, () => reserveAutoAnalysisQuota(mockStore, "2026-11-18", 3)));
-  assert.equal(concurrent.filter(Boolean).length, 3);
+  const claim = { eventAt: NOW, direction: "short", severe: true };
+  const concurrent = await Promise.all(Array.from({ length: 7 }, () => reserveAutoAnalysisQuota(mockStore, NOW, 3, claim)));
+  assert.equal(concurrent.filter(x => x === "reserved").length, 1);
+  assert.equal(concurrent.filter(x => x === "duplicate").length, 6);
   const app = await testServer(t, "1", { now: Date.UTC(2026, 10, 18, 15, 45) + 1000 });
   assert.equal((await app.invoke()).autoAnalysis.status, "completed");
   app.state.now += period;
+  assert.equal((await app.invoke()).autoAnalysis.status, "episode");
+  app.state.now += period;
   assert.equal((await app.invoke()).autoAnalysis.status, "completed");
   assert.equal(app.requests.length, 2);
-  assert.equal(app.objects.get(`${storage}/quota/2026-11-18.ndjson`), "1\n");
-  assert.equal(app.objects.get(`${storage}/quota/2026-11-19.ndjson`), "1\n");
+  assert.equal(app.objects.get(`${storage}/quota/2026-11-18.ndjson`).trim().split("\n").length, 1);
+  assert.equal(app.objects.get(`${storage}/quota/2026-11-19.ndjson`).trim().split("\n").length, 1);
 });
 
 test("separate FC instances cannot call twice for the same candle or exceed the shared daily quota", async t => {
@@ -355,7 +368,7 @@ test("separate FC instances cannot call twice for the same candle or exceed the 
 });
 
 test("preflight failures do not spend a model call; sent timeouts and invalid outputs do and are not retried", async t => {
-  const app = await testServer(t, "2");
+  const app = await testServer(t, "3");
   app.state.invalidMarket = true;
   assert.equal((await app.invoke()).autoAnalysis.stage, "market_snapshot");
   app.state.invalidMarket = false;
@@ -365,14 +378,76 @@ test("preflight failures do not spend a model call; sent timeouts and invalid ou
   app.state.modelTimeout = true;
   assert.equal((await app.invoke()).autoAnalysis.errorCode, "MODEL_TIMEOUT");
   assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
-  app.state.now += period;
+  app.state.now += 2 * period;
   app.state.modelTimeout = false;
   app.state.invalidModel = true;
   assert.equal((await app.invoke()).autoAnalysis.errorCode, "INVALID_MODEL_OUTPUT");
   assert.ok(app.logs.some(log => log.event === "market_auto_analysis_failed" && log.upstreamRequestId === upstreamId && log.inputTokens === 123));
   app.state.now += period;
+  assert.equal((await app.invoke()).autoAnalysis.status, "reserved_quota");
+  assert.equal(app.requests.length, 2);
+});
+
+test("minute movement alone wakes Kimi, deduplicates an episode and leaves trading disabled for it", async t => {
+  const app = await testServer(t, "3", { now: NOW + 185000, movementPct: -0.8, autoOrder: true, execution: true, proposal: proposal() });
+  const first = await app.invoke();
+  assert.equal(first.candleClosedAt, null);
+  assert.equal(first.trigger.kind, "movement");
+  assert.equal(first.trigger.direction, "short");
+  assert.equal(first.trigger.severe, false, JSON.stringify(first));
+  assert.equal(first.autoAnalysis.order.code, "AUTO_ORDER_RESEARCH_ONLY");
+  assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
+  app.state.now += 60000;
+  assert.equal((await app.invoke()).autoAnalysis.status, "episode");
+  app.state.movementPct = -1.3;
+  const escalation = await app.invoke();
+  assert.equal(escalation.trigger.severe, true);
+  assert.equal(escalation.autoAnalysis.status, "completed", JSON.stringify({ escalation, logs: app.logs }));
+  assert.equal(app.requests.length, 2);
+  const request = JSON.parse(app.requests[1].messages[1].content);
+  assert.equal(request.scanEvidence.trigger.severe, true);
+  assert.deepEqual(request.scanEvidence.rules, []);
+  assert.equal(app.submissions.length, 0);
+  assert.doesNotMatch(app.requests[1].messages[0].content, /本次候选会进入即时下单复核/);
+});
+
+test("ordinary alerts leave a slot for a later severe move", async t => {
+  const app = await testServer(t, "2", { now: NOW + 185000, movementPct: -0.8 });
+  const first = await app.invoke();
+  assert.equal(first.trigger.severe, false, JSON.stringify(first));
+  assert.equal(first.autoAnalysis.status, "completed");
+  app.state.now += 30 * 60000;
+  assert.equal((await app.invoke()).autoAnalysis.status, "reserved_quota");
+  app.state.movementPct = -1.3;
+  assert.equal((await app.invoke()).autoAnalysis.status, "completed");
+  app.state.now += 30 * 60000;
   assert.equal((await app.invoke()).autoAnalysis.status, "daily_limit");
   assert.equal(app.requests.length, 2);
+});
+
+test("a low-volume crossing triggers research but fails the order gate", async t => {
+  const app = await testServer(t, "3", { now: NOW + 5000, lowVolumeBreakout: true,
+    autoOrder: true, execution: true, proposal: proposal() });
+  const scan = await app.invoke();
+  assert.equal(scan.trigger.kind, "structure");
+  assert.equal(scan.autoAnalysis.order.code, "AUTO_ORDER_SCAN_DIRECTION_MISMATCH");
+  assert.equal(app.requests.length, 1);
+  const { scanEvidence } = JSON.parse(app.requests[0].messages[1].content);
+  assert.equal(scanEvidence.rules[0].status, "filtered");
+  assert.equal(app.submissions.length, 0);
+});
+
+test("a simultaneous movement and qualified breakout dispatch one research-only analysis", async t => {
+  const app = await testServer(t, "3", { now: NOW + 5000, movementPct: 1.3,
+    autoOrder: true, execution: true, proposal: proposal() });
+  const scan = await app.invoke();
+  assert.equal(scan.trigger.kind, "movement");
+  assert.equal(scan.autoAnalysis.order.code, "AUTO_ORDER_RESEARCH_ONLY");
+  assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
+  assert.equal(app.requests.length, 1);
+  const { scanEvidence } = JSON.parse(app.requests[0].messages[1].content);
+  assert.equal(scanEvidence.rules[0].status, "passed");
+  assert.equal(app.submissions.length, 0);
 });
 
 test("quota storage errors fail closed and archive errors retain the recorded scan without causing another call", async t => {

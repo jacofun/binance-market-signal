@@ -61,7 +61,16 @@ jobs:
           fi
       - name: Deploy and verify code, runtime and health
         if: github.event_name != 'pull_request' && steps.current.outputs.deploy == 'true'
+        id: deploy
         env:
           ALIYUN_FC_ACCESS_KEY_ID: ${{ secrets.ALIYUN_FC_ACCESS_KEY_ID }}
           ALIYUN_FC_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_FC_ACCESS_KEY_SECRET }}
         run: python scripts/deploy_fc.py
+      - name: Confirm scanner runs every minute
+        if: steps.deploy.outputs.scanner_schedule == 'verified'
+        run: echo 'The enabled scanner timer was verified against FC.'
+      - name: Report scanner timer warning
+        if: steps.deploy.outputs.scanner_schedule != '' && steps.deploy.outputs.scanner_schedule != 'verified'
+        env:
+          SCANNER_SCHEDULE: ${{ steps.deploy.outputs.scanner_schedule }}
+        run: echo "::warning title=Scanner timer::One-minute scan schedule not verified ($SCANNER_SCHEDULE)."

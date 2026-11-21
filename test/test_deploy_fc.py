@@ -113,7 +113,7 @@ class DeployTests(unittest.TestCase):
         workflow = yaml.load((ROOT / ".github/workflows/deploy-fc.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(workflow["on"]["push"]["branches"], ["main"])
         self.assertEqual(workflow["concurrency"]["cancel-in-progress"], "false")
-        step = workflow["jobs"]["deploy"]["steps"][-1]
+        step = next(step for step in workflow["jobs"]["deploy"]["steps"] if step.get("id") == "deploy")
         self.assertEqual(set(step["env"]), {"ALIYUN_FC_ACCESS_KEY_ID", "ALIYUN_FC_ACCESS_KEY_SECRET"})
         self.assertIn("steps.current.outputs.deploy", step["if"])
 
@@ -122,6 +122,32 @@ class DeployTests(unittest.TestCase):
         with patch.object(client, "list_triggers", side_effect=AssertionError("Read trigger policy"), create=True), \
              patch.object(client, "list_custom_domains", side_effect=AssertionError("Read domain policy"), create=True):
             self.assertEqual(module.deploy(client, self.target, b"zip", sleep=lambda _: None)["health"], "ok")
+
+    def test_scanner_timer_preserves_message_and_enabled_state(self):
+        for enabled in (True, False):
+            old = {"cronExpression": "5 */15 * * * *", "payload": "", "enable": enabled}
+            updated = {**old, "cronExpression": "5 * * * * *"}
+            before, after = [
+                SimpleNamespace(body=SimpleNamespace(trigger_type="timer", trigger_config=json.dumps(config)))
+                for config in (old, updated)
+            ]
+            client = SimpleNamespace()
+            with patch.object(client, "get_trigger", side_effect=[before, after], create=True) as get, \
+                 patch.object(client, "update_trigger", create=True) as update:
+                status = module.update_scanner_schedule(client, self.target)
+                self.assertEqual(status, "verified" if enabled else "trigger_disabled")
+                self.assertEqual(get.call_count, 2)
+                update.assert_called_once()
+                name, trigger, request = update.call_args.args
+                self.assertEqual((name, trigger), ("binance-market-signal", "binance-market-scanner"))
+                self.assertEqual(request.body.to_map(), {"triggerConfig": json.dumps(updated)})
+
+    def test_scanner_timer_read_denial_is_reported_without_writing(self):
+        client = SimpleNamespace()
+        with patch.object(client, "get_trigger", side_effect=PermissionError, create=True), \
+             patch.object(client, "update_trigger", create=True) as update:
+            self.assertEqual(module.update_scanner_schedule(client, self.target), "unverified_PermissionError")
+            update.assert_not_called()
 
 
 if __name__ == "__main__":

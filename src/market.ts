@@ -7,14 +7,16 @@ import type { Config } from "./config.js";
 import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot } from "./types.js";
 
 export const ANALYSIS_INTERVALS = ["4h", "1h", "15m"] as const satisfies readonly Interval[];
-export const INTERVAL_MS: Record<Interval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000 };
+type CandleInterval = Interval | "1m";
+export const INTERVAL_MS: Record<CandleInterval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000, "1m": 60000 };
 export const CANDLE_LIMIT = 200;
+const candleLimit = (interval: CandleInterval) => interval === "1m" ? 211 : CANDLE_LIMIT;
 const candlePublicationGraceMs = 1000;
 const candleRetryDelaysMs = [0, 400, 1000, 2000];
-export const closedCandleBoundary = (at: number, interval: Interval) => Math.floor(at / INTERVAL_MS[interval]) * INTERVAL_MS[interval];
+export const closedCandleBoundary = (at: number, interval: CandleInterval) => Math.floor(at / INTERVAL_MS[interval]) * INTERVAL_MS[interval];
 export const candleRow = (c: Candle) => [c.openTime, c.open, c.high, c.low, c.close, c.volume, c.takerBuyVolume];
 const badData = () => new AppError("INVALID_MARKET_DATA", "行情缺失、时间不连续或字段无效，本次不生成交易机会。", 502);
-const candleNotReady = (interval: Interval) => new AppError("MARKET_CANDLE_NOT_READY",
+const candleNotReady = (interval: CandleInterval) => new AppError("MARKET_CANDLE_NOT_READY",
   `最新 ${interval} K 线的收盘数据尚未发布，请稍后重试。`, 503, undefined, undefined, { marketEndpoint: "/fapi/v1/klines" });
 export function numeric(value: unknown, positive = false): number {
   if (typeof value !== "number" && (typeof value !== "string" || !/^-?\d+(\.\d+)?$/.test(value))) throw badData();
@@ -26,7 +28,7 @@ function timestamp(value: unknown): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) throw badData();
   return Number(value);
 }
-export function parseCandles(raw: unknown, interval: Interval, serverTime: number, allowOneMissingClose = false): Candle[] {
+export function parseCandles(raw: unknown, interval: CandleInterval, serverTime: number, allowOneMissingClose = false): Candle[] {
   if (!Array.isArray(raw) || raw.length > 300) throw badData();
   const period = INTERVAL_MS[interval];
   const rows = raw.map((row: unknown) => {
@@ -42,7 +44,7 @@ export function parseCandles(raw: unknown, interval: Interval, serverTime: numbe
   const expectedClose = closedCandleBoundary(serverTime, interval) - 1;
   if (rows.length < 60 || rows.some((c, i) => i > 0 && c.openTime !== rows[i - 1]!.openTime + period) ||
     rows.at(-1)!.closeTime < expectedClose - (allowOneMissingClose ? period : 0)) throw badData();
-  return rows.slice(-CANDLE_LIMIT);
+  return rows.slice(-candleLimit(interval));
 }
 
 function priceLevels(candles: Candle[]): Frame["priceLevels"] {
@@ -123,7 +125,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
     if (Math.abs(this.offset) > 30000) throw new AppError("CLOCK_SKEW", "函数与币安服务器时间偏差过大。", 503);
     return time;
   }
-  async waitForClose(serverTime: number, expectedClose: number, signal: AbortSignal): Promise<number> {
+  async waitForClose(serverTime: number, expectedClose: number, signal: AbortSignal, interval: CandleInterval = "15m"): Promise<number> {
     const settleIn = expectedClose + candlePublicationGraceMs - serverTime;
     if (settleIn > 0) await delay(settleIn, undefined, { signal });
     if (serverTime >= expectedClose) return serverTime;
@@ -132,7 +134,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
       const current = await this.serverTime(signal);
       if (current >= expectedClose) return current;
     }
-    throw candleNotReady("15m");
+    throw candleNotReady(interval);
   }
   async quote(symbol: string, signal: AbortSignal): Promise<Quote> {
     const raw = await this.get("/fapi/v1/premiumIndex", { symbol }, signal) as Record<string, unknown>;
@@ -143,10 +145,10 @@ export class RestMarketDataProvider implements MarketDataProvider {
     if (age < -2000 || age > this.config.maxPriceAgeMs) throw new AppError("STALE_MARKET_DATA", "最新标记价格已过期，本次不生成有效机会。", 503);
     return q;
   }
-  async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
-    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(CANDLE_LIMIT + 1), endTime: String(at) }, signal), interval, at, allowOneMissingClose);
+  async candles(symbol: string, interval: CandleInterval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
+    return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(candleLimit(interval) + 1), endTime: String(at) }, signal), interval, at, allowOneMissingClose);
   }
-  async latestClosedCandles(symbol: string, interval: Interval, at: number, signal: AbortSignal): Promise<Candle[]> {
+  async latestClosedCandles(symbol: string, interval: CandleInterval, at: number, signal: AbortSignal): Promise<Candle[]> {
     const boundary = closedCandleBoundary(at, interval);
     for (const wait of candleRetryDelaysMs) {
       if (wait) await delay(wait, undefined, { signal });

@@ -7,6 +7,7 @@ import { loadOssConfig } from "./oss-config.js";
 import { effectiveKind } from "./price-zones.js";
 import { SOURCE_COMMIT } from "./version.js";
 import type { Candle, Frame, PriceZone } from "./types.js";
+import { minuteMs, scanMovement, type AnalysisClaim, type Movement } from "./movement.js";
 
 export const SCANNER_TRIGGER = "binance-market-scanner";
 const symbol = "BTCUSDT";
@@ -15,7 +16,7 @@ const pageSize = 16;
 const hour = INTERVAL_MS["1h"];
 const pageWindow = 4 * hour;
 const historyDays = 30;
-const rulesVersion = "v1";
+const rulesVersion = "v2";
 const minimumRvol = 1.5;
 const maximumDistanceAtr = 1;
 const minimumRoomAtr = 1;
@@ -25,15 +26,17 @@ type Decision = "passed" | "watch" | "filtered" | "none";
 type Check = { code: string; passed: boolean | null; value: number | string | null; expected: number | string | null };
 type Rule = { kind: "breakout" | "reclaim"; status: Decision; direction: Direction | null; zone: Pick<PriceZone, "id" | "lower" | "upper"> | null; checks: Check[] };
 export interface ScanEvidence {
-  scanId: string; symbol: typeof symbol; scannedAt: number; candleClosedAt: number; rulesVersion: typeof rulesVersion;
-  close: number; rvol20: number | null; trend4h: Frame["trend"]; rules: Rule[];
+  scanId: string; symbol: typeof symbol; scannedAt: number; candleClosedAt: number | null; rulesVersion: typeof rulesVersion;
+  close: number; rvol20: number | null; trend4h: Frame["trend"] | null; rules: Rule[];
+  movement?: Movement;
+  trigger: AnalysisClaim & { kind: "movement" | "structure" };
 }
 export type AutoOrderOutcome =
   { status: "skipped" | "failed"; code: string } |
   { status: "accepted" | "rejected" | "unknown"; clientId: string; protection: string;
     exchangeStatus?: string; executedQty?: string; exchangeCode?: number; code?: string };
 export type AutoAnalysisOutcome =
-  { status: "disabled" | "duplicate" | "daily_limit" | "busy" | "stale" } |
+  { status: "disabled" | "duplicate" | "episode" | "reserved_quota" | "daily_limit" | "busy" | "stale" } |
   { status: "failed"; stage: string; errorCode: string } |
   { status: "completed"; analysisId: string; order?: AutoOrderOutcome };
 
@@ -149,23 +152,52 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
       let evidence: ScanEvidence | undefined;
       try {
         const serverTime = await provider.serverTime(signal);
-        expectedCandleClosedAt = slotFor(Math.max(now(), serverTime));
-        await provider.waitForClose(serverTime, expectedCandleClosedAt, signal);
-        const short = frame(await provider.latestClosedCandles(symbol, "15m", expectedCandleClosedAt, signal), "15m");
-        candleClosedAt = short.lastCloseTime + 1;
-        // Keep the higher-timeframe zones fixed at the start of the pattern.
-        const contextAt = candleClosedAt - 2 * interval;
-        const [hourly, background] = await Promise.all([
-          provider.candles(symbol, "1h", contextAt, signal).then(candles => frame(candles, "1h")),
-          provider.candles(symbol, "4h", contextAt, signal).then(candles => frame(candles, "4h")),
+        const minuteClose = closedCandleBoundary(Math.max(now(), serverTime), "1m");
+        expectedCandleClosedAt = slotFor(minuteClose);
+        await provider.waitForClose(serverTime, minuteClose, signal, "1m");
+        let movement: Movement | undefined;
+        let movementError: unknown;
+        let structureError: unknown;
+        let short: Frame | undefined;
+        let trend4h: Frame["trend"] | null = null;
+        let rules: Rule[] = [];
+        await Promise.all([
+          provider.latestClosedCandles(symbol, "1m", minuteClose, signal).then(
+            candles => { movement = scanMovement(candles); }
+          ).catch(error => { movementError = error; }),
+          (async () => {
+            if (minuteClose - expectedCandleClosedAt >= 2 * minuteMs) return;
+            try {
+              const bars = await provider.latestClosedCandles(symbol, "15m", expectedCandleClosedAt, signal);
+              short = frame(bars, "15m");
+              candleClosedAt = short.lastCloseTime + 1;
+              // Zones are evaluated from before the pattern, never from future bars.
+              const contextAt = candleClosedAt - 2 * interval;
+              const [hourly, background] = await Promise.all([
+                provider.candles(symbol, "1h", contextAt, signal).then(candles => frame(candles, "1h")),
+                provider.candles(symbol, "4h", contextAt, signal).then(candles => frame(candles, "4h")),
+              ]);
+              trend4h = background.trend;
+              rules = scanRules(short, hourly, background);
+            } catch (error) { structureError = error; }
+          })(),
         ]);
-        const rules = scanRules(short, hourly, background);
-        const status = rules.some(rule => rule.status === "passed") ? "passed" :
+        const structural = rules.filter(rule => rule.zone !== null &&
+          (rule.kind === "breakout" || rule.checks.some(check => check.code === "next_close" && check.passed === true)));
+        const direction = structural.find(rule => rule.status === "passed")?.direction ?? structural[0]?.direction ?? null;
+        const trigger: ScanEvidence["trigger"] | undefined = movement?.direction ?
+          { kind: "movement", eventAt: movement.closedAt, direction: movement.direction, severe: movement.severity === "severe" } :
+          direction && candleClosedAt !== null ? { kind: "structure", eventAt: candleClosedAt, direction, severe: false } : undefined;
+        if (!trigger && structureError) throw structureError;
+        if (!trigger && !short && movementError) throw movementError;
+        const status = trigger ? "passed" :
           rules.some(rule => rule.status === "watch") ? "watch" : rules.some(rule => rule.status === "filtered") ? "filtered" : "none";
-        const observations = { close: short.close, rvol20: short.volumeRatio20, trend4h: background.trend, rules };
-        record = { ...basis, candleClosedAt, status, ...observations };
-        if (status === "passed") {
-          evidence = { scanId: id, symbol, scannedAt, candleClosedAt, rulesVersion, ...observations };
+        const observations = { close: short?.close ?? movement!.close, rvol20: short?.volumeRatio20 ?? null, trend4h, rules, movement };
+        record = { ...basis, candleClosedAt, status, ...observations, trigger };
+        if (movementError instanceof AppError) record.movementErrorCode = movementError.code;
+        if (structureError instanceof AppError) record.structureErrorCode = structureError.code;
+        if (trigger) {
+          evidence = { scanId: id, symbol, scannedAt, candleClosedAt, rulesVersion, ...observations, trigger };
           record.autoAnalysis = { status: followUp ? "pending" : "disabled" };
         }
       } catch (error) {
@@ -175,7 +207,8 @@ export function makeMarketScanner(env: Env, now: () => number, request: typeof f
       }
       await store.appendJsonLine(logKey(scannedAt), record);
       const autoAnalysis = evidence && followUp ? await followUp(evidence, store) : record.autoAnalysis;
-      return { scannedAt, candleClosedAt, status: record.status, ...(record.errorCode ? { errorCode: record.errorCode, expectedCandleClosedAt } : {}),
+      return { scannedAt, candleClosedAt, status: record.status, trigger: record.trigger,
+        ...(record.errorCode ? { errorCode: record.errorCode, expectedCandleClosedAt } : {}),
         ...(autoAnalysis ? { autoAnalysis } : {}) };
     },
     async list(input: Record<string, unknown>) {

@@ -83,7 +83,7 @@ export class WebSocketMarketDataProvider extends RestMarketDataProvider {
       if (!rows.length || c.openTime > rows.at(-1)!.openTime) this.bars.set(key, [...rows, c].slice(-CANDLE_LIMIT));
     }
   }
-  override async candles(symbol: string, interval: Interval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
+  override async candles(symbol: string, interval: Interval | "1m", at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
     const key = `${symbol}:${interval}`;
     const rows = this.bars.get(key) || [];
     try {
