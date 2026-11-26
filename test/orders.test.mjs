@@ -7,10 +7,10 @@ import { loadOrderConfig } from "../build/order-auth.js";
 import { loadOssConfig } from "../build/oss-config.js";
 import { orderOption } from "../build/order-rules.js";
 import { makeServer } from "../build/server.js";
-import { env, jwt, NOW, provider, modelResult, publicKey } from "./fixtures.mjs";
+import { env, jwt, NOW, provider, m2Snapshot, modelResult, publicKey } from "./fixtures.mjs";
 
 const settings = {
-  ...env, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: "https://demo-fapi.binance.com",
+  ...env, USE_DETERMINISTIC_MODELS: "true", SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: "https://demo-fapi.binance.com",
   BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret",
   ACCESS_KEY_ID: "test-oss-key", ACCESS_KEY_SECRET: "test-oss-secret-123",
   OSS_BUCKET: "orders-bucket", OSS_REGION: "cn-hangzhou",
@@ -128,7 +128,7 @@ async function start(t, override = {}) {
   const logs = [];
   let modelCalls = 0;
   const server = makeServer({ env: { ...settings, ...override }, logger: { info: value => logs.push(value), error: value => logs.push(value) },
-    now: () => mock.state.clock, model: async () => { modelCalls++; return modelResult(); }, provider: provider(), orderFetch: mock.mockFetch });
+    now: () => mock.state.clock, model: async () => { modelCalls++; return modelResult(); }, provider: provider({ snapshot: async () => m2Snapshot() }), orderFetch: mock.mockFetch });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
@@ -178,6 +178,17 @@ test("analysis succeeds with orders disabled, incomplete configuration or a non-
     assert.equal(result.data.status, "candidate");
     assert.deepEqual(app.calls, []);
   }
+});
+
+test("manual LLM comparison returns research without creating an order reference", async t => {
+  const app = await start(t, { USE_DETERMINISTIC_MODELS: "false" });
+  const { http, data } = await app.analyze();
+  assert.equal(http, 200);
+  assert.equal(data.status, "candidate");
+  assert.equal(data.model.name, "qwen-plus");
+  assert.equal(data.orderPermit, undefined);
+  assert.equal(app.modelCalls(), 1);
+  assert.equal(app.objects.size, 0);
 });
 
 test("FC verifies signatures and order routes still require exact claims and scope", async t => {
@@ -240,11 +251,11 @@ test("candidate previews fix both protective levels and issue no executable draf
   assert.equal(preview.quantity, "0.001");
   assert.equal(preview.mode, "demo");
   assert.deepEqual(preview.options.map(o => [o.kind, o.price, o.triggerPrice]), [
-    ["market", "10000.1", undefined], ["limit", "9990", undefined], ["conditional", "10010", "10010"],
+    ["market", "10000.1", undefined], ["limit", "9985", undefined], ["conditional", "10015", "10015"],
   ]);
   for (const option of preview.options) {
-    assert.equal(option.stopLossPrice, "9900");
-    assert.equal(option.takeProfitPrice, "10200");
+    assert.equal(option.stopLossPrice, "9935");
+    assert.equal(option.takeProfitPrice, "10180");
     assert.equal(option.draft, undefined);
   }
   assert.equal(preview.submission.state, "blocked");
@@ -520,7 +531,7 @@ test("owner-confirmed entry runs once and attaches stop then take profit to the 
   assert.deepEqual(calls.map(call => call.params.get("type")), ["MARKET", "STOP_MARKET", "TAKE_PROFIT_MARKET"]);
   assert.equal(calls[0].params.get("quantity"), "0.001");
   assert.equal(calls[0].params.get("side"), "BUY");
-  assert.deepEqual(calls.slice(1).map(call => call.params.get("triggerPrice")), ["9900", "10200"]);
+  assert.deepEqual(calls.slice(1).map(call => call.params.get("triggerPrice")), ["9935", "10180"]);
   for (const call of calls.slice(1)) {
     assert.equal(call.path, "/fapi/v1/algoOrder");
     assert.equal(call.params.get("workingType"), "MARK_PRICE");

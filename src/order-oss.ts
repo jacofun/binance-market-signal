@@ -15,7 +15,6 @@ type OssConfig = ReturnType<typeof loadOssConfig> & { prefix: string };
 
 export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore & {
   appendJsonLineAt(path: string, value: unknown, position: number): Promise<number | null>;
-  appendJsonLine(path: string, value: unknown): Promise<void>;
   readJsonLines(path: string, limit: number): Promise<unknown[]>;
 } {
   const storageCode = `${domain}_STORAGE_UNAVAILABLE`;
@@ -87,15 +86,6 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
       const response = await request("PUT", path, value, "", true);
       await response.body?.cancel().catch(() => {});
       if (!response.ok) throw unavailable(response);
-    },
-    async appendJsonLine(path, value) {
-      let position = 0;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const next = await appendJsonLineAt(path, value, position);
-        if (next === null) return;
-        position = next;
-      }
-      throw new AppError(storageCode, `${label}并发追加冲突，请使用请求编号查看函数日志。`, 503);
     },
     async readJsonLines(path, limit) {
       const response = await request("GET", path);

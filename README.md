@@ -2,7 +2,7 @@
 
 新加坡（`ap-southeast-1`）阿里云 FC 自定义运行时服务。Node.js 24 / Debian 12，监听 `0.0.0.0:9000`，适配 0.35 vCPU、512 MB 内存、10 GB 临时磁盘。TypeScript 编译为 JavaScript，部署包没有运行时第三方依赖。
 
-一次请求依次获取币安公开行情、计算收盘 K 线特征与价格区域、由 M1/M2 规则或百炼模型生成研究结果，再校验结构及复核标记价格，最后返回 V4 研究结果。函数不保存原始行情、提示词或完整手动分析结果。开启订单功能且生成有效候选时，只将交易计划所需字段暂存到私有 OSS。日志记录请求编号、状态、耗时及模型失败时经过白名单过滤的诊断字段，不记录 JWT、密钥、模型完整回复或请求头。
+主链路通过 REST 获取币安行情，由 M1 评估已收盘 K 线，M1 触发后由 M2 构建方案，再做结构校验和标记价复核。手动分析和符合条件的自动分析使用 V4 数据契约。日志保留请求编号、状态、耗时和经白名单过滤的诊断字段。自动分析归档包含本次快照使用的 K 线。
 
 ## 接口
 
@@ -26,31 +26,29 @@ X-JWT-Token: Bearer <北京现有接口签发的交易JWT>
 
 响应含 `analysisId`、`status`、`opportunity`、`market`、`timing`、`model`、`codeVersion`：
 
-- `candidate`：候选价位通过结构校验和最终价格核验，仍须人工确认自然语言触发条件；`triggerVerified` 固定为 `false`。
+- `candidate`：候选价位通过结构校验和最终价格核验，手动下单前须复核草稿并确认委托。保留 V4 的 `triggerVerified=false`，M1 判定见 `m1Trigger.triggered`。
 - `watch`：等待条件或等待进入价位区间。
 - `none`：暂无机会，入场/止损/方向为空。
 - `expired`：分析耗时超限、价格明显偏移，或已越过止损/首个目标。`expiredReasons` 给出原因。
 
-机会包含多空、入场区间、止损、目标、程序重算的盈亏比、触发/失效条件、支持证据和反对理由。不报告未经校准的胜率。自动扫描可通过独立开关启用委托。盈亏比按入场区间不利端估算，不含手续费、滑点、资金费，也不计算仓位或杠杆。候选目标引用由合约成交 K 线计算的结构区域，机会状态通过最新**标记价格**复核。此版本是实时研究助手，没有经回测验证的收益承诺。
+机会包含多空、入场区间、止损、目标、程序重算的盈亏比、触发/失效条件、支持证据和反对理由。不报告未经校准的胜率。定时分析的委托使用独立执行开关。盈亏比按入场区间不利端估算，不含手续费、滑点、资金费，也不计算仓位或杠杆。候选目标引用由合约成交 K 线计算的结构区域，机会状态通过最新**标记价格**复核。此版本是实时研究助手，没有经回测验证的收益承诺。
 
-`market.chart` 由 `{ interval, candles }` 组成，提供本次分析送给模型的原始收盘 K 线。每行依次为 `[开盘时间戳（毫秒）, 开, 高, 低, 收, 成交量, 主动买量]`，按时间递增。`market.asOf` 是行情快照时间，`market.latestQuote` 是分析后的复核标记价格。
+`market.chart` 由 `{ interval, candles }` 组成，提供本次分析使用的原始收盘 K 线。每行依次为 `[开盘时间戳（毫秒）, 开, 高, 低, 收, 成交量, 主动买量]`，按时间递增。`market.asOf` 是行情快照时间，`market.latestQuote` 是分析后的复核标记价格。
 
 ## FC 环境变量
 
-FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证。**不需要任何 SIGNAL_JWT_*、SIGNAL_AUTH_MODE 或 SYNC_JWT_* 环境变量，旧值不再读取。** 百炼模式需要 `DASHSCOPE_API_KEY`，并建议明确百炼地域端点与模型。示例值中的占位符必须替换：
+FC 统一使用同域名的原生 JWT 策略，与同步函数复用同一凭证。**不需要任何 SIGNAL_JWT_*、SIGNAL_AUTH_MODE 或 SYNC_JWT_* 环境变量，旧值不再读取。** 下列配置使用默认 M1/M2 分析。手动百炼比较需单独设 `USE_DETERMINISTIC_MODELS=false`，并配置对应地域的百炼密钥和模型。
 
 ```json
 {
-  "DASHSCOPE_API_KEY": "填写百炼API Key",
-  "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "DASHSCOPE_MODEL": "kimi-k3.1-pro",
   "SIGNAL_ALLOWED_SYMBOLS": "BTCUSDT",
   "PORT": "9000",
-  "MARKET_DATA_MODE": "rest"
+  "MARKET_DATA_MODE": "rest",
+  "USE_DETERMINISTIC_MODELS": "true"
 }
 ```
 
-百炼 Key 与调用地域必须匹配。北京公共兼容端点为上面的默认值；新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
+百炼 Key 与调用地域必须匹配。北京默认使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`，新加坡可使用 `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`。也接受百炼工作空间专属域名，如 `https://你的WorkspaceId.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。使用控制台针对该 Key 给出的地址，模型服务地域由 API Key 和端点决定，与函数所在地域独立。代码只向明确列入白名单的百炼官方 HTTPS 域名发送 Key，禁止重定向。
 
 百炼 `kimi-k3.1-pro` 的采样参数固定为 `temperature=1.0`、`top_p=0.95`、`presence_penalty=0.0`。代码按模型名自动设置温度为 1，其余两个参数不传，使用服务端默认值；其他模型沿用温度 0.1，无需新增温度环境变量。Kimi 建议先用 `DASHSCOPE_RESPONSE_FORMAT=json_object`、`DASHSCOPE_ENABLE_THINKING=false` 验证完整调用。这里保持既有的非思考请求模式；若改用 `omit` 交由模型默认启用思考，需另行评估输出预算和超时。参考：[百炼 Kimi 参数约束](https://www.alibabacloud.com/help/en/model-studio/kimi-api#default-parameters)。
 
@@ -112,22 +110,22 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 
 ### V4 数据契约
 
-- `schemaVersion=4`。手工研究提示词以 `market-research-v4-volume-timing-v8` 标记，自动扫描附加 `-auto-scan-movement-v2`。保留 `opportunity`、`market.chart`、历史解析和当前 JWT 接口。
-- 分析快照和扫描共用收盘等待与重试机制。每次分析核对 4h、1h、15m 的最新应收盘时间，必要时重试，仍未发布则返回 `MARKET_CANDLE_NOT_READY`。取数期间跨过新的收盘边界时重新构建快照。模型输入的 `latestClosedAt` 表示各周期最后一根的收盘边界，每根 K 线仍以开盘时间标识。
+- `schemaVersion=4`。规则分析版本标记为 `deterministic-m1-m2-v1`。手动百炼比较提示词标记为 `market-research-v4-volume-timing-v8`。保留 `opportunity`、`market.chart`、历史解析和当前 JWT 接口。
+- 手动和自动分析共用收盘等待与重试机制。每次分析核对 4h、1h、15m 的最新应收盘时间，必要时重试，仍未发布则返回 `MARKET_CANDLE_NOT_READY`。取数期间跨过新的收盘边界时重新构建快照。模型输入的 `latestClosedAt` 表示各周期最后一根的收盘边界，每根 K 线仍以开盘时间标识。
 - `market.frames` 保留各周期的趋势、ATR 百分比、波动状态、最近 5 根量价细节及 5/20/50 根阶段统计。RVOL20 以此前 20 根均量为分母，CLV 取值为 −1 到 1。量比达到 1.5 或降至 0.75 时分别标记放量和缩量。OI 按两个相邻整点与 1h 已收盘价格对齐，缺失值保留为空。
 - 每个摆动点等待后两根 K 线收盘确认。新摆动点与同类区域聚类时，中心跨度上限取初次和本次确认 ATR14 的较小值乘 0.5。区域在极值外扩初次确认 ATR 的 0.15，外扩上限为价格的 1%。区间 ID 由周期、原始支阻类型和第一个摆动点的开盘毫秒组成。聚类扩张后，以最后确认时点起跟踪最终边界的突破和回测，保留量比及触达反应。每周期保留每类离最新成交收盘价最近的 6 个区间。区域来自摆动结构，成交量证据为整根 K 线的观察量。
 - 模型从区间 ID 中选择入场、失效和目标依据。失效区和 1h ATR 用作止损研究参考。程序校验止损在入场区间的不利侧、步长及价格尺度，并在下单前执行配置的价差风险上限。目标按方向排序，较近的有效 4h 区域或触达至少两次的独立区域须优先设目标。全市场 `exchangeInfo` 按实例缓存 1 小时，读取 `PRICE_FILTER.tickSize` 并校验各价位。程序保留模型提交的价位或返回诊断。
 - 模型输入的区域额外附带 `selectablePriceRange`，用于入场和目标选价。程序按价格步长向区间内取整，下界上取整，上界下取整。区域已突破或范围内无可用价位时，该字段为空。入场的两个端点都须落在同一个引用区域。入场价越界但其他校验通过时，返回无计划的 `watch`，显示模型原区间和可选范围，原因代码为 `entry_out_of_bounds`。
 - 目标按价格路径跨周期排序。模型输入的 `effectiveKind` 和 `importantObstacle` 标明区域的有效支阻与重要性。模型若跳过更近的重要区域，其余校验通过时保留已校验的行情解读，返回无计划的 `watch`，摘要说明首个被跳过的区域。
 - `research` 包含市场状态、情景、三周期结论、价格区间、风险、目标评估和规则结果。目标距离、1h ATR 倍数和 R 以入场区间的不利端计算；历史波动分位数用快照前不重叠的 1h 成交 K 线窗口计算，并附样本数。4h / 12h / 24h 研究窗口独立于 30–300 秒的 `validForSeconds`。模型给出方向但将入场区间明确设为 `null` 时，保留行情解读并返回无计划的 `watch`，清除价格、区间引用和执行条件。已有入场区间的方案继续通过原有数值和结构校验。
-- 手动与自动分析都结合量价证据、首个目标的可达性和盈亏比。模型使用 `1/(1+R)` 作为忽略成本的盈亏平衡门槛，定性判断证据能否支持尝试。时机尚未完全确认但权衡有利时可以给出候选，并说明提前入场风险。等待应有明确、足以改变结论的理由。
+- 手动百炼比较使用 `1/(1+R)` 作为忽略成本的盈亏平衡门槛，定性判断证据能否支持尝试。时机尚未完全确认但权衡有利时可以给出候选，并说明提前入场风险。等待应有明确、足以改变结论的理由。
 - 研究结果通过 `triggerConditions` 记录入场前复核条件，在 `invalidationConditions` 写出「未入场失效」和「持仓提前退出」。这些条件用于人工复核，结构止损和目标仍使用 `stopLoss` 和 `targets`。
 
 ### M1 触发评分
 
-手动和自动分析都由 `analysis.ts` 调用 `MarketDataProvider.snapshot()`。REST 使用同一快照时间构建 4h、1h、15m 的已收盘成交 K 线特征，WebSocket 模式沿用该入口并在缓存缺口时用 REST 补齐。两种模式都使用 `market.ts` 的 `frame()`，从 `features.ts` 取得 EMA 趋势、ATR、RVOL20 和量价特征，从 `price-zones.ts` 取得确认区域及其突破、回测状态。自动扫描也复用 `frame()`，其结构初筛的 1h 区域和 4h 趋势取自形态开始前。通过扫描进入自动分析后，再获取实时分析快照供 M1 和百炼共用。
+手动和自动分析都由 `analysis.ts` 调用 `MarketDataProvider.snapshot()`。REST 使用同一快照时间构建 4h、1h、15m 的已收盘成交 K 线特征，手动分析的可选 WebSocket 模式沿用该入口并在缓存缺口时用 REST 补齐。两种模式都使用 `market.ts` 的 `frame()`，从 `features.ts` 取得 EMA 趋势、ATR、RVOL20 和量价特征，从 `price-zones.ts` 取得确认区域及其突破、回测状态。定时入口始终使用 REST 快照。
 
-在百炼模式中设置 `USE_M1_TRIGGER=true` 后，手动分析响应和自动分析归档附带 `m1Trigger`，包含 `triggered`、`score`、`reasons`、`keyFeatures` 和 `confidence`。该开关默认关闭。启用后可对照 `m1Trigger` 与 `decision.modelStatus` 查看程序评分和百炼判断。
+在百炼模式中设置 `USE_M1_TRIGGER=true` 后，手动分析响应附带 `m1Trigger`，包含 `triggered`、`score`、`reasons`、`keyFeatures` 和 `confidence`。该开关默认关闭。启用后可对照 `m1Trigger` 与 `decision.modelStatus` 查看程序评分和百炼判断。
 
 | 规则 | 分数 | 默认条件 |
 | --- | ---: | --- |
@@ -137,11 +135,11 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 | 多周期趋势 | 5 或 10 | 两个周期与信号方向一致得 5 分，三个周期一致得 10 分。 |
 | 波动率 | 10 | 15m ATR14 占收盘价的百分比在 0.05% 至 2% 之间，含边界。 |
 
-形态、区域、波动率条件均满足且总分至少 80 时触发。触发后，95 分起为 `high`，其余为 `medium`，未触发为 `low`。分数和置信度表示规则吻合程度，尚未用历史收益校准。阈值集中在 `src/m1-trigger.ts`。本地运行 `npm test` 可验证评分、手动响应、自动归档及模型继续执行的行为。
+形态、区域、波动率条件均满足且总分至少 80 时触发。触发后，95 分起为 `high`，其余为 `medium`，未触发为 `low`。分数和置信度表示规则吻合程度，尚未用历史收益校准。阈值集中在 `src/m1-trigger.ts`。本地运行 `npm test` 可验证评分、手动响应与自动归档。
 
 ### M1 + M2 规则分析
 
-设置 `USE_DETERMINISTIC_MODELS=true`，手动和自动分析均由 M1 判定触发，触发后由 M2 生成方案。此模式无需百炼配置，也无需另外设置 `USE_M1_TRIGGER`。留空或设为 `false` 时走原百炼流程。
+手动分析默认使用 M1 和 M2，留空或设 `USE_DETERMINISTIC_MODELS=true` 即可。显式设为 `false` 时，手动分析返回百炼研究结果，订单票据仅由规则分析生成。自动分析固定使用 M1/M2，无需配置百炼。
 
 | 环节 | M2 默认规则 |
 | --- | --- |
@@ -149,7 +147,7 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 | 止损 | 做多放在支撑区下沿外，做空放在阻力区上沿外。区域缓冲至少 0.15 倍 ATR 或一个价格步长中的较大值，入场近端到止损至少 0.5 倍 ATR。按入场不利端计算的风险距离最多 2 倍 ATR。 |
 | 目标 | 按路径选取对向确认区域的近端可用价位，最多两个。首个目标至少 1.5R，目标距入场不利端最多 6 倍 ATR。实单沿用首个目标作为止盈保护价。 |
 
-响应和自动归档包含 `decisionSource: "deterministic"`、`m1Trigger` 与 `m2Order`。M1 未触发时返回 `none`。M1 触发但 M2 无合法方案时返回无交易计划的 `watch`。M2 有方案时，`opportunity` 及其最终状态来自现有结构校验和标记价复核。订单预览及提交继续校验盘口、交易所过滤器和账户风险上限，自动提交仍使用既有扫描方向及执行开关。规则参数在 `src/m2-order.ts` 中，尚待历史回放校准。
+响应和自动归档包含 `decisionSource: "deterministic"`、`m1Trigger` 与 `m2Order`。M1 未触发时返回 `none`。M1 触发但 M2 无合法方案时返回无交易计划的 `watch`。M2 有方案时，`opportunity` 及其最终状态来自现有结构校验和标记价复核。订单预览及提交继续校验盘口、交易所过滤器和账户风险上限，自动提交只接受通过复核的 `candidate`，并受独立执行开关控制。规则参数在 `src/m2-order.ts` 中，尚待历史回放校准。
 
 
 ## HTTP触发器与CDN
@@ -195,13 +193,13 @@ MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
 
-## 扫描和订单共用 OSS
+## 自动分析、历史查询和订单的 OSS 配置
 
 使用 `OSS_BUCKET`、`OSS_REGION`、`ACCESS_KEY_ID` 和 `ACCESS_KEY_SECRET`。地域填 Bucket 的地域 ID，比如 `cn-hangzhou`，Bucket 变量填桶名。`OSS_NETWORK` 可选，默认 `public`，使用 OSS 内网域名时填 `internal`。
 
-已有的 `SIGNAL_ORDER_OSS_BUCKET` / `SIGNAL_ORDER_OSS_REGION` 可以直接沿用，其次兼容旧的 `SIGNAL_SCANNER_OSS_BUCKET` / `SIGNAL_SCANNER_OSS_REGION`。新 `OSS_*` 配置优先。Bucket 和地域须来自同一组。订单与扫描各用原有的对象前缀。两者之前分桶时，默认沿用订单桶以保留订单记录和在途锁。原扫描记录仍留在旧桶，需要回查时可将扫描前缀的历史文件迁入共用桶并保持对象键名。不要在有在途或持仓订单时切换订单桶。
+已有的 `SIGNAL_ORDER_OSS_BUCKET` / `SIGNAL_ORDER_OSS_REGION` 可以直接沿用，其次兼容旧的 `SIGNAL_SCANNER_OSS_BUCKET` / `SIGNAL_SCANNER_OSS_REGION`。新 `OSS_*` 配置优先。Bucket 和地域须来自同一组。各业务使用独立的对象前缀。两者之前分桶时，默认沿用订单桶以保留订单记录和在途锁。原扫描记录仍留在旧桶，需要回查时可将扫描前缀的历史文件迁入共用桶并保持对象键名。不要在有在途或持仓订单时切换订单桶。
 
-遇到 `SCAN_STORAGE_CONFIGURATION` 时，在 `market_scan_request_failed` 日志查看 `configurationField`，按变量名检查值。日志不包含变量值。
+遇到 `SCAN_STORAGE_CONFIGURATION` 时，在 `market_auto_analysis_failed` 或 `market_scan_request_failed` 日志查看 `configurationField`，按变量名检查值。日志不包含变量值。
 
 ## BTCUSDT 开仓、止盈和止损
 
@@ -232,51 +230,25 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 预览需要 `oss:GetObject` 和 `oss:PutObject` 读取及写入短时凭据，历史查单使用 `oss:GetObject`。执行还需桶级 `oss:GetBucketVersioning`、订单前缀下 `oss:PutObject` 和对 `locks/btcusdt.json` 的 `oss:DeleteObject`。同一账户和模式的所有实例使用相同 OSS 桶和前缀。保留激活锁及执行记录，持仓期间不要更换币安 API Key、模式或前缀。遇到 `order_entry_unresolved`、`order_protection_requires_attention` 或 `ORDER_RECOVERY_RELEASE`，按分析编号及客户端订单编号核对成交、持仓和保护单。仅在停用新执行、确认无在途请求与未处置仓位后清理孤立锁。先使用测试网验证 FC、OSS 和币安链路，再启用实盘。
 
-## BTCUSDT 自动扫描
+## BTCUSDT 定时 M1/M2 分析
 
-独立的 FC 事件入口 `POST /invoke` 处理名为 `binance-market-scanner` 的定时触发器。每分钟第 5 秒执行，触发消息可留空。根据交易所时间读取最新已收盘 1m K 线，按最近 5 分钟、15 分钟的收盘价变化检测异动，每根 15m K 线收盘后的前两分钟另行检测结构。当收盘数据尚未发布时会在本次调用内重试。手工分析、查单、保护单恢复及交易复盘走各自的入口。
-
-| 异动窗口 | 普通异动门槛（须同时满足两项） | 严重异动门槛 |
-| --- | --- | --- |
-| 5 分钟 | 涨跌幅绝对值 ≥ 0.6%，且 ≥ 近期中位数的 2.5 倍 | 涨跌幅绝对值 ≥ 1.2% |
-| 15 分钟 | 涨跌幅绝对值 ≥ 1.0%，且 ≥ 近期中位数的 2 倍 | 涨跌幅绝对值 ≥ 2.0% |
-
-中位数取信号窗口之前最多 180 个同长度滚动窗口的涨跌幅绝对值，至少需要 60 个完整窗口。成交量、趋势和结构提供给模型作判断依据，异动触发本身只使用价格。部署工作流在验证代码后通过 `fc:GetTrigger` 和 `fc:UpdateTrigger` 只更新现有扫描触发器的调度表达式，保留启用状态及触发消息。若部署凭证无权更新调度，在 FC 控制台将该触发器设为 `5 * * * * *` 并确认启用。
-
-- **顺势突破**要求 15m 收盘穿越已确认的 1h 关键区、相对成交量达到 1.5 倍、4h 趋势一致，且收盘距穿越边缘不超过 1 倍 15m ATR，到下一个反向区至少有 1 倍 15m ATR。
-- **假突破回收**要求盘中穿过边缘且重新收进区间，随后一根收盘向回收方向继续移动。确认后检查与区间边缘的距离和到反向区的空间。两类规则都用形态开始前已知的 1h 区域。找不到下一个反向区时记录为数据不足。
-- 异动、结构事件、过滤、待确认、无触发及行情失败都会记录。每次执行分别记录扫描时间和 K 线收盘时间，通过 OSS AppendObject 追加到 `private/market-signal-scanner/v1/BTCUSDT/runs/<utcHourEpochMs>.ndjson`。交易日志列表按扫描时间倒序，每页最多 16 条，在最多四小时的窗口内翻页，可回看最近 30 天。原按收盘时段保存的 JSON 记录继续可查，扫描时间显示为空。
-
-授予共用 OSS 凭证扫描前缀的 `oss:GetObject` 和 `oss:PutObject`。记录使用 OSS 追加位置校验处理并发，Bucket 的保留策略须允许追加对象。扫描列表无需列桶权限。
-
-CDN 保持 `/trade/api/signal/*` 回源规则，`POST /trade/api/signal/scans` 可以原路径转发或改写为 `/scans`，透传原有 JWT 到 FC。列表复用站点所有者的短期交易凭证。扫描日志可按 `market_scan_recorded` 和 `market_scan_request_failed` 检索。
-
-### 自动分析与额度
-
-在 `binance-market-signal` FC 配置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为非负整数。留空或设为 `0` 时仅扫描。设为正整数时，按北京时间自然日限制自动分析次数，手动分析不占该额度。现有 `binance-market-scanner` 触发器继续使用。
-
-异动、15m 收盘穿越或确认回收都可以触发研究，同一分钟最多一次，合并时优先按异动处理。20 分钟内同向信号合并，普通事件升级为严重异动时可额外分析一次。异动和结构共用每日额度。限额大于 1 时，30% 向上取整留给严重异动，并至少保留 1 个普通额度。限额为 1 时先到先用。
-
-函数先保存扫描并加载最新 V4 实时行情，再按 OSS 追加位置原子判断去重及占用配额。百炼模式在请求发出前占用额度，规则模式在运行 M1 前占用额度。两种模式共用额度及去重记录，规则分析即使未触发也占用一次。若函数在占用配额后中断，配额保留至当日结束。超过配额的信号不会延后补发。百炼模式将异动涨跌幅和阈值、扫描规则逐项检查以及最新的 4h、1h、15m 行情发给模型，每个周期最多 200 根。
+1. 在 FC 控制台停用原 `binance-market-scanner`，并在新代码部署后创建名为 `binance-market-analysis` 的定时触发器。使用 Cron `5 */15 * * * *`，在每小时第 0、15、30、45 分钟的第 5 秒执行。触发消息可留空，事件通过 FC 的 `POST /invoke` 进入。部署工作流保留控制台触发器配置。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
+2. 设置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为正整数以启用定时分析。留空或设为 `0` 时跳过定时分析。限额按 15m 收盘所属的北京时间自然日统计，每次 M1 触发且取得归档额度时占一次。M1 未触发的收盘仅记录已评估状态，手动分析也不占用该额度。
+3. 定时入口以 `neutral` 风格使用 `RestMarketDataProvider` 获取 4h、1h、15m 收盘行情并直接评估 M1。事件超过收盘三分钟或快照对不上该收盘时跳过。M1 通过才运行 M2，交易方案经结构、步长和最新标记价格复核。同一收盘的去重与额度使用 OSS 条件追加，发生并发时只允许一个调用归档及继续执行。
 
 | OSS 路径 | 用途与权限 |
 | --- | --- |
-| `private/market-signal-scanner/v1/BTCUSDT/auto-analysis/` | 去重、每日调用配额和扫描跟进状态，使用现有扫描桶，需 `oss:GetObject` 与 `oss:PutObject`。配额、去重对象至少保留至相关扫描时段结束，启用期间勿重置正在使用的对象。 |
-| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | 复用网站私有分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。根目录默认 `/private`，若网站使用其他根目录，在本函数配置相同的 `PRIVATE_RESOURCE_ROOT`。 |
+| `private/market-signal-auto-analysis/v1/BTCUSDT/slots/<北京时间日期>.ndjson` | 定时分析去重和每日额度，需 `oss:GetObject` 和 `oss:PutObject`。Bucket 策略须允许追加对象。 |
+| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | M1 触发后写入网站分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。根目录默认 `/private`。 |
+| `private/market-signal-scanner/v1/` | 历史扫描及旧分析关联，只读，需 `oss:GetObject`。原 `POST /scans` 和关联归档读取接口继续可用。 |
 
-归档默认使用扫描桶。如果网站内容桶与扫描桶分开，在本函数配置网站的 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`，让自动分析进入网站分析历史和复盘队列。跨地域归档使用公网端点。从自动扫描表打开详情时，如果网站的归档读取失败，浏览器通过既有所有者凭证在 `/scans` 读取已关联的自动分析原件。该读取需要现有扫描凭证具有归档 `records/` 前缀的 `oss:GetObject` 权限。
+归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。新定时结果在网站分析历史和 FC 日志中查看，历史扫描页面保留旧记录。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
 
-在交易日志的扫描表查看自动分析状态和研究详情，归档结果也会出现在分析历史。日志事件 `market_auto_analysis_completed` 记录模型和 Token 用量，`market_auto_analysis_failed` 记录失败阶段、请求编号、异常来源和已有的百炼诊断信息。归档失败时，可用扫描请求编号定位诊断，无需重调模型。
+### 自动委托
 
-### 自动扫描提交订单
+`SIGNAL_AUTO_ORDER_EXECUTE=true` 与 `SIGNAL_ORDER_EXECUTE=true` 同时开启后，已归档的有效 `candidate` 可进入自动委托复核。复核使用与账户相同的 `BINANCE_BASE_URL`，沿用 `market-order-protection` 恢复心跳、最新盘口、入场区间、过期时间、既有持仓和委托检查、交易所过滤器以及价差风险上限。关闭自动执行开关时，定时任务只做分析及归档。
 
-`SIGNAL_AUTO_ORDER_EXECUTE=true` 启用扫描后的自动提交，默认关闭。仍需 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 大于 0、`SIGNAL_ORDER_EXECUTE=true`、既有订单配置和运行中的 `market-order-protection` 定时任务。启用时，自动扫描及其模型分析使用与下单相同的 `BINANCE_BASE_URL` REST 行情，`SIGNAL_ORDER_MODE=demo` 对应测试网，`live` 对应实盘。手动分析和手动提交入口沿用原流程。
-
-异动触发只用于研究，包括同一分钟同时命中结构的情况。独立结构事件分析归档后，只有与至少一条完整通过初筛的规则同向的 `candidate` 才进入委托复核。程序检查候选的有效期、入场区间、标记价、可成交盘口、账户持仓和挂单、交易所过滤器、既有数量与风险上限，以及剩余函数运行时间。
-
-自动入口以最新买一或卖一提交 `LIMIT/IOC`，多单使用卖一，空单使用买一，当前限价提供最差成交价约束。未成交余量由交易所撤销。确认有成交后立即提交标记价止损和首个目标止盈。保护单与开仓是独立请求，两笔保护均获交易所确认后才标记为齐全。交易所响应不明确时按已保存的客户订单编号查单和恢复保护，禁止重发开仓。沿用已有 OSS 订单前缀、执行锁和权限。
-
-函数日志 `market_auto_order_outcome` 和扫描结果的 `autoAnalysis.order` 记录提交状态、保护状态或跳过原因。用分析编号可走现有所有者订单状态接口查询。
+入口以最新对手价提交 `LIMIT/IOC`，确认成交后提交标记价止损和首个目标止盈。执行、保护和恢复沿用原订单路径。日志 `market_auto_order_outcome` 记录提交和保护结果，可用分析编号查单。
 
 ## 本地验证
 
@@ -289,8 +261,6 @@ python3 -m unittest discover -s test -p 'test_deploy_fc.py' -v
 npm run package
 ```
 
-异动规则可用公开的 Binance USDⓈ-M BTCUSDT 1m K 线回放。按开盘时间拼接连续日档的 CSV，传给 `node scripts/replay-movement.mjs 10`，其中 `10` 是本次回放的每日研究额度。回放统计异动、去重和限额，不调用 Kimi。
-
-测试覆盖共用交易凭证和FC入口边界、鉴权先于上游调用、CORS/路径、收盘及连续性、限流、过期报价、模型无效/截断输出、分析后重新核价、小实例并发、WebSocket缓存/补齐与部署配置保留。模型和行情使用可注入测试数据；真实百炼分析与真实WebSocket长时间稳定性仍需在配置完成后的运行环境验证。
+测试使用模拟 REST、OSS 和币安委托接口，覆盖新旧定时入口、收盘重试、M1/M2、每日额度、并发去重、归档及保护委托风险校验。另覆盖手动接口、历史扫描读取、WebSocket 缓存补齐和部署配置保留。
 
 参考：[FC自定义运行时](https://www.alibabacloud.com/help/en/functioncompute/custom-runtime/)、[百炼兼容接口](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)、[币安USD-M行情](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data)。

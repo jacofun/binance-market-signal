@@ -36,7 +36,11 @@ function loadLlmConfig(env: Env) {
 }
 
 export function loadConfig(env: Env) {
-  const useDeterministicModels = env.USE_DETERMINISTIC_MODELS?.trim() === "true";
+  const deterministicFlag = env.USE_DETERMINISTIC_MODELS?.trim();
+  if (deterministicFlag && deterministicFlag !== "true" && deterministicFlag !== "false") {
+    throw new AppError("INVALID_CONFIGURATION", "USE_DETERMINISTIC_MODELS 只支持 true/false。", 503);
+  }
+  const useDeterministicModels = deterministicFlag !== "false";
   const engine = useDeterministicModels ? { useDeterministicModels } : { useDeterministicModels, ...loadLlmConfig(env) };
   const symbols = (env.SIGNAL_ALLOWED_SYMBOLS || "BTCUSDT").split(",").map(v => v.trim());
   if (!symbols.length || symbols.length > 4 || new Set(symbols).size !== symbols.length || symbols.some(s => !/^[A-Z0-9]{3,24}USDT$/.test(s))) {

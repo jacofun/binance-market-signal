@@ -73,7 +73,7 @@ test("deterministic HTTP analysis needs no LLM configuration and handles every d
   let market = m2Snapshot();
   let mark = 10000;
   const { request } = await app(t, {
-    env: { USE_DETERMINISTIC_MODELS: "true", SIGNAL_COOLDOWN_SECONDS: "0", DASHSCOPE_BASE_URL: "invalid-unused-setting" },
+    env: { SIGNAL_COOLDOWN_SECONDS: "0", DASHSCOPE_BASE_URL: "invalid-unused-setting" },
     provider: provider({ snapshot: async () => market, quote: async () => ({ ...market.quote, price: mark }) }),
     model: async () => assert.fail("deterministic mode must not invoke the LLM"),
   });
@@ -109,7 +109,7 @@ test("deterministic HTTP analysis needs no LLM configuration and handles every d
   assert.equal(noTrigger.m2Order, null);
 });
 test("shared ticket reaches analysis without FC metadata headers or JWT environment settings", async t => {
-  const { request } = await app(t, { env: { DASHSCOPE_API_KEY: env.DASHSCOPE_API_KEY, SIGNAL_COOLDOWN_SECONDS: "0" } });
+  const { request } = await app(t, { env });
   for (const headers of [{}, { "x-fc-control-path": "/invoke" }, { "x-fc-function-name": "unexpected-name" }, { "x-fc-request-id": "" }]) {
     const response = await request("/analyze", { symbol: "BTCUSDT" }, headers);
     assert.equal(response.status, 200);
