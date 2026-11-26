@@ -6,6 +6,7 @@ import type { MarketDataProvider, ModelDecision, ModelResult, Proposal, Style } 
 import { SOURCE_COMMIT } from "./version.js";
 import { assessResearch, researchContext } from "./research.js";
 import { candleRow } from "./market.js";
+import { evaluateM1Trigger } from "./m1-trigger.js";
 
 export type Model = typeof analyzeWithModel;
 export type AnalysisStage = "market_snapshot" | "model" | "proposal_validation" | "quote_verification";
@@ -19,6 +20,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
   onStage("market_snapshot");
   const snapshot = await provider.snapshot(symbol, signal);
   if (signal.aborted) throw new AppError("REQUEST_TIMEOUT", "请求已取消或超时。", 504);
+  const m1Trigger = config.useM1Trigger ? evaluateM1Trigger(snapshot, style) : undefined;
   const modelStart = now();
   onStage("model");
   const result: ModelResult = await model(config, snapshot, style, signal);
@@ -54,6 +56,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
   const risk = entryReference && p.stopLoss ? Math.abs(entryReference - p.stopLoss) : null;
   return {
     schemaVersion: 4, analysisId: randomUUID(), symbol, style, status,
+    ...(m1Trigger ? { m1Trigger } : {}),
     decision: { ...modelDecision, reasons: [...decisionReasons, ...expiryReasons] },
     opportunity: { ...p, status, rewardRisk: p.targets.map(t => ({ target: t.price, ratio: risk ? Math.abs(t.price - entryReference!) / risk : null })),
       triggerVerified: false, priceReference: "markPrice", expiredReasons: expiryReasons.map(reason => reason.message) },

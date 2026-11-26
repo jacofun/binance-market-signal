@@ -102,9 +102,11 @@ export function effectiveKind(zone: PriceZone) {
   return zone.kind === "resistance" ? "support" : "resistance";
 }
 
+export const distanceToZone = (zone: PriceZone, price: number) => Math.max(0, zone.lower - price, price - zone.upper);
+
 export function selectZones(zones: PriceZone[], reference: number) {
-  const distance = (zone: PriceZone) => Math.max(0, zone.lower - reference, reference - zone.upper);
   const nearest = (group: PriceZone[]) => group.toSorted((a, b) =>
-    distance(a) - distance(b) || b.touches - a.touches || b.lastTouchTime - a.lastTouchTime || a.id.localeCompare(b.id)).slice(0, 6);
+    distanceToZone(a, reference) - distanceToZone(b, reference) ||
+    b.touches - a.touches || b.lastTouchTime - a.lastTouchTime || a.id.localeCompare(b.id)).slice(0, 6);
   return [...nearest(zones.filter(z => effectiveKind(z) === "support")), ...nearest(zones.filter(z => effectiveKind(z) === "resistance"))];
 }

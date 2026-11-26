@@ -15,7 +15,7 @@ const zone = (id, kind, lower, upper) => ({ id, kind, lower, upper, interval: "1
 export const snapshot = () => ({
   symbol: "BTCUSDT", asOf: NOW, receivedAt: NOW, tickSize: 0.1, quote: quote(), source: "rest", warnings: [], openInterest: [],
   frames: ANALYSIS_INTERVALS.map(interval => ({
-    interval, lastCloseTime: NOW - 1, close: 10000, ema20: 9900, ema50: 9800, atr14: 100, trend: "up", volumeRatio20: 1.5,
+    interval, lastCloseTime: NOW - 1, close: 10000, ema20: 9900, ema50: 9800, atr14: 100, atrPct: 1, trend: "up", volumeRatio20: 1.5,
     high20: 10100, low20: 9700, recentCandles: [],
     volumePrice: [{ openTime: NOW - INTERVAL_MS[interval], closeChangePct: 0.5, volumeRatio20: 1.5, takerBuyShare: 0.6 }],
     priceLevels: { high200: 10200, low200: 9500, swingHighs: [], swingLows: [] },

@@ -33,6 +33,7 @@ test("full prefix and CDN-rewritten root paths return opportunities using only X
     assert.equal(response.status, 200);
     const result = await response.json();
     assert.equal(result.status, "candidate"); assert.ok(result.requestId); assert.equal(result.opportunity.triggerVerified, false);
+    assert.equal(Object.hasOwn(result, "m1Trigger"), false);
     assert.equal(result.decision.modelStatus, "candidate");
     const completed = logs.find(log => log.event === "analysis_completed" && log.requestId === result.requestId);
     assert.equal(completed.modelStatus, "candidate");
@@ -43,6 +44,30 @@ test("full prefix and CDN-rewritten root paths return opportunities using only X
   }
   const wrong = await request("/trade/api/signal/analyze", { symbol: "BTCUSDT" }, { "X-JWT-Token": "", Authorization: jwt() });
   assert.equal(wrong.status, 401);
+});
+test("enabling M1 exposes a trigger alongside the model decision on the same snapshot", async t => {
+  const market = snapshot();
+  let snapshots = 0;
+  let modelCalls = 0;
+  const { request } = await app(t, {
+    env: { ...env, USE_M1_TRIGGER: "true" },
+    provider: provider({ snapshot: async () => { snapshots++; return market; } }),
+    model: async (_config, input) => {
+      modelCalls++;
+      assert.equal(input, market);
+      return modelResult(proposal({ status: "watch" }));
+    },
+  });
+  const response = await request();
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.m1Trigger.triggered, true);
+  assert.equal(result.m1Trigger.keyFeatures.asOf, result.market.asOf);
+  assert.equal(result.status, "watch");
+  assert.equal(result.decision.modelStatus, "watch");
+  assert.equal(result.opportunity.triggerVerified, false);
+  assert.equal(snapshots, 1);
+  assert.equal(modelCalls, 1);
 });
 test("shared ticket reaches analysis without FC metadata headers or JWT environment settings", async t => {
   const { request } = await app(t, { env: { DASHSCOPE_API_KEY: env.DASHSCOPE_API_KEY, SIGNAL_COOLDOWN_SECONDS: "0" } });

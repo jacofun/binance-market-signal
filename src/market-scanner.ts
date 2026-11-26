@@ -4,7 +4,7 @@ import { limited } from "./http.js";
 import { closedCandleBoundary, frame, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadOssConfig } from "./oss-config.js";
-import { effectiveKind } from "./price-zones.js";
+import { distanceToZone, effectiveKind } from "./price-zones.js";
 import { SOURCE_COMMIT } from "./version.js";
 import type { Candle, Frame, PriceZone } from "./types.js";
 import { minuteMs, scanMovement, type AnalysisClaim, type Movement } from "./movement.js";
@@ -44,10 +44,8 @@ export function scanRules(short: Frame, hourly: Frame, background: Frame): Rule[
   const [before, previous, last] = short.recentCandles.slice(-3);
   if (!before || !previous || !last) throw new AppError("SCAN_INSUFFICIENT_DATA", "扫描缺少连续的已收盘 K 线。", 502);
   const zones = hourly.zones.filter(zone => zone.confirmedAt <= previous.openTime && zone.status !== "broken");
-  const ordered = (items: PriceZone[], price: number) => items.toSorted((a, b) => {
-    const distance = (z: PriceZone) => Math.max(0, z.lower - price, price - z.upper);
-    return distance(a) - distance(b) || a.id.localeCompare(b.id);
-  });
+  const ordered = (items: PriceZone[], price: number) => items.toSorted((a, b) =>
+    distanceToZone(a, price) - distanceToZone(b, price) || a.id.localeCompare(b.id));
   const directionOf = (zone: PriceZone): Direction => effectiveKind(zone) === "resistance" ? "long" : "short";
   const edge = (zone: PriceZone) => directionOf(zone) === "long" ? zone.upper : zone.lower;
   const side = (zone: PriceZone) => directionOf(zone) === "long" ? 1 : -1;
