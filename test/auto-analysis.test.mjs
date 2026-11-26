@@ -158,6 +158,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
   const runtime = makeServer({
     env: { ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", OSS_BUCKET: "auto-analysis-test", OSS_REGION: "cn-hangzhou",
       ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT: limit,
+      USE_M1_TRIGGER: state.m1 ? "true" : undefined,
       SIGNAL_AUTO_ORDER_EXECUTE: state.autoOrder ? "true" : undefined,
       SIGNAL_MAX_ANALYSIS_AGE_MS: state.modelElapsed ? "100000" : undefined,
       SIGNAL_ORDER_EXECUTE: state.execution ? "true" : undefined, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: `https://${demoHost}`,
@@ -300,7 +301,7 @@ test("demo REST analysis retries a delayed response and gives Kimi the same clos
 });
 
 test("qualified timer sends the actual checks once and archives the independent decision for the review worker", async t => {
-  const app = await testServer(t, "1");
+  const app = await testServer(t, "1", { now: NOW + 5000, m1: true });
   const run = await app.invoke();
   assert.equal(run.status, "passed");
   assert.equal(run.autoAnalysis?.status, "completed", JSON.stringify(run));
@@ -323,6 +324,9 @@ test("qualified timer sends the actual checks once and archives the independent 
   const saved = JSON.parse(app.objects.get(`${archive}/records/${analysisId}.json`));
   assert.equal(saved.status, "none");
   assert.equal(saved.decision.modelStatus, "none");
+  assert.equal(saved.m1Trigger.triggered, true);
+  assert.equal(saved.m1Trigger.keyFeatures.asOf, saved.market.asOf);
+  assert.equal(saved.m1Trigger.keyFeatures.lastCloseTime, scanEvidence.candleClosedAt - 1);
   assert.equal(saved.decision.reasons[0].code, "model_none");
   const completed = app.logs.find(log => log.event === "market_auto_analysis_completed" && log.analysisId === analysisId);
   assert.equal(completed.modelStatus, "none");

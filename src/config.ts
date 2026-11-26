@@ -50,7 +50,7 @@ export function loadConfig(env: Env) {
     maxAnalysisAgeMs: integer(env, "SIGNAL_MAX_ANALYSIS_AGE_MS", 60000, 5000, 110000),
     maxPriceDriftBps: integer(env, "SIGNAL_MAX_PRICE_DRIFT_BPS", 30, 1, 500),
     cooldownMs: integer(env, "SIGNAL_COOLDOWN_SECONDS", 10, 0, 300) * 1000,
-    responseFormat, enableThinking,
+    responseFormat, enableThinking, useM1Trigger: env.USE_M1_TRIGGER?.trim() === "true",
   };
 }
 export type Config = ReturnType<typeof loadConfig>;
