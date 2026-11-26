@@ -86,7 +86,7 @@ export function exceptionChain(error: unknown) {
     // Native errors and JSON parser errors can embed upstream data in their text.
     const frames = (typeof error.stack === "string" ? error.stack : "").split("\n").slice(1, 20).flatMap(line => {
       if (!/^\s+at /.test(line)) return [];
-      const match = /\/build\/((?:analysis|auth|auto-analysis|config|errors|features|http|market|market-scanner|model|order-auth|order-binance|order-execution|order-oss|order-rules|orders|oss-config|price-zones|research|server|websocket-market)\.js:\d{1,7}:\d{1,5})\)?$/.exec(line);
+      const match = /\/build\/((?:analysis|auth|auto-analysis|config|errors|features|http|m1-trigger|m2-order|market|model|order-auth|order-binance|order-execution|order-oss|order-rules|orders|oss-config|price-grid|price-zones|research|scan-history|server|websocket-market)\.js:\d{1,7}:\d{1,5})\)?$/.exec(line);
       return match ? [match[1]!] : [];
     }).slice(0, 4);
     chain.push({

@@ -8,8 +8,6 @@ import type { LlmConfig } from "./config.js";
 import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
 export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v8";
-export const AUTO_SCAN_PROMPT_VERSION = `${RESEARCH_PROMPT_VERSION}-auto-scan-movement-v2`;
-export const AUTO_ORDER_PROMPT_VERSION = `${AUTO_SCAN_PROMPT_VERSION}-immediate-v1`;
 
 const text = { type: "string", minLength: 1, maxLength: 600 };
 const list = { type: "array", items: text, maxItems: 8 };
@@ -262,7 +260,7 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
 }
 
 export async function analyzeWithModel(config: LlmConfig, snapshot: Snapshot, style: Style, signal: AbortSignal,
-  request: typeof fetch = fetch, scanEvidence?: import("./market-scanner.js").ScanEvidence, immediate = false): Promise<ModelResult> {
+  request: typeof fetch = fetch): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
   const context = researchContext(snapshot);
   const marketInput = {
@@ -291,19 +289,18 @@ volumePrice 为最近5根的明细，量比以此前20根均量为分母，CLV �
 翻转明确发生在哪个周期。比较原方向两次推进时价格与量能的变化，量价背离用作动能减弱证据。已经发生的 1h 结构翻转须指出哪根 1h K 线收盘收复或跌破了哪个结构位。高周期尚未翻转时，若收盘证据与风险收益支持，可提出有明确失效位的 15m 早期翻转候选，注明与高周期的冲突和提前入场风险。4h 方向不清时，按区间或转换分析。
 
 summary 首句明确写出做多候选、做空候选、等待确认或放弃。research 交代 marketRegime、scenario、三个周期的证据、风险和 researchHorizon（4、12或24小时）。历史分位数来自不重叠的成交 K 线窗口，属于历史描述。validForSeconds 在30至300之间，用于本次报价复核，与研究窗口独立。
-candidate 表示现有证据和风险收益已支持尝试，不要求形态完美。${immediate ? "本次候选会进入即时下单复核。用已经出现的收盘证据判断，并要求当前报价在入场区内。如果某个尚未发生的条件是交易成立的必要前提，才为该条件等待。" : "实际入场仍须人工复核 triggerConditions。"}只要 direction 是 long 或 short，就必须提供完整计划，entry 必须是含数值 min 和 max 的对象，并给出 stopLoss、至少一个 target 及对应区间。只有方向参考、还没有可用入场区间时，输出无计划的 watch，在 summary 和周期解读中说明方向倾向以及仍需确认的条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 全部为 null，targets 为空数组，research.scenario 为 none。
-有计划时，在 triggerConditions 写明${immediate ? "已经出现的入场依据和下单前须复核的入场区间。将可承受的剩余不确定性写进 riskFactors。" : "入场前须复核的价格区和已有的可观察依据，注明周期和价位。"}止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
+candidate 表示现有证据和风险收益已支持尝试，不要求形态完美。实际入场仍须人工复核 triggerConditions。只要 direction 是 long 或 short，就必须提供完整计划，entry 必须是含数值 min 和 max 的对象，并给出 stopLoss、至少一个 target 及对应区间。只有方向参考、还没有可用入场区间时，输出无计划的 watch，在 summary 和周期解读中说明方向倾向以及仍需确认的条件。方向或结构机会失效时输出 none，并说明放弃原因。无计划时 direction、entry、stopLoss、research.entryZoneId、research.stopZoneId 全部为 null，targets 为空数组，research.scenario 为 none。
+有计划时，在 triggerConditions 写明入场前须复核的价格区和已有的可观察依据，注明周期和价位。止盈、止损沿用 targets、stopLoss。invalidationConditions 区分【未入场失效】和【持仓提前退出】。前者写明何时取消候选，后者结合放量但推进受阻或背离等预警，指出后续收盘破坏哪个局部结构时应提前退出。若缺少独立的提前退出依据，说明按原定目标和结构止损复核。价格和量能条件须基于本次行情。价格收盘条件使用成交 K 线。
 
 有计划时，从 frames.zones 引用区域 ID。先选 research.entryZoneId，再从同一区域的 selectablePriceRange 选择 entry.min 和 entry.max。输出前核对 selectablePriceRange.min ≤ entry.min ≤ entry.max ≤ selectablePriceRange.max，两个端点不可取自不同区域。每个目标价须落在它引用区域的 selectablePriceRange 内。靠近边界时直接使用对应的 min 或 max，勿自行四舍五入原始 lower 或 upper。selectablePriceRange 为空的区域不可用于入场或目标。找不到符合条件的计划时使用 watch 或 none。
 stopZoneId 引用有效结构作为止损参考，做多引用支撑、做空引用阻力。综合量价、局部失效位和 1h ATR 自主决定 stopLoss，区域边缘和 ATR 是研究参考。做空可以在阻力区内或其下方设置更近的止损，前提是止损严格高于 entry.max；做多止损严格低于 entry.min。解释为什么这个价位代表失效，以及较近止损被正常波动触发的风险。目标区做多选阻力，做空选支撑。按 effectiveKind 识别有效支阻，broken 区域不可用。
 目标按价格路径由近至远，合并查看全部周期。做空从 entry.min 向下，按有效支撑区的上沿由高到低考虑。做多从 entry.max 向上，按有效阻力区的下沿由低到高考虑。每个远端目标之前，若有整个区域位于入场边界和该目标之间、与引用目标区不重叠且 importantObstacle 为 true 的区域，目标列表必须先有一个价位落在该近端区域。即使近端是 15m、远端是 1h 或 4h，也按同一规则。无法先给出有依据的近端目标时，返回无计划的 watch 或 none。结合目标距离、历史波幅和反对证据说明依据，无固定2R要求。
 所有价位为 tickSize 整数倍且在标记价格的0.5至1.5倍内。做多 stopLoss < entry.min <= entry.max < 每个目标价；做空相反。有计划时 targets、triggerConditions、invalidationConditions、evidence、counterarguments 至少1项，evidence 至少引用一个周期的 volumePrice。每条 evidence 只能引用1个枚举指标。用简短中文，勿输出额外字段或 Markdown。
-${scanEvidence ? `以专业交易员视角独立决策。优先选择有结构依据、在可接受下行风险下有最大合理盈利空间的方案，同时评估反向证据、流动性障碍和目标可达性。scanEvidence 是程序初筛的历史观测。trigger 说明启动原因，movement 给出 1m 已收盘数据计算的 5m/15m 涨跌幅、基线和相邻同长度区间成交量比。rules 是可用的 15m 结构事件及检查，盘中两次结构扫描之间可为空。异动方向用于提示关注，结合完整快照判断延续、回收或观望。初筛区域来自形态开始时的快照，价格引用仅能使用本次 snapshot 的合法区域。
-` : ""}按此 JSON Schema 输出：${JSON.stringify(schema)}`;
+按此 JSON Schema 输出：${JSON.stringify(schema)}`;
   if (!["json_object", "json_schema"].includes(config.responseFormat) || !["false", "omit"].includes(config.enableThinking)) {
     throw new AppError("INVALID_CONFIGURATION", "结构化输出仅支持 json_object/json_schema；思考模式配置仅支持 false/omit。", 503);
   }
-  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot: marketInput, ...(scanEvidence ? { scanEvidence } : {}) }) }],
+  const body = { model: config.model, messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify({ style, snapshot: marketInput }) }],
     // Bailian Kimi K3.1 Pro rejects non-default sampling values; Qwen keeps the
     // existing low-temperature setting. top_p/presence_penalty use defaults.
     stream: false, temperature: config.model === "kimi-k3.1-pro" ? 1 : 0.1, max_tokens: config.maxTokens,

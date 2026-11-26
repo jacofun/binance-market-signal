@@ -8,13 +8,13 @@ import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
 import type { MarketDataProvider, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
-import { autoOrderBase, loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
+import { loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
 import { makeOrderStore } from "./order-oss.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
-import { makeMarketScanner, validateScanTimer, SCANNER_TRIGGER } from "./market-scanner.js";
-import { analysisIdPattern, readAutoAnalysisArchive, runAutoAnalysis } from "./auto-analysis.js";
+import { makeScanHistory } from "./scan-history.js";
+import { analysisIdPattern, AUTO_ANALYSIS_TRIGGER, readLegacyAnalysisArchive, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -41,9 +41,9 @@ async function body(req: IncomingMessage, ramProbe = false): Promise<Record<stri
   } catch (error) { throw new AppError("INVALID_REQUEST", "请求体必须为 JSON 对象。", 400, undefined, undefined, { cause: error }); }
 }
 function health() { return { status: "ok", service: "binance-market-signal", codeVersion: SOURCE_COMMIT, nodeMajor: Number(process.versions.node.split(".")[0]) }; }
-export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console, orderFetch = fetch, scannerFetch = fetch }: {
+export function makeServer({ env = process.env, provider, model, now = Date.now, logger = console, orderFetch = fetch, analysisFetch = fetch }: {
   env?: Env; provider?: MarketDataProvider; model?: Model; now?: () => number;
-  logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch; scannerFetch?: typeof fetch;
+  logger?: Pick<Console, "info" | "error">; orderFetch?: typeof fetch; analysisFetch?: typeof fetch;
 } = {}) {
   let config: Config | undefined;
   let orderConfig: OrderConfig | undefined;
@@ -64,7 +64,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
     let isOrder = false;
-    let scanAction: "list" | "run" | "analysis" | undefined;
+    let scanAction: "list" | "analysis" | undefined;
     let archiveId: string | undefined;
     let orderAction: string | undefined;
     let acquired = false;
@@ -100,26 +100,21 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         if (Object.keys(input).length === 1 && input.action === "health") { send(200, health()); return; }
         // FC reserves x-fc-* headers and marks event invocations as /invoke.
         const timerEvent = path === "/invoke" && !origin && req.headers["x-fc-control-path"] === "/invoke";
-        if (timerEvent && input.triggerName === SCANNER_TRIGGER) {
-          scanAction = "run";
-          validateScanTimer(input, now());
-          const enabled = env.SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT?.trim();
-          const orderBase = autoOrderBase(env);
-          const result = await makeMarketScanner(env, now, scannerFetch, orderBase).run(requestId,
-            enabled && enabled !== "0" ? (evidence, store) => runAutoAnalysis(evidence, store, {
-              env, now, logger, request: scannerFetch, orderBase, orderRequest: orderFetch,
-              market: settings => orderBase ? provider ?? new RestMarketDataProvider(settings, scannerFetch, now, orderBase) : getMarket(settings),
-              deadline: startedAt + 105_000,
-              orderDeadline: startedAt + 115_000,
-              acquire: () => {
-                if (active) return undefined;
-                active = true;
-                return () => { active = false; };
-              },
-            }) : undefined);
-          const log = { event: "market_scan_recorded", requestId, ...result, elapsedMs: now() - startedAt };
-          if ("errorCode" in result) logger.error(JSON.stringify(log));
-          else logger.info(JSON.stringify(log));
+        if (timerEvent && input.triggerName === AUTO_ANALYSIS_TRIGGER) {
+          const triggeredAt = validateAutoAnalysisTimer(input, now());
+          const result = await runAutoAnalysis(requestId, triggeredAt, {
+            env, now, logger, request: analysisFetch, orderRequest: orderFetch,
+            deadline: startedAt + 105_000,
+            orderDeadline: startedAt + 115_000,
+            acquire: () => {
+              if (active) return undefined;
+              active = true;
+              return () => { active = false; };
+            },
+          });
+          const { m1Trigger, ...outcome } = result;
+          logger.info(JSON.stringify({ event: "market_auto_analysis_run", requestId, ...outcome,
+            m1Triggered: m1Trigger?.triggered, m1Score: m1Trigger?.score, elapsedMs: now() - startedAt }));
           send(200, { requestId, ...result }); return;
         }
         if (timerEvent && input.triggerName === "market-order-protection") {
@@ -168,10 +163,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
             throw new AppError("INVALID_REQUEST", "分析编号或扫描编号无效。", 400);
           }
           archiveId = analysisId;
-          const result = await readAutoAnalysisArchive(env, now, scannerFetch, scanId, analysisId);
+          const result = await readLegacyAnalysisArchive(env, now, analysisFetch, scanId, analysisId);
           send(200, { requestId, result }); return;
         }
-        const result = await makeMarketScanner(env, now, scannerFetch).list(input);
+        const result = await makeScanHistory(env, now, analysisFetch).list(input);
         send(200, { requestId, ...result }); return;
       }
       if (Object.keys(input).some(k => !["symbol", "style"].includes(k)) || typeof input.symbol !== "string" ||
@@ -192,7 +187,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       timer = setTimeout(() => cancel("request_deadline"), config.requestTimeoutMs); timer.unref();
       const result = await analyze(config, getMarket(config), trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
       let orderPermit: string | undefined;
-      if ((env.SIGNAL_ORDER_MODE === "demo" || env.SIGNAL_ORDER_MODE === "live") &&
+      if (result.decisionSource === "deterministic" && (env.SIGNAL_ORDER_MODE === "demo" || env.SIGNAL_ORDER_MODE === "live") &&
           result.symbol === "BTCUSDT" && result.opportunity.direction && (result.status === "candidate" || result.status === "watch")) {
         try {
           const settings = ordersConfig();

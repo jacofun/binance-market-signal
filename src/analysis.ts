@@ -17,7 +17,7 @@ interface DecisionReason { code: DecisionCode; message: string }
 
 export async function analyze(config: Config, provider: MarketDataProvider, symbol: string, style: Style, signal: AbortSignal,
   model: Model = analyzeWithModel, now: () => number = Date.now, onStage: (stage: AnalysisStage) => void = () => {},
-  onSnapshot?: (snapshot: Snapshot, signal: AbortSignal) => Promise<void>) {
+  onSnapshot?: (snapshot: Snapshot, signal: AbortSignal) => void | Promise<void>) {
   const start = now();
   onStage("market_snapshot");
   const snapshot = await provider.snapshot(symbol, signal);
@@ -89,6 +89,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
       verificationMs: end - modelEnd, totalMs: end - start },
     model: { name: config.useDeterministicModels ? "m1-m2" : config.model,
       promptVersion: config.useDeterministicModels ? DETERMINISTIC_VERSION : RESEARCH_PROMPT_VERSION, ...result.usage }, codeVersion: SOURCE_COMMIT,
-    notes: ["候选研究结果，触发条件须人工确认；不自动下单。", "盈亏比按入场区间不利端估算，未计手续费、滑点和资金费。"],
+    notes: [config.useDeterministicModels ? "手动交易须复核价格并确认委托。" : "百炼结果用于研究比较。",
+      "盈亏比按入场区间不利端估算，未计手续费、滑点和资金费。"],
   };
 }
