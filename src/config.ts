@@ -10,7 +10,7 @@ function integer(env: Env, name: string, fallback: number, min: number, max: num
   }
   return parsed;
 }
-export function loadConfig(env: Env) {
+function loadLlmConfig(env: Env) {
   const key = env.DASHSCOPE_API_KEY?.trim();
   const model = env.DASHSCOPE_MODEL?.trim() || "qwen-plus";
   if (!key || /\s/.test(key) || !/^[A-Za-z0-9_./-]{1,128}$/.test(model)) {
@@ -25,6 +25,19 @@ export function loadConfig(env: Env) {
       endpoint.pathname.replace(/\/$/, "") !== "/compatible-mode/v1") throw new Error();
     endpoint.pathname = "/compatible-mode/v1/chat/completions";
   } catch { throw new AppError("INVALID_CONFIGURATION", "DASHSCOPE_BASE_URL 必须为百炼 HTTPS 兼容接口的 /compatible-mode/v1 地址。", 503); }
+  const responseFormat = env.DASHSCOPE_RESPONSE_FORMAT?.trim() || "json_object";
+  const enableThinking = env.DASHSCOPE_ENABLE_THINKING?.trim() || "false";
+  if (!["json_object", "json_schema"].includes(responseFormat) || !["false", "omit"].includes(enableThinking)) {
+    throw new AppError("INVALID_CONFIGURATION", "DASHSCOPE_RESPONSE_FORMAT 只支持 json_object/json_schema，DASHSCOPE_ENABLE_THINKING 只支持 false/omit。", 503);
+  }
+  return { apiKey: key, model, endpoint: endpoint.href, responseFormat, enableThinking,
+    modelTimeoutMs: integer(env, "DASHSCOPE_TIMEOUT_MS", 45000, 1000, 90000),
+    maxTokens: integer(env, "DASHSCOPE_MAX_TOKENS", model === "kimi-k3.1-pro" ? 4096 : 2000, 512, 4096) };
+}
+
+export function loadConfig(env: Env) {
+  const useDeterministicModels = env.USE_DETERMINISTIC_MODELS?.trim() === "true";
+  const engine = useDeterministicModels ? { useDeterministicModels } : { useDeterministicModels, ...loadLlmConfig(env) };
   const symbols = (env.SIGNAL_ALLOWED_SYMBOLS || "BTCUSDT").split(",").map(v => v.trim());
   if (!symbols.length || symbols.length > 4 || new Set(symbols).size !== symbols.length || symbols.some(s => !/^[A-Z0-9]{3,24}USDT$/.test(s))) {
     throw new AppError("INVALID_CONFIGURATION", "SIGNAL_ALLOWED_SYMBOLS 必须为最多四个不同的 USDT 合约交易对。", 503);
@@ -35,22 +48,16 @@ export function loadConfig(env: Env) {
   if (mode === "websocket" && env.CONTINUOUS_WORKER !== "true") {
     throw new AppError("INVALID_CONFIGURATION", "WebSocket 模式须在常驻服务中显式配置 CONTINUOUS_WORKER=true；FC 默认使用 rest。", 503);
   }
-  const responseFormat = env.DASHSCOPE_RESPONSE_FORMAT?.trim() || "json_object";
-  const enableThinking = env.DASHSCOPE_ENABLE_THINKING?.trim() || "false";
-  if (!["json_object", "json_schema"].includes(responseFormat) || !["false", "omit"].includes(enableThinking)) {
-    throw new AppError("INVALID_CONFIGURATION", "DASHSCOPE_RESPONSE_FORMAT 只支持 json_object/json_schema，DASHSCOPE_ENABLE_THINKING 只支持 false/omit。", 503);
-  }
   return {
-    apiKey: key, model, endpoint: endpoint.href, symbols, mode,
+    ...engine, symbols, mode,
     binanceTimeoutMs: integer(env, "BINANCE_TIMEOUT_MS", 8000, 1000, 15000),
-    modelTimeoutMs: integer(env, "DASHSCOPE_TIMEOUT_MS", 45000, 1000, 90000),
     requestTimeoutMs: integer(env, "SIGNAL_REQUEST_TIMEOUT_MS", 65000, 5000, 110000),
-    maxTokens: integer(env, "DASHSCOPE_MAX_TOKENS", model === "kimi-k3.1-pro" ? 4096 : 2000, 512, 4096),
     maxPriceAgeMs: integer(env, "SIGNAL_MAX_PRICE_AGE_MS", 5000, 1000, 15000),
     maxAnalysisAgeMs: integer(env, "SIGNAL_MAX_ANALYSIS_AGE_MS", 60000, 5000, 110000),
     maxPriceDriftBps: integer(env, "SIGNAL_MAX_PRICE_DRIFT_BPS", 30, 1, 500),
     cooldownMs: integer(env, "SIGNAL_COOLDOWN_SECONDS", 10, 0, 300) * 1000,
-    responseFormat, enableThinking, useM1Trigger: env.USE_M1_TRIGGER?.trim() === "true",
+    useM1Trigger: env.USE_M1_TRIGGER?.trim() === "true",
   };
 }
 export type Config = ReturnType<typeof loadConfig>;
+export type LlmConfig = Extract<Config, { useDeterministicModels: false }>;

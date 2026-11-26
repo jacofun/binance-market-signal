@@ -5,7 +5,7 @@ import { makeServer } from "../build/server.js";
 import { analyzeWithModel } from "../build/model.js";
 import { loadConfig } from "../build/config.js";
 import { RestMarketDataProvider } from "../build/market.js";
-import { env, jwt, NOW, provider, modelResult, proposal, silent, snapshot } from "./fixtures.mjs";
+import { env, jwt, NOW, m2Snapshot, provider, modelResult, proposal, silent, snapshot } from "./fixtures.mjs";
 
 async function app(t, options = {}) {
   const server = makeServer({ env, now: () => NOW, logger: silent, provider: provider(), model: async () => modelResult(), ...options });
@@ -68,6 +68,45 @@ test("enabling M1 exposes a trigger alongside the model decision on the same sna
   assert.equal(result.opportunity.triggerVerified, false);
   assert.equal(snapshots, 1);
   assert.equal(modelCalls, 1);
+});
+test("deterministic HTTP analysis needs no LLM configuration and handles every decision outcome", async t => {
+  let market = m2Snapshot();
+  let mark = 10000;
+  const { request } = await app(t, {
+    env: { USE_DETERMINISTIC_MODELS: "true", SIGNAL_COOLDOWN_SECONDS: "0", DASHSCOPE_BASE_URL: "invalid-unused-setting" },
+    provider: provider({ snapshot: async () => market, quote: async () => ({ ...market.quote, price: mark }) }),
+    model: async () => assert.fail("deterministic mode must not invoke the LLM"),
+  });
+  const candidate = await (await request()).json();
+  assert.equal(candidate.decisionSource, "deterministic");
+  assert.equal(candidate.status, "candidate");
+  assert.equal(candidate.model.name, "m1-m2");
+  assert.equal(candidate.model.inputTokens, null);
+  assert.equal(candidate.timing.modelMs, 0);
+  assert.equal(candidate.m1Trigger.triggered, true);
+  assert.deepEqual(candidate.opportunity.entry, candidate.m2Order.entryRange);
+
+  mark = 10020;
+  const requoted = await (await request()).json();
+  assert.equal(requoted.status, "watch");
+  assert.equal(requoted.decision.reasons[0].code, "quote_outside_entry");
+
+  mark = 10000;
+  market = snapshot();
+  const noOrder = await (await request()).json();
+  assert.equal(noOrder.m1Trigger.triggered, true);
+  assert.equal(noOrder.status, "watch");
+  assert.equal(noOrder.decision.reasons[0].code, "m2_no_order");
+  assert.equal(noOrder.m2Order, null);
+  assert.equal(noOrder.opportunity.entry, null);
+  assert.equal(noOrder.orderPermit, undefined);
+
+  market.frames.find(frame => frame.interval === "15m").volumeRatio20 = null;
+  const noTrigger = await (await request()).json();
+  assert.equal(noTrigger.status, "none");
+  assert.equal(noTrigger.m1Trigger.triggered, false);
+  assert.equal(noTrigger.decision.reasons[0].code, "m1_not_triggered");
+  assert.equal(noTrigger.m2Order, null);
 });
 test("shared ticket reaches analysis without FC metadata headers or JWT environment settings", async t => {
   const { request } = await app(t, { env: { DASHSCOPE_API_KEY: env.DASHSCOPE_API_KEY, SIGNAL_COOLDOWN_SECONDS: "0" } });
