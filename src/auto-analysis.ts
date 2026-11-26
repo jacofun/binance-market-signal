@@ -194,32 +194,38 @@ export async function runAutoAnalysis(evidence: ScanEvidence, store: Store, opti
       const passed = evidence.rules.filter(rule => rule.status === "passed");
       const style = evidence.trigger.kind === "structure" && passed.length === 1 ? passed[0]?.kind === "breakout" ? "trend" : "reversal" : "neutral";
       const immediate = !!options.orderBase && evidence.trigger.kind === "structure" && passed.length > 0;
-      const result = await analyze(config, market(config), evidence.symbol, style, signal, async (cfg, snapshot, focus, abort) => {
+      const reserve = async (abort?: AbortSignal | null) => {
+        stage = "quota";
+        abort?.throwIfAborted();
+        const dispatchAt = now();
+        if (dispatchAt - claim.eventAt >= 3 * minuteMs) throw new AppError("AUTO_ANALYSIS_STALE_SCAN", "异动扫描已过时。", 409);
+        const reservation = await reserveAutoAnalysisQuota(store, dispatchAt, limit, claim);
+        if (reservation !== "reserved") throw new AppError(`AUTO_ANALYSIS_${reservation.toUpperCase()}`, "本次扫描无需重复分析或额度不足。", 409);
+        quotaClaimed = true;
+        if (beijingDay(dispatchAt) !== beijingDay(now())) throw new AppError("AUTO_ANALYSIS_STALE_SCAN", "自动分析额度日期已切换。", 409);
+        abort?.throwIfAborted();
+      };
+      const result = await analyze(config, market(config), evidence.symbol, style, signal, (cfg, snapshot, focus, abort) =>
+        analyzeWithModel(cfg, snapshot, focus, abort, async (input, init) => {
+          await reserve(init?.signal);
+          stage = "model";
+          modelStarted = true;
+          return request(input, init);
+        }, evidence, immediate), now, value => { stage = value; }, async (snapshot, abort) => {
         if (evidence.trigger.kind === "structure" &&
             snapshot.frames.find(frame => frame.interval === "15m")?.lastCloseTime !== evidence.trigger.eventAt - 1) {
           throw new AppError("AUTO_ANALYSIS_STALE_SCAN", "当前分析快照已不是本次扫描的 K 线。", 409);
         }
-        return analyzeWithModel(cfg, snapshot, focus, abort, async (input, init) => {
-          stage = "quota";
-          init?.signal?.throwIfAborted();
-          const dispatchAt = now();
-          if (dispatchAt - claim.eventAt >= 3 * minuteMs) throw new AppError("AUTO_ANALYSIS_STALE_SCAN", "异动扫描已过时。", 409);
-          const reservation = await reserveAutoAnalysisQuota(store, dispatchAt, limit, claim);
-          if (reservation !== "reserved") throw new AppError(`AUTO_ANALYSIS_${reservation.toUpperCase()}`, "本次扫描无需重复分析或额度不足。", 409);
-          quotaClaimed = true;
-          if (beijingDay(dispatchAt) !== beijingDay(now())) throw new AppError("AUTO_ANALYSIS_STALE_SCAN", "自动分析额度日期已切换。", 409);
-          init?.signal?.throwIfAborted();
-          stage = "model";
-          modelStarted = true;
-          return request(input, init);
-        }, evidence, immediate);
-      }, now, value => { stage = value; });
+        if (config.useDeterministicModels) await reserve(abort);
+      });
       analysisId = result.analysisId;
       stage = "archive";
-      const model = { ...result.model, promptVersion: immediate ? AUTO_ORDER_PROMPT_VERSION : AUTO_SCAN_PROMPT_VERSION };
+      const model = config.useDeterministicModels ? result.model :
+        { ...result.model, promptVersion: immediate ? AUTO_ORDER_PROMPT_VERSION : AUTO_SCAN_PROMPT_VERSION };
       const notes = immediate ? ["同向候选通过即时委托复核后可自动提交，实际结果以订单记录为准。", ...result.notes.slice(1)] : result.notes;
       await archiveResult(history, { ...result, model, notes, requestId: evidence.scanId, scanEvidence: evidence });
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
+        decisionSource: result.decisionSource,
         modelStatus: result.decision.modelStatus, modelDirection: result.decision.modelDirection,
         decisionReasons: result.decision.reasons.map(reason => reason.code),
         ...model, elapsedMs: now() - start }));

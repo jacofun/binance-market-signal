@@ -1,9 +1,10 @@
 import { AppError, type ModelFailureDetails, type ModelOutputDetails, type ValidationDetails } from "./errors.js";
 import { boundedJson } from "./http.js";
 import { effectiveKind } from "./price-zones.js";
-import { inside, researchContext, significantObstacle, structureZones, targetObstacles, zoneUsable } from "./research.js";
+import { blockingTargetObstacle, inside, researchContext, significantObstacle, structureZones, zoneUsable } from "./research.js";
+import { onPriceGrid, tickPriceRange } from "./price-grid.js";
 import { candleRow } from "./market.js";
-import type { Config } from "./config.js";
+import type { LlmConfig } from "./config.js";
 import type { ModelDecision, ModelResult, PriceZone, Proposal, Snapshot, Style } from "./types.js";
 
 export const RESEARCH_PROMPT_VERSION = "market-research-v4-volume-timing-v8";
@@ -104,26 +105,8 @@ const zoneSummary = (zone: PriceZone) => ({
   id: zone.id, status: zone.status, lower: zone.lower, upper: zone.upper, effectiveKind: effectiveKind(zone),
 });
 
-function onPriceGrid(price: number, tickSize: number): boolean {
-  const ticks = price / tickSize;
-  return Number.isFinite(ticks) && ticks <= Number.MAX_SAFE_INTEGER / 8 &&
-    Math.abs(Math.round(ticks) - ticks) <= Math.min(0.0001, 8 * Number.EPSILON * ticks);
-}
-
 function selectablePriceRange(zone: PriceZone, tickSize: number) {
-  if (!zoneUsable(zone) || !Number.isFinite(tickSize) || tickSize <= 0) return null;
-  const [mantissa, exponent = "0"] = tickSize.toString().split("e");
-  const decimals = Math.max(0, (mantissa?.split(".")[1]?.length ?? 0) - Number(exponent));
-  if (decimals > 100) return null;
-  const priceAt = (ticks: number) => Number((ticks * tickSize).toFixed(decimals));
-  // Compare normalized prices to the original edges. The division itself
-  // can place an already valid edge just above or below its integer tick.
-  const below = Math.floor(zone.lower / tickSize);
-  const above = Math.ceil(zone.upper / tickSize);
-  const min = priceAt(priceAt(below) >= zone.lower ? below : below + 1);
-  const max = priceAt(priceAt(above) <= zone.upper ? above : above - 1);
-  return min > 0 && min <= max && inside(min, zone) && inside(max, zone) &&
-    onPriceGrid(min, tickSize) && onPriceGrid(max, tickSize) ? { min, max } : null;
+  return zoneUsable(zone) ? tickPriceRange(zone.lower, zone.upper, tickSize) : null;
 }
 
 function zoneReference(id: string | null, zone?: PriceZone): Pick<ValidationDetails, "requestedZoneId" | "zoneReference" | "zone"> {
@@ -248,8 +231,7 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
       if (!inside(target.price, zone)) reject("unsupported_target", field,
         { reason: "target_out_of_bounds", zone: zoneSummary(zone), price: target.price,
           selectablePriceRange: selectablePriceRange(zone, snapshot.tickSize) });
-      const blocker = targetObstacles(zones, p, target.price, zone.id).find(obstacle => significantObstacle(obstacle) &&
-        !p.targets.slice(0, i).some(earlier => inside(earlier.price, obstacle)));
+      const blocker = blockingTargetObstacle(zones, p, target, p.targets.slice(0, i));
       if (blocker && !preserveResearchOnUnusablePlan) reject("target_obstacle", field, {
         reason: "target_skips_obstacle", zone: zoneSummary(zone), price: target.price, blockingZone: zoneSummary(blocker),
       });
@@ -279,7 +261,7 @@ export function evaluateProposal(raw: unknown, snapshot: Snapshot, preserveResea
   return { proposal: p, decision };
 }
 
-export async function analyzeWithModel(config: Config, snapshot: Snapshot, style: Style, signal: AbortSignal,
+export async function analyzeWithModel(config: LlmConfig, snapshot: Snapshot, style: Style, signal: AbortSignal,
   request: typeof fetch = fetch, scanEvidence?: import("./market-scanner.js").ScanEvidence, immediate = false): Promise<ModelResult> {
   const schema = schemaForSnapshot(snapshot);
   const context = researchContext(snapshot);

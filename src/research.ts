@@ -15,7 +15,9 @@ export const hourlyAtr = (snapshot: Snapshot) => snapshot.frames.find(f => f.int
 export const inside = (price: number, zone: PriceZone) => price >= zone.lower && price <= zone.upper;
 export const zoneUsable = (zone: PriceZone) => zone.status !== "broken";
 
-export function targetObstacles(zones: PriceZone[], p: Proposal, target: number, targetZoneId: string) {
+type TargetContext = Pick<Proposal, "direction" | "entry"> & { research: Pick<Proposal["research"], "entryZoneId"> };
+
+export function targetObstacles(zones: PriceZone[], p: TargetContext, target: number, targetZoneId: string) {
   if (!p.direction || !p.entry) return [];
   const long = p.direction === "long";
   const targetZone = zones.find(z => z.id === targetZoneId);
@@ -28,6 +30,12 @@ export function targetObstacles(zones: PriceZone[], p: Proposal, target: number,
 }
 
 export const significantObstacle = (zone: PriceZone) => zone.touches >= 2 || zone.interval === "4h";
+
+export function blockingTargetObstacle(zones: PriceZone[], plan: TargetContext, target: { price: number; zoneId: string },
+  earlierTargets: readonly { price: number }[]) {
+  return targetObstacles(zones, plan, target.price, target.zoneId).find(obstacle =>
+    significantObstacle(obstacle) && !earlierTargets.some(earlier => inside(earlier.price, obstacle)));
+}
 
 export function assessResearch(snapshot: Snapshot, p: Proposal) {
   const context = researchContext(snapshot);
