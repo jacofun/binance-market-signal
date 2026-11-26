@@ -4,7 +4,7 @@ import test from "node:test";
 import { autoAnalysisLimit, reserveAutoAnalysisQuota } from "../build/auto-analysis.js";
 import { INTERVAL_MS, parseCandles } from "../build/market.js";
 import { makeServer } from "../build/server.js";
-import { env, jwt, klines, marketFetch, NOW, proposal, provider, quote, snapshot } from "./fixtures.mjs";
+import { env, jwt, klines, m2Snapshot, marketFetch, NOW, proposal, provider, quote, snapshot } from "./fixtures.mjs";
 
 const period = INTERVAL_MS["15m"];
 const storage = "/private/market-signal-scanner/v1/BTCUSDT/auto-analysis";
@@ -142,7 +142,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
   const market = provider({
     snapshot: async () => {
       if (state.invalidMarket) throw Error("simulated unavailable market");
-      const current = snapshot();
+      const current = state.deterministic ? m2Snapshot() : snapshot();
       current.asOf = state.now;
       current.quote.time = state.now;
       if (state.proposal?.direction === "short") current.frames[1].zones.push({
@@ -159,9 +159,12 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     env: { ...env, DASHSCOPE_MODEL: "kimi-k3.1-pro", OSS_BUCKET: "auto-analysis-test", OSS_REGION: "cn-hangzhou",
       ACCESS_KEY_ID: "test-oss-id", ACCESS_KEY_SECRET: "test-oss-secret-key", SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT: limit,
       USE_M1_TRIGGER: state.m1 ? "true" : undefined,
+      USE_DETERMINISTIC_MODELS: state.deterministic ? "true" : undefined,
+      DASHSCOPE_API_KEY: state.deterministic ? undefined : env.DASHSCOPE_API_KEY,
       SIGNAL_AUTO_ORDER_EXECUTE: state.autoOrder ? "true" : undefined,
       SIGNAL_MAX_ANALYSIS_AGE_MS: state.modelElapsed ? "100000" : undefined,
       SIGNAL_ORDER_EXECUTE: state.execution ? "true" : undefined, SIGNAL_ORDER_MODE: "demo", BINANCE_BASE_URL: `https://${demoHost}`,
+      SIGNAL_ORDER_MAX_RISK_USDT: state.maxRisk,
       BINANCE_API_KEY: "test-binance-apikey", BINANCE_API_SECRET: "test-binance-secret" },
     now: () => state.now, provider: state.realMarket ? undefined : market, scannerFetch, orderFetch,
     logger: { info: line => logs.push(JSON.parse(line)), error: line => logs.push(JSON.parse(line)) },
@@ -231,6 +234,41 @@ test("a qualified timer sends one protected IOC, archives the decision and suppo
   assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
   assert.equal(app.requests.length, 1);
   assert.equal(app.submissions.length, 3);
+});
+
+test("automatic deterministic analyses preserve quota, stale checks and the existing protected order path", async t => {
+  const app = await testServer(t, "1", { now: NOW + 5000, deterministic: true, autoOrder: true, execution: true, stale: true });
+  await app.recover();
+  assert.equal((await app.invoke()).autoAnalysis.status, "stale");
+  app.state.stale = false;
+  const { autoAnalysis } = await app.invoke();
+  assert.equal(autoAnalysis.status, "completed");
+  assert.equal(autoAnalysis.order.status, "accepted");
+  assert.equal(autoAnalysis.order.protection, "active");
+  const saved = JSON.parse(app.objects.get(`${archive}/records/${autoAnalysis.analysisId}.json`));
+  assert.equal(saved.decisionSource, "deterministic");
+  assert.equal(saved.model.promptVersion, "deterministic-m1-m2-v1");
+  assert.equal(saved.status, "candidate");
+  assert.equal(app.submissions[0].timeInForce, "IOC");
+  assert.deepEqual(app.submissions.slice(1).map(order => [order.type, Number(order.triggerPrice)]), [
+    ["STOP_MARKET", saved.m2Order.stopLoss], ["TAKE_PROFIT_MARKET", saved.m2Order.takeProfits[0].price],
+  ]);
+  assert.equal((await app.invoke()).autoAnalysis.status, "duplicate");
+  app.state.now += period;
+  assert.equal((await app.invoke()).autoAnalysis.status, "daily_limit");
+  assert.equal(app.requests.length, 0);
+  assert.equal(app.submissions.length, 3);
+});
+
+test("automatic M2 candidate cannot bypass the existing execution risk limit", async t => {
+  const app = await testServer(t, "1", { now: NOW + 5000, deterministic: true, autoOrder: true, execution: true, maxRisk: "0.01" });
+  await app.recover();
+  const { autoAnalysis } = await app.invoke();
+  const saved = JSON.parse(app.objects.get(`${archive}/records/${autoAnalysis.analysisId}.json`));
+  assert.equal(saved.status, "candidate");
+  assert.deepEqual(autoAnalysis.order, { status: "failed", code: "ORDER_RULE_CHANGED" });
+  assert.equal(app.submissions.length, 0);
+  assert.equal(app.requests.length, 0);
 });
 
 test("auto ordering is gated by the two switches, market eligibility, heartbeat and deadline", async t => {

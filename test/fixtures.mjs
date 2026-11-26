@@ -24,6 +24,12 @@ export const snapshot = () => ({
     historicalRanges: { 4: {}, 12: {}, 24: {} },
   })),
 });
+export function m2Snapshot() {
+  const market = snapshot();
+  const hourly = market.frames.find(frame => frame.interval === "1h");
+  hourly.zones = hourly.zones.filter(zone => zone.id !== "short-stop");
+  return market;
+}
 export const proposal = (delta = {}) => {
   const direction = Object.hasOwn(delta, "direction") ? delta.direction : "long";
   return { status: "candidate", direction, title: "趋势候选", summary: "等待本人确认触发条件",

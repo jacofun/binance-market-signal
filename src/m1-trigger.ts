@@ -18,7 +18,15 @@ export interface M1Result {
   triggered: boolean;
   score: number;
   reasons: string[];
-  keyFeatures: Record<string, unknown>;
+  keyFeatures: Record<string, unknown> & {
+    asOf: number;
+    style: Style;
+    lastCloseTime?: number;
+    marketState?: "trend" | "range" | "transition";
+    setup?: Setup | null;
+    direction?: Direction | null;
+    zone?: ReturnType<typeof nearestZone>;
+  };
   confidence: "high" | "medium" | "low";
 }
 
