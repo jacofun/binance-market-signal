@@ -216,7 +216,8 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     const option = orderOption(draft?.option.kind ?? "limit", plan, quote, rules, config, !draft);
     if (!supportsExits(rules) || typeof option === "string" ||
       draft && (option.stopLossPrice !== draft.option.stopLossPrice || option.takeProfitPrice !== draft.option.takeProfitPrice)) {
-      throw new AppError("ORDER_RULE_CHANGED", typeof option === "string" ? option : "止盈或止损未通过复核。", 409);
+      throw new AppError("ORDER_RULE_CHANGED", typeof option === "string" ? option :
+        !supportsExits(rules) ? "交易所当前未开放所需的止损或止盈委托类型。" : "止盈或止损未通过复核。", 409);
     }
     if (draft && (option.kind === "market" ? Math.abs(Number(option.price) - Number(draft.option.price)) / Number(draft.option.price) > 0.003 :
       option.price !== draft.option.price || option.triggerPrice !== draft.option.triggerPrice)) {

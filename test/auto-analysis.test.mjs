@@ -163,7 +163,9 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     const iat = Math.floor(state.now / 1000);
     return { "X-JWT-Token": jwt({ iat, exp: iat + 120, scope }) };
   };
-  return { state, objects, marketCalls, submissions, logs, post, timer, invoke, ticket, protection,
+  const execution = async (analysis, requestedScanId = analysis.requestId, scope = "trading:sync") =>
+    post("/scans", { action: "execution", analysisId: analysis.analysisId, scanId: requestedScanId }, ticket(scope));
+  return { state, objects, marketCalls, submissions, logs, post, timer, invoke, ticket, protection, execution,
     recover: () => timer("market-order-protection"),
     decision: id => JSON.parse(objects.get(`${tradeLogs}/decisions/${id}.json`)),
     outcome: (id, phase = "analysis") => JSON.parse(objects.get(`${tradeLogs}/outcomes/${id}/${phase}.json`)),
@@ -242,6 +244,10 @@ test("M1 runs on each close, no-signal slots do not use quota, and a failed M2 s
   assert.equal(watch.status, "completed", JSON.stringify({ watch, logs: app.logs }));
   assert.equal(app.saved(watch.analysisId).status, "watch");
   assert.equal(app.saved(watch.analysisId).m2Order, null);
+  const reason = app.saved(watch.analysisId).decision.reasons[0];
+  assert.equal(reason.code, "m2_no_order");
+  assert.match(reason.message, /^M2 未生成方案。.+/);
+  assert.equal((await app.post("/scans", { version: 4 }, app.ticket())).data.records[0].decisionReason, reason.message);
   app.state.now += period;
   app.state.noOrder = false;
   const capped = await app.invoke();
@@ -320,6 +326,12 @@ test("zero-fill IOC is expired and trade log outages do not block execution", as
   await app.recover();
   const expired = await app.invoke();
   assert.equal(app.outcome(expired.analysisId, "terminal").finalStatus, "expired");
+  const report = (await app.execution(expired)).data.execution;
+  assert.equal(report.state, "unfilled");
+  assert.equal(report.exchangeStatus, "EXPIRED");
+  assert.equal(report.executedQty, "0");
+  assert.equal((await app.execution(expired, scanId)).http, 404);
+  assert.equal((await app.execution(expired, expired.requestId, "trading:orders:read")).http, 401);
   app.state.now += period;
   app.state.rejectTradeLogs = true;
   app.state.entryStatus = "FILLED";
@@ -342,6 +354,10 @@ test("protected execution still enforces recovery, price risk and both order swi
     assert.equal(result.status, "completed");
     assert.equal(result.order.code, code);
     assert.equal(app.outcome(result.analysisId).finalStatus, "not_executed");
+    const report = (await app.execution(result)).data.execution;
+    assert.equal(report.state, "blocked");
+    assert.equal(report.reasonCode, code);
+    if (code === "ORDER_RULE_CHANGED") assert.match(report.message, /超过配置上限 0\.01 USDT/);
     assert.deepEqual(app.submissions, []);
   }
 });

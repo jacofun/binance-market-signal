@@ -3,12 +3,12 @@ import { loadConfig, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
 import { closedCandleBoundary, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { legacyOutcomePath, makeLegacyScanStore } from "./scan-history.js";
-import { autoOrderBase, loadOrderConfig, makeOrderPermit } from "./order-auth.js";
+import { autoOrderBase, loadOrderConfig, makeOrderPermit, object } from "./order-auth.js";
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadAnalysisArchiveConfig, loadOssConfig } from "./oss-config.js";
-import { makeTradeResultLog } from "./trade-result-log.js";
+import { makeTradeResultLog, readAutomaticExecution } from "./trade-result-log.js";
 import type { Snapshot, Trend, TriggerInterval } from "./types.js";
 
 export const AUTO_ANALYSIS_TRIGGER = "binance-market-analysis";
@@ -110,6 +110,15 @@ export async function readLinkedAnalysisArchive(env: Env, now: () => number, req
   return result;
 }
 
+export async function readLinkedExecution(env: Env, now: () => number, request: typeof fetch, scanId: string, analysisId: string) {
+  const store = historyStore(env, now, request);
+  const archive = await readArchivedAnalysis(store, analysisId);
+  if (!isAutomaticRecord(archive, scanId, analysisId) || archive?.status !== "candidate") {
+    throw new AppError("SIGNAL_NOT_FOUND", "未找到与这次扫描匹配的候选方案。", 404);
+  }
+  return readAutomaticExecution(store, analysisId);
+}
+
 async function readArchivedAnalysis(store: Store, analysisId: string) {
   return await store.read(`records/${analysisId}.json`, 512 * 1024) as
     (Record<string, unknown> & { orderPermit?: unknown; automaticAnalysis?: { candleClosedAt?: unknown } }) | null;
@@ -152,7 +161,10 @@ export async function attachAutomaticScanArchive(env: Env, now: () => number, re
   const opportunityStatus = saved?.status;
   if (!isAutomaticRecord(saved, row.id, analysisId, row.candleClosedAt) ||
     (opportunityStatus !== "candidate" && opportunityStatus !== "watch" && opportunityStatus !== "none" && opportunityStatus !== "expired")) return row;
-  return { ...row, analysisId, opportunityStatus };
+  const reasons = object(saved?.decision) ? saved.decision.reasons : undefined;
+  const primary = Array.isArray(reasons) ? reasons[0] : undefined;
+  const decisionReason = object(primary) && typeof primary.message === "string" && primary.message.length <= 240 ? primary.message : undefined;
+  return { ...row, analysisId, opportunityStatus, ...(decisionReason ? { decisionReason } : {}) };
 }
 
 async function archiveResult(store: Store, result: Awaited<ReturnType<typeof analyze>> & {
@@ -189,9 +201,9 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
   const tradeResults = makeTradeResultLog(env, now, request, requestId, event => logger.error(JSON.stringify(event)));
 
   async function placeOrder(result: Awaited<ReturnType<typeof analyze>>, orderBase?: string) {
-    if (env.SIGNAL_ORDER_EXECUTE !== "true") return { status: "skipped", code: "ORDER_EXECUTION_DISABLED" };
+    if (env.SIGNAL_ORDER_EXECUTE !== "true") return { status: "skipped" as const, code: "ORDER_EXECUTION_DISABLED" };
     const plan = result.status === "candidate" && makeOrderPermit(result, "owner", now());
-    if (!plan) return { status: "skipped", code: result.status === "candidate" ? "ORDER_DRAFT_EXPIRED" : "AUTO_ORDER_NOT_CANDIDATE" };
+    if (!plan) return { status: "skipped" as const, code: result.status === "candidate" ? "ORDER_DRAFT_EXPIRED" : "AUTO_ORDER_NOT_CANDIDATE" };
     try {
       const settings = loadOrderConfig(env);
       if (settings.base !== orderBase) throw new AppError("AUTO_ORDER_MARKET_MISMATCH", "行情和下单端点不一致。", 409);
@@ -207,7 +219,9 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       logger.error(JSON.stringify({ event: "market_auto_order_failed", ...ids, analysisId,
         code: safe.code, httpStatus: safe.status, configurationField: original?.configurationField,
         ...original?.upstream, exception: exceptionChain(error) }));
-      return { status: "failed", code: safe.code };
+      const upstreamCode = original?.upstream && "upstreamCode" in original.upstream ? Number(original.upstream.upstreamCode) : NaN;
+      return { status: "failed" as const, code: safe.code, message: safe.message,
+        ...(Number.isSafeInteger(upstreamCode) && upstreamCode < 0 ? { exchangeCode: upstreamCode } : {}) };
     }
   }
 
@@ -275,7 +289,8 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       if (order.status === "failed" || order.status === "skipped") {
         const finalStatus = result.status === "expired" || order.code === "ORDER_DRAFT_EXPIRED" ? "expired" :
           order.status === "skipped" || preflightFailures.has(order.code) ? "not_executed" : null;
-        await tradeResults.logOutcome(analysisId, "analysis", { finalStatus, reason: order.code });
+        await tradeResults.logOutcome(analysisId, "analysis", { finalStatus, reason: order.code,
+          ...(order.status === "failed" ? { message: order.message, exchangeCode: order.exchangeCode } : {}) });
       }
       return { status: "completed", candleClosedAt, analysisId, order };
     } finally {
