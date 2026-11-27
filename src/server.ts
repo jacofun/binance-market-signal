@@ -14,7 +14,8 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeScanHistory } from "./scan-history.js";
-import { analysisIdPattern, AUTO_ANALYSIS_TRIGGER, readLegacyAnalysisArchive, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
+import { analysisIdPattern, attachAutomaticScanArchive, AUTO_ANALYSIS_TRIGGER, readAutomaticScanRows,
+  readLinkedAnalysisArchive, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -163,10 +164,13 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
             throw new AppError("INVALID_REQUEST", "分析编号或扫描编号无效。", 400);
           }
           archiveId = analysisId;
-          const result = await readLegacyAnalysisArchive(env, now, analysisFetch, scanId, analysisId);
+          const result = await readLinkedAnalysisArchive(env, now, analysisFetch, scanId, analysisId);
           send(200, { requestId, result }); return;
         }
-        const result = await makeScanHistory(env, now, analysisFetch).list(input);
+        const result = await makeScanHistory(env, now, analysisFetch, {
+          read: (from, to) => readAutomaticScanRows(env, now, analysisFetch, from, to),
+          attachArchive: row => attachAutomaticScanArchive(env, now, analysisFetch, row),
+        }).list(input);
         send(200, { requestId, ...result }); return;
       }
       if (Object.keys(input).some(k => !["symbol", "style"].includes(k)) || typeof input.symbol !== "string" ||

@@ -239,10 +239,10 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 | OSS 路径 | 用途与权限 |
 | --- | --- |
 | `private/market-signal-auto-analysis/v1/BTCUSDT/slots/<北京时间日期>.ndjson` | 定时分析去重和每日额度，需 `oss:GetObject` 和 `oss:PutObject`。Bucket 策略须允许追加对象。 |
-| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | M1 触发后写入网站分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。根目录默认 `/private`。 |
+| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | M1 触发后写入网站分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。扫描列表核对关联归档及读取详情需要 `records/` 的 `oss:GetObject`。根目录默认 `/private`。 |
 | `private/market-signal-scanner/v1/` | 历史扫描及旧分析关联，只读，需 `oss:GetObject`。原 `POST /scans` 和关联归档读取接口继续可用。 |
 
-归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。新定时结果在网站分析历史和 FC 日志中查看，历史扫描页面保留旧记录。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
+归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。网站的自动扫描面板用 `POST /scans` 的 `version: 3` 按时间合并 M1 评估与旧扫描记录。此前只保存了收盘时间和状态的 M1 记录仍可显示这两项，后续记录附带评分、量比、趋势及可读取的分析归档。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
 
 ### 自动委托
 

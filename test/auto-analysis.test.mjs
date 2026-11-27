@@ -309,3 +309,33 @@ test("legacy scan rows and linked analyses remain readable to the existing owner
   assert.equal((await app.post("/scans", { ...query, analysisId: scanId }, app.ticket())).http, 404);
   assert.deepEqual(app.marketCalls, []);
 });
+
+test("scan history v3 includes REST M1 runs, pre-upgrade slots and linked archives", async t => {
+  const app = await testServer(t, "1");
+  const oldSlot = NOW - period;
+  app.objects.set(`${storage}/2026-11-18.ndjson`, JSON.stringify({ closedAt: oldSlot, status: "no_trigger" }) + "\n");
+  const recent = await app.invoke();
+  assert.equal(recent.status, "completed");
+  const hour = Math.floor(NOW / 3600000) * 3600000;
+  const oldScan = { id: scanId, time: NOW + 1000, status: "error" };
+  app.objects.set(`${legacy}/runs/${hour}.ndjson`, JSON.stringify(oldScan) + "\n");
+  const v2 = (await app.post("/scans", { version: 2 }, app.ticket())).data;
+  assert.deepEqual(v2.records, [oldScan]);
+  const query = () => app.post("/scans", { version: 3 }, app.ticket());
+  const { http, data } = await query();
+  assert.equal(http, 200);
+  const [current, old, preUpgrade] = data.records;
+  assert.equal(current.kind, "deterministic");
+  assert.equal(current.status, "triggered");
+  assert.equal(current.m1.score, 100);
+  assert.equal(current.opportunityStatus, "candidate");
+  assert.equal(current.analysisId, recent.analysisId);
+  assert.deepEqual(old, oldScan);
+  assert.deepEqual(preUpgrade, { kind: "deterministic", symbol: "BTCUSDT", id: `m1-slot-${oldSlot}`,
+    time: oldSlot, scannedAt: null, candleClosedAt: oldSlot, status: "no_trigger" });
+  const lookup = { action: "analysis", scanId: current.id, analysisId: current.analysisId };
+  assert.equal((await app.post("/scans", lookup, app.ticket())).data.result.analysisId, current.analysisId);
+  assert.equal((await app.post("/scans", { ...lookup, scanId }, app.ticket())).http, 404);
+  app.objects.delete(`${archive}/records/${current.analysisId}.json`);
+  assert.equal((await query()).data.records[0].analysisId, undefined);
+});
