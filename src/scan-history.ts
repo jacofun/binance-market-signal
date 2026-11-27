@@ -25,7 +25,10 @@ const asObject = (value: unknown): Record<string, unknown> | null =>
 export const makeLegacyScanStore = (env: Env, now: () => number, request: typeof fetch) =>
   makeOrderStore({ ...loadOssConfig(env, "SCAN"), prefix: "private/market-signal-scanner/v1" }, now, request, "SCAN");
 
-export function makeScanHistory(env: Env, now: () => number, request: typeof fetch) {
+export function makeScanHistory(env: Env, now: () => number, request: typeof fetch, automatic?: {
+  read: (from: number, to: number) => Promise<unknown[]>;
+  attachArchive: (record: Record<string, unknown>) => Promise<Record<string, unknown>>;
+}) {
   const store = makeLegacyScanStore(env, now, request);
   async function listLegacy(input: Record<string, unknown>) {
     const latest = slotFor(now());
@@ -43,7 +46,7 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
 
   return {
     async list(input: Record<string, unknown>) {
-      if (input.version !== 2) return listLegacy(input);
+      if (input.version !== 2 && !(input.version === 3 && automatic)) return listLegacy(input);
       const latest = now();
       const oldest = hourFor(latest) - historyDays * 24 * hour;
       const before = typeof input.before === "string" ? cursorFormat.exec(input.before) : null;
@@ -54,6 +57,7 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
       const hours = Array.from({ length: (hourFor(to) - hourFor(from)) / hour + 1 }, (_, i) => hourFor(to) - i * hour);
       const slots = Array.from({ length: pageSize + 1 }, (_, i) => slotFor(to) - i * interval).filter(slot => slot >= from);
       const reads: (() => Promise<unknown[]>)[] = hours.map(h => () => store.readJsonLines(logKey(h), 8 * 1024 * 1024));
+      if (input.version === 3 && automatic) reads.unshift(() => automatic.read(from, to));
       for (const slot of slots) reads.push(async () => {
         const row = asObject(await store.read(legacyKey(slot)));
         return row ? [{ ...row, time: slot, id: `legacy-${slot}`, scannedAt: null,
@@ -70,6 +74,12 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
       const last = visible.at(-1);
       const hasMore = rows.length > pageSize && last;
       const records = await limited(visible.map(({ record, id }) => async () => {
+        if (record.kind === "deterministic" && automatic) {
+          return automatic.attachArchive(record).catch(() => {
+            const { analysisId: _unverified, ...row } = record;
+            return row;
+          });
+        }
         if (asObject(record.autoAnalysis)?.status !== "pending") return record;
         // A failed status lookup must not hide the saved scan.
         const outcome = await store.read(legacyOutcomePath(id)).catch(() => null);
