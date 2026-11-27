@@ -123,6 +123,27 @@ class DeployTests(unittest.TestCase):
              patch.object(client, "list_custom_domains", side_effect=AssertionError("Read domain policy"), create=True):
             self.assertEqual(module.deploy(client, self.target, b"zip", sleep=lambda _: None)["health"], "ok")
 
+    def test_analysis_timer_update_preserves_payload_and_enabled_state(self):
+        for enabled in (True, False):
+            before = {"cronExpression": "5 */15 * * * *", "payload": "custom", "enable": enabled}
+            after = {**before, "cronExpression": "5 */5 * * * *"}
+            client = SimpleNamespace()
+            responses = [SimpleNamespace(body=SimpleNamespace(trigger_type="timer", trigger_config=json.dumps(config)))
+                         for config in (before, after)]
+            with patch.object(client, "get_trigger", side_effect=responses, create=True) as get, \
+                 patch.object(client, "update_trigger", create=True) as update:
+                self.assertEqual(module.sync_analysis_schedule(client, self.target), "verified" if enabled else "trigger_disabled")
+                get.assert_called_with("binance-market-signal", "binance-market-analysis")
+                update.assert_called_once()
+                self.assertEqual(json.loads(update.call_args.args[2].body.trigger_config), after)
+
+    def test_analysis_timer_read_denial_leaves_trigger_untouched(self):
+        client = SimpleNamespace()
+        with patch.object(client, "get_trigger", side_effect=PermissionError, create=True), \
+             patch.object(client, "update_trigger", create=True) as update:
+            self.assertEqual(module.sync_analysis_schedule(client, self.target), "unverified_PermissionError")
+            update.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,9 +2,10 @@ import type { M1Result } from "./m1-trigger.js";
 import { tickPriceRange } from "./price-grid.js";
 import { distanceToZone, effectiveKind } from "./price-zones.js";
 import { blockingTargetObstacle, structureZones, zoneUsable } from "./research.js";
-import type { Proposal, Snapshot, Style } from "./types.js";
+import type { Proposal, Snapshot, Style, TriggerInterval } from "./types.js";
 
 export const DETERMINISTIC_VERSION = "deterministic-m1-m2-v1";
+export const DETERMINISTIC_5M_VERSION = "deterministic-m1-m2-v2-5m";
 const thresholds = {
   entryHalfWidthAtr: 0.15,
   maxEntryDistanceAtr: 0.5,
@@ -25,7 +26,7 @@ export interface M2Order {
   riskReward: number;
   reasons: string[];
   keyFeatures: {
-    style: Style; asOf: number; markPrice: number; tickSize: number; atr15m: number; rvol20: number;
+    style: Style; asOf: number; markPrice: number; tickSize: number; atr15m: number; rvol20: number; triggerInterval: TriggerInterval;
     entryZoneId: string; stopZoneId: string; worstEntryPrice: number; riskDistance: number;
   };
 }
@@ -34,11 +35,14 @@ export function generateM2Order(snapshot: Snapshot, m1Result: M1Result, style?: 
   const signal = m1Result.keyFeatures;
   const { direction } = signal;
   const short = snapshot.frames.find(frame => frame.interval === "15m");
+  const triggerFrame = snapshot.triggerFrame ?? short;
+  const triggerInterval = snapshot.triggerFrame?.interval ?? "15m";
   if (m1Result.triggered !== true || !direction || !signal.setup || !signal.zone || !short ||
-    signal.asOf !== snapshot.asOf || signal.lastCloseTime !== short.lastCloseTime ||
+    !triggerFrame || signal.asOf !== snapshot.asOf || (signal.triggerInterval ?? "15m") !== triggerInterval ||
+    signal.lastCloseTime !== triggerFrame.lastCloseTime ||
     (style !== undefined && style !== signal.style)) return null;
   const { atr14: atr } = short;
-  const rvol20 = short.volumePrice.at(-1)?.volumeRatio20;
+  const rvol20 = triggerFrame.volumePrice.at(-1)?.volumeRatio20;
   const { tickSize } = snapshot;
   const markPrice = snapshot.quote.price;
   if (!Number.isFinite(atr) || atr <= 0 || rvol20 == null || !Number.isFinite(rvol20) ||
@@ -95,7 +99,7 @@ export function generateM2Order(snapshot: Snapshot, m1Result: M1Result, style?: 
   return {
     direction, entryRange, stopLoss, takeProfits, riskReward: first.rMultiple,
     reasons: ["m1_triggered", "entry_in_confirmed_zone", "stop_beyond_zone", "targets_at_confirmed_zones"],
-    keyFeatures: { style: signal.style, asOf: snapshot.asOf, markPrice, tickSize, atr15m: atr, rvol20,
+    keyFeatures: { style: signal.style, asOf: snapshot.asOf, markPrice, tickSize, atr15m: atr, rvol20, triggerInterval,
       entryZoneId: zone.id, stopZoneId: zone.id, worstEntryPrice, riskDistance },
   };
 }
@@ -128,9 +132,9 @@ export function deterministicProposal(snapshot: Snapshot, trigger: M1Result, ord
     summary: `${title}。M1 得分 ${trigger.score}，首个结构目标对应 ${order.riskReward.toFixed(2)}R。`,
     entry: entryRange, stopLoss,
     targets: takeProfits.map(({ price, zoneId }) => ({ price, zoneId, reason: "对向确认区域的近端可用价位。" })),
-    triggerConditions: [`M1 已使用 15m 收盘证据触发，入场前复核标记价格位于 ${entryRange.min}–${entryRange.max}。`],
+    triggerConditions: [`M1 已使用 ${keyFeatures.triggerInterval} 收盘证据触发，入场前复核标记价格位于 ${entryRange.min}–${entryRange.max}。`],
     invalidationConditions: [`【未入场失效】标记价格触及止损价 ${stopLoss} 或越过首个目标。`, "【持仓提前退出】按原定结构止损及目标复核。"],
-    evidence: [{ metric: "15m.volumePrice", reason: `最新收盘量比为 ${keyFeatures.rvol20.toFixed(2)}。` },
+    evidence: [{ metric: `${keyFeatures.triggerInterval}.volumePrice`, reason: `最新收盘量比为 ${keyFeatures.rvol20.toFixed(2)}。` },
       { metric: keyFeatures.entryZoneId, reason: "同向确认区域提供入场与结构失效参考。" }],
     counterarguments: [risk], validForSeconds: thresholds.validForSeconds, research,
   };

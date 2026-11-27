@@ -40,6 +40,8 @@ def target_from_yaml(path):
             raise ValueError()
         if props["timeout"] != 120 or props["cpu"] != 0.35 or props["memorySize"] != 512 or props["diskSize"] != 10240:
             raise ValueError()
+        if not re.fullmatch(r"(?:[0-9]|[1-5][0-9]) \*/(?:[1-9]|[1-5][0-9]) \* \* \* \*", props["analysisCron"]):
+            raise ValueError()
         return props
     except (KeyError, TypeError, ValueError, AttributeError):
         raise DeployError("s.yaml deployment target is invalid.") from None
@@ -208,6 +210,30 @@ def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
     raise DeployError("FC deployment readback timed out; inspect the FC console before retrying.")
 
 
+def sync_analysis_schedule(client, target):
+    name = target["functionName"]
+    trigger = "binance-market-analysis"
+    try:
+        current = client.get_trigger(name, trigger).body
+        if current.trigger_type != "timer":
+            return "unexpected_trigger_type"
+        config = json.loads(current.trigger_config)
+        if not isinstance(config, dict) or not isinstance(config.get("cronExpression"), str) or type(config.get("enable")) is not bool:
+            return "unrecognized_trigger_config"
+        if config["cronExpression"] != target["analysisCron"]:
+            config["cronExpression"] = target["analysisCron"]
+            client.update_trigger(name, trigger, models.UpdateTriggerRequest(
+                body=models.UpdateTriggerInput(trigger_config=json.dumps(config))))
+            updated = client.get_trigger(name, trigger).body
+            if updated.trigger_type != "timer" or json.loads(updated.trigger_config) != config:
+                return "readback_mismatch"
+        return "verified" if config["enable"] else "trigger_disabled"
+    except Exception as error:
+        code = getattr(error, "code", "")
+        safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", code) else type(error).__name__
+        return f"unverified_{safe_code}"
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     target = target_from_yaml(root / "s.yaml")
@@ -224,6 +250,9 @@ def main():
     package = load_zip(root / target["code"])
     print(f"Deploying {target['functionName']} in {target['region']}; preserving environment variables, role, layers and resources.")
     result = deploy(client, target, package)
+    result["analysisSchedule"] = sync_analysis_schedule(client, target)
+    if result["analysisSchedule"] != "verified":
+        print(f"::warning title=Analysis schedule::Check binance-market-analysis in FC ({result['analysisSchedule']}).")
     (root / "dist/deploy-result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     if os.environ.get("GITHUB_STEP_SUMMARY"):

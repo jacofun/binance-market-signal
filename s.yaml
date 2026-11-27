@@ -1,4 +1,5 @@
-# CI preserves environment variables, role, layers, resources and trigger configuration.
+# CI preserves environment variables, role, layers and resources.
+# After code verification it reconciles only the existing analysis timer cadence.
 edition: 3.0.0
 name: binance-market-signal
 access: default
@@ -18,3 +19,4 @@ resources:
         args: []
         port: 9000
       code: ./dist/binance-market-signal.zip
+      analysisCron: "5 */5 * * * *"

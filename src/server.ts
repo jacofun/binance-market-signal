@@ -168,7 +168,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           send(200, { requestId, result }); return;
         }
         const result = await makeScanHistory(env, now, analysisFetch, {
-          read: (from, to) => readAutomaticScanRows(env, now, analysisFetch, from, to),
+          read: (from, to) => readAutomaticScanRows(env, now, analysisFetch, from, to, input.version === 4),
           attachArchive: row => attachAutomaticScanArchive(env, now, analysisFetch, row),
         }).list(input);
         send(200, { requestId, ...result }); return;

@@ -4,11 +4,11 @@ import { confirmedPivots, priceZones, selectZones } from "./price-zones.js";
 import { AppError } from "./errors.js";
 import { boundedJson, limited } from "./http.js";
 import type { Config } from "./config.js";
-import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot } from "./types.js";
+import type { Candle, Frame, Interval, MarketDataProvider, Quote, Snapshot, TriggerInterval } from "./types.js";
 
 export const ANALYSIS_INTERVALS = ["4h", "1h", "15m"] as const satisfies readonly Interval[];
-type CandleInterval = Interval | "1m";
-export const INTERVAL_MS: Record<CandleInterval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000, "1m": 60000 };
+type CandleInterval = Interval | "5m" | "1m";
+export const INTERVAL_MS: Record<CandleInterval, number> = { "4h": 14400000, "1h": 3600000, "15m": 900000, "5m": 300000, "1m": 60000 };
 export const CANDLE_LIMIT = 200;
 const candleLimit = (interval: CandleInterval) => interval === "1m" ? 211 : CANDLE_LIMIT;
 const candlePublicationGraceMs = 1000;
@@ -88,7 +88,7 @@ export class RestMarketDataProvider implements MarketDataProvider {
   private offset = 0;
   private instruments: { expires: number; ticks: Map<string, number> } | undefined;
   constructor(private config: Pick<Config, "binanceTimeoutMs" | "maxPriceAgeMs" | "symbols">, private request: typeof fetch = fetch,
-    private now: () => number = Date.now, private base = "https://fapi.binance.com") {}
+    private now: () => number = Date.now, private base = "https://fapi.binance.com", private triggerInterval: TriggerInterval = "15m") {}
   async get(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown> {
     const url = new URL(path, this.base);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
@@ -188,13 +188,14 @@ export class RestMarketDataProvider implements MarketDataProvider {
   }
   async snapshot(symbol: string, signal: AbortSignal): Promise<Snapshot> {
     const time = await this.serverTime(signal);
-    const at = await this.waitForClose(time, closedCandleBoundary(Math.max(this.now(), time), "15m"), signal);
+    const interval = this.triggerInterval;
+    const at = await this.waitForClose(time, closedCandleBoundary(Math.max(this.now(), time), interval), signal, interval);
     const result = await this.loadSnapshot(symbol, at, signal);
     const now = this.now();
-    const boundary = closedCandleBoundary(Math.max(now, now + this.offset), "15m");
-    if (boundary <= closedCandleBoundary(at, "15m")) return result;
+    const boundary = closedCandleBoundary(Math.max(now, now + this.offset), interval);
+    if (boundary <= closedCandleBoundary(at, interval)) return result;
     // An analysis started just before a close can cross it while loading data.
-    const refreshedAt = await this.waitForClose(await this.serverTime(signal), boundary, signal);
+    const refreshedAt = await this.waitForClose(await this.serverTime(signal), boundary, signal, interval);
     return this.loadSnapshot(symbol, refreshedAt, signal);
   }
   private async loadSnapshot(symbol: string, at: number, signal: AbortSignal): Promise<Snapshot> {
@@ -211,9 +212,18 @@ export class RestMarketDataProvider implements MarketDataProvider {
       }
     });
     tasks.push(() => this.tickSize(symbol, signal));
+    if (this.triggerInterval === "5m") tasks.push(async (): Promise<Snapshot["triggerFrame"]> => {
+      const candles = await this.latestClosedCandles(symbol, "5m", at, signal);
+      const last = candles.at(-1)!;
+      const volumePrice = volumeBars(candles).slice(-5);
+      return { interval: "5m", lastCloseTime: last.closeTime, close: last.close, volumePrice,
+        volumeRatio20: volumePrice.at(-1)!.volumeRatio20 };
+    });
     const values = await limited(tasks);
+    const triggerFrame = values[6] as Snapshot["triggerFrame"];
     return { symbol, asOf: at, receivedAt: this.now(), quote: values[3] as Quote,
-      frames: values.slice(0, 3) as Frame[], tickSize: values[5] as number, openInterest: values[4] as Snapshot["openInterest"], warnings, source: "rest" };
+      frames: values.slice(0, 3) as Frame[], tickSize: values[5] as number, openInterest: values[4] as Snapshot["openInterest"],
+      ...(triggerFrame ? { triggerFrame } : {}), warnings, source: "rest" };
   }
   close() {}
 }

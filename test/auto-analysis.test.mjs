@@ -6,7 +6,7 @@ import { INTERVAL_MS } from "../build/market.js";
 import { makeServer } from "../build/server.js";
 import { jwt, klines, NOW } from "./fixtures.mjs";
 
-const period = INTERVAL_MS["15m"];
+const period = INTERVAL_MS["5m"];
 const storage = "/private/market-signal-auto-analysis/v1/BTCUSDT/slots";
 const legacy = "/private/market-signal-scanner/v1/BTCUSDT";
 const archive = "/private/.trading/owner/market-signals";
@@ -19,7 +19,8 @@ function candles(interval, at, state) {
     const close = 10000 + (i - 199) * 0.5;
     const high = interval === "1h" && i === 185 && !state.noOrder ? 10140 : close + 39;
     const low = interval === "1h" && i === 195 ? 9995 : close - 1;
-    const volume = interval === "15m" && i === 199 && !state.noTrigger ? 20 : 10;
+    const highVolume = interval === "5m" && !state.noTrigger || interval === "15m" && state.noTrigger;
+    const volume = i === 199 && highVolume ? 20 : 10;
     [row[1], row[2], row[3], row[4], row[5]] = [close, high, low, close, volume].map(String);
     return row;
   });
@@ -31,7 +32,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
   const submissions = [];
   const orders = new Map();
   const protection = new Map();
-  let reads15m = 0;
+  let reads5m = 0;
   const analysisFetch = async (input, options) => {
     const url = new URL(input);
     if (url.hostname.endsWith("aliyuncs.com") && url.hostname.startsWith("auto-analysis-test.")) {
@@ -70,7 +71,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     assert.ok(url.pathname.endsWith("/klines"), url.pathname);
     const interval = url.searchParams.get("interval");
     const rows = candles(interval, Number(url.searchParams.get("endTime")), state);
-    if (interval === "15m" && ++reads15m === 1 && state.delayClose) rows.splice(199, 1);
+    if (interval === "5m" && ++reads5m === 1 && state.delayClose) rows.splice(199, 1);
     return Response.json(rows);
   };
   const orderFetch = async (input, options) => {
@@ -180,8 +181,9 @@ test("unset and zero daily limit disable the timer without pulling market data",
   }
 });
 
-test("the timer pulls only REST 4h/1h/15m candles and archives a deterministic M2 candidate", async t => {
-  const app = await testServer(t, "1", { now: NOW + 5000, delayClose: true });
+test("the timer uses fresh REST 5m volume evidence alongside the 4h/1h/15m structure", async t => {
+  const close = NOW + period;
+  const app = await testServer(t, "1", { now: close + 5000, delayClose: true });
   const result = await app.invoke();
   assert.equal(result.status, "completed", JSON.stringify({ result, logs: app.logs }));
   const saved = app.saved(result.analysisId);
@@ -190,9 +192,14 @@ test("the timer pulls only REST 4h/1h/15m candles and archives a deterministic M
   assert.equal(saved.decisionSource, "deterministic");
   assert.equal(saved.m1Trigger.triggered, true);
   assert.equal(saved.m2Order.direction, "long");
-  assert.deepEqual(saved.automaticAnalysis, { triggeredAt: app.state.now, candleClosedAt: NOW });
-  assert.deepEqual(saved.model, { name: "m1-m2", promptVersion: "deterministic-m1-m2-v1", inputTokens: null, outputTokens: null });
-  assert.deepEqual(app.marketCalls.filter(call => call.interval).map(call => call.interval).sort(), ["15m", "15m", "1h", "4h"]);
+  assert.deepEqual(saved.automaticAnalysis, { triggeredAt: app.state.now, candleClosedAt: close, candleInterval: "5m" });
+  assert.equal(saved.market.triggerFrame.lastCloseTime, close - 1);
+  assert.equal(saved.market.frames.find(frame => frame.interval === "15m").lastCloseTime, NOW - 1);
+  assert.equal(saved.m1Trigger.keyFeatures.triggerInterval, "5m");
+  assert.equal(saved.m2Order.keyFeatures.atr15m, saved.market.frames.find(frame => frame.interval === "15m").atr14);
+  assert.equal(saved.opportunity.evidence[0].metric, "5m.volumePrice");
+  assert.deepEqual(saved.model, { name: "m1-m2", promptVersion: "deterministic-m1-m2-v2-5m", inputTokens: null, outputTokens: null });
+  assert.deepEqual(app.marketCalls.filter(call => call.interval).map(call => call.interval).sort(), ["15m", "1h", "4h", "5m", "5m"]);
   assert.ok(saved.market.chart.every(frame => frame.candles.length === 200));
   assert.equal([...app.objects.keys()].filter(key => key.includes("/review-queue/")).length, 3);
   assert.ok([...app.objects.keys()].every(key => !key.startsWith(legacy)));
@@ -310,9 +317,9 @@ test("legacy scan rows and linked analyses remain readable to the existing owner
   assert.deepEqual(app.marketCalls, []);
 });
 
-test("scan history v3 includes REST M1 runs, pre-upgrade slots and linked archives", async t => {
-  const app = await testServer(t, "1");
-  const oldSlot = NOW - period;
+test("scan history v4 includes 5m runs and pre-upgrade slots while v3 preserves its 15m contract", async t => {
+  const app = await testServer(t, "1", { now: NOW + period + 5000 });
+  const oldSlot = NOW - INTERVAL_MS["15m"];
   app.objects.set(`${storage}/2026-11-18.ndjson`, JSON.stringify({ closedAt: oldSlot, status: "no_trigger" }) + "\n");
   const recent = await app.invoke();
   assert.equal(recent.status, "completed");
@@ -321,21 +328,34 @@ test("scan history v3 includes REST M1 runs, pre-upgrade slots and linked archiv
   app.objects.set(`${legacy}/runs/${hour}.ndjson`, JSON.stringify(oldScan) + "\n");
   const v2 = (await app.post("/scans", { version: 2 }, app.ticket())).data;
   assert.deepEqual(v2.records, [oldScan]);
-  const query = () => app.post("/scans", { version: 3 }, app.ticket());
+  const v3 = (await app.post("/scans", { version: 3 }, app.ticket())).data;
+  assert.deepEqual(v3.records.map(row => row.candleClosedAt ?? null), [null, oldSlot]);
+  assert.equal(v3.records[1].candleInterval, undefined);
+  const query = () => app.post("/scans", { version: 4 }, app.ticket());
   const { http, data } = await query();
   assert.equal(http, 200);
   const [current, old, preUpgrade] = data.records;
   assert.equal(current.kind, "deterministic");
+  assert.equal(current.candleInterval, "5m");
+  assert.equal(current.candleClosedAt, NOW + period);
   assert.equal(current.status, "triggered");
   assert.equal(current.m1.score, 100);
   assert.equal(current.opportunityStatus, "candidate");
   assert.equal(current.analysisId, recent.analysisId);
   assert.deepEqual(old, oldScan);
   assert.deepEqual(preUpgrade, { kind: "deterministic", symbol: "BTCUSDT", id: `m1-slot-${oldSlot}`,
-    time: oldSlot, scannedAt: null, candleClosedAt: oldSlot, status: "no_trigger" });
+    time: oldSlot, scannedAt: null, candleClosedAt: oldSlot, candleInterval: "15m", status: "no_trigger" });
   const lookup = { action: "analysis", scanId: current.id, analysisId: current.analysisId };
   assert.equal((await app.post("/scans", lookup, app.ticket())).data.result.analysisId, current.analysisId);
   assert.equal((await app.post("/scans", { ...lookup, scanId }, app.ticket())).http, 404);
   app.objects.delete(`${archive}/records/${current.analysisId}.json`);
   assert.equal((await query()).data.records[0].analysisId, undefined);
+});
+
+test("upgrading within the same day preserves the old 15m slot claim and quota", async t => {
+  const app = await testServer(t, "1");
+  app.objects.set(`${storage}/2026-11-18.ndjson`, JSON.stringify({ closedAt: NOW, status: "reserved" }) + "\n");
+  assert.equal((await app.invoke()).status, "duplicate");
+  app.state.now += period;
+  assert.equal((await app.invoke()).status, "daily_limit");
 });

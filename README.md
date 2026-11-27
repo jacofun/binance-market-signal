@@ -111,7 +111,7 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 ### V4 数据契约
 
 - `schemaVersion=4`。规则分析版本标记为 `deterministic-m1-m2-v1`。手动百炼比较提示词标记为 `market-research-v4-volume-timing-v8`。保留 `opportunity`、`market.chart`、历史解析和当前 JWT 接口。
-- 手动和自动分析共用收盘等待与重试机制。每次分析核对 4h、1h、15m 的最新应收盘时间，必要时重试，仍未发布则返回 `MARKET_CANDLE_NOT_READY`。取数期间跨过新的收盘边界时重新构建快照。模型输入的 `latestClosedAt` 表示各周期最后一根的收盘边界，每根 K 线仍以开盘时间标识。
+- 手动和自动分析共用收盘等待与重试机制。每次分析核对 4h、1h、15m 的最新应收盘时间，自动分析另核对 5m，必要时重试，仍未发布则返回 `MARKET_CANDLE_NOT_READY`。取数期间跨过触发周期的新收盘边界时重新构建快照。模型输入的 `latestClosedAt` 表示各周期最后一根的收盘边界，每根 K 线仍以开盘时间标识。
 - `market.frames` 保留各周期的趋势、ATR 百分比、波动状态、最近 5 根量价细节及 5/20/50 根阶段统计。RVOL20 以此前 20 根均量为分母，CLV 取值为 −1 到 1。量比达到 1.5 或降至 0.75 时分别标记放量和缩量。OI 按两个相邻整点与 1h 已收盘价格对齐，缺失值保留为空。
 - 每个摆动点等待后两根 K 线收盘确认。新摆动点与同类区域聚类时，中心跨度上限取初次和本次确认 ATR14 的较小值乘 0.5。区域在极值外扩初次确认 ATR 的 0.15，外扩上限为价格的 1%。区间 ID 由周期、原始支阻类型和第一个摆动点的开盘毫秒组成。聚类扩张后，以最后确认时点起跟踪最终边界的突破和回测，保留量比及触达反应。每周期保留每类离最新成交收盘价最近的 6 个区间。区域来自摆动结构，成交量证据为整根 K 线的观察量。
 - 模型从区间 ID 中选择入场、失效和目标依据。失效区和 1h ATR 用作止损研究参考。程序校验止损在入场区间的不利侧、步长及价格尺度，并在下单前执行配置的价差风险上限。目标按方向排序，较近的有效 4h 区域或触达至少两次的独立区域须优先设目标。全市场 `exchangeInfo` 按实例缓存 1 小时，读取 `PRICE_FILTER.tickSize` 并校验各价位。程序保留模型提交的价位或返回诊断。
@@ -123,15 +123,15 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 
 ### M1 触发评分
 
-手动和自动分析都由 `analysis.ts` 调用 `MarketDataProvider.snapshot()`。REST 使用同一快照时间构建 4h、1h、15m 的已收盘成交 K 线特征，手动分析的可选 WebSocket 模式沿用该入口并在缓存缺口时用 REST 补齐。两种模式都使用 `market.ts` 的 `frame()`，从 `features.ts` 取得 EMA 趋势、ATR、RVOL20 和量价特征，从 `price-zones.ts` 取得确认区域及其突破、回测状态。定时入口始终使用 REST 快照。
+手动和自动分析都由 `analysis.ts` 调用 `MarketDataProvider.snapshot()`。4h、1h、15m 使用同一快照时间构建已收盘的趋势、价格区域和波动特征。自动分析另外读取已收盘 5m K 线，作为 M1 的形态、收盘价和相对成交量输入，保存在 `market.triggerFrame`。15m 仍提供趋势、价格结构及 ATR，M2 的价格和风险距离继续用 15m ATR。手动分析使用 15m 收盘触发，可选 WebSocket 模式在缓存缺口时用 REST 补齐。
 
 在百炼模式中设置 `USE_M1_TRIGGER=true` 后，手动分析响应附带 `m1Trigger`，包含 `triggered`、`score`、`reasons`、`keyFeatures` 和 `confidence`。该开关默认关闭。启用后可对照 `m1Trigger` 与 `decision.modelStatus` 查看程序评分和百炼判断。
 
 | 规则 | 分数 | 默认条件 |
 | --- | ---: | --- |
-| 形态 | 30 | `trend` 要求 4h、1h 同向且 15m 收盘涨跌方向与之相符。 `reversal` 使用 15m 放量下影收复或上影受阻。 `neutral` 优先顺势，未匹配时检查反转。 |
-| 区域 | 25 | 15m 成交收盘价距同向有效区域不超过 1 倍 15m ATR14。做多看支撑，做空看阻力，排除已跌破的支撑、已站上的阻力及状态为 `broken` 的区域。 |
-| 相对成交量 | 25 | 15m RVOL20 ≥ 1.2。放量影线标签沿用现有的 RVOL20 ≥ 1.5 规则。 |
+| 形态 | 30 | `trend` 要求 4h、1h 同向且触发周期收盘涨跌方向与之相符。`reversal` 使用触发周期的放量下影收复或上影受阻。`neutral` 优先顺势，未匹配时检查反转。 |
+| 区域 | 25 | 触发周期的成交收盘价距同向有效区域不超过 1 倍 15m ATR14。做多看支撑，做空看阻力，排除已跌破的支撑、已站上的阻力及状态为 `broken` 的区域。 |
+| 相对成交量 | 25 | 触发周期 RVOL20 ≥ 1.2，分母为该周期此前 20 根均量。放量影线标签沿用 RVOL20 ≥ 1.5。 |
 | 多周期趋势 | 5 或 10 | 两个周期与信号方向一致得 5 分，三个周期一致得 10 分。 |
 | 波动率 | 10 | 15m ATR14 占收盘价的百分比在 0.05% 至 2% 之间，含边界。 |
 
@@ -160,7 +160,7 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 
 - 每实例最多一个分析任务，额外请求429，不排队、不自动重试；该限制不是跨实例的全局限流。对全局调用量有要求时应另加网关配额或共享限流。
 - 行情请求并发最多2；每周期向模型传入最近最多200根已收盘K线和程序计算的指标摘要。K线以紧凑数组传入，字段为开盘时间、开高低收、成交量和主动买量。
-- 4h/1h/15m K线以币安UTC周期为准，剔除未收盘K线；每周期至少60根且须连续、最新，否则分析失败。
+- 4h/1h/15m 及自动分析的 5m K 线以币安 UTC 周期为准。每周期至少使用 60 根连续的最新已收盘 K 线。
 - 持仓量接口不可用时明确标注缺失；被限流时停止，不能把缺失数据当作0。持仓量不代表净多头，也不直接代表资金流入。
 - 原始响应、模型输出、请求体均有大小上限；Node堆限制256 MB，为原生缓冲区和运行时保留空间。10 GB磁盘不用于堆积行情。
 - 模型失败、截断、结构不合法不重试，不以修复后的自由文本输出代替有效机会。
@@ -189,7 +189,7 @@ MARKET_DATA_MODE=websocket CONTINUOUS_WORKER=true npm start
 
 部署 RAM 身份只需目标函数的 `fc:GetFunction`、`fc:UpdateFunction` 和 `fc:InvokeFunction`。
 
-部署前核对现有 `binance-market-signal`：`ap-southeast-1`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒；其他环境变量、层、角色、资源、网络、健康检查配置和触发器均保留。
+部署前核对现有 `binance-market-signal`：`ap-southeast-1`、`custom.debian12`、0.35vCPU、512MB、10240MB磁盘、9000端口；不匹配时写入前停止。**保留控制台已有的 Node.js 24 层与 PATH**。部署将启动命令改为 `/bin/sh /code/bootstrap`（从原命令保留已有Node解释器绝对路径），超时120秒。部署保留环境变量、层、角色、资源、网络及健康检查配置。通过代码核验后单独同步分析定时器的 Cron。
 
 CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校验远端代码CRC64、配置保留情况，再通过RAM `InvokeFunction` 的 `{"action":"health"}` 做冷启动探测，检查 Node 主版本24和本次Git提交号。探测不调用百炼/币安、不需要配置模型Key。部署异常不自动覆盖重试，不将SDK原始异常或配置值打印到日志。
 
@@ -232,9 +232,9 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 ## BTCUSDT 定时 M1/M2 分析
 
-1. 在 FC 控制台停用原 `binance-market-scanner`，并在新代码部署后创建名为 `binance-market-analysis` 的定时触发器。使用 Cron `5 */15 * * * *`，在每小时第 0、15、30、45 分钟的第 5 秒执行。触发消息可留空，事件通过 FC 的 `POST /invoke` 进入。部署工作流保留控制台触发器配置。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
-2. 设置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为正整数以启用定时分析。留空或设为 `0` 时跳过定时分析。限额按 15m 收盘所属的北京时间自然日统计，每次 M1 触发且取得归档额度时占一次。M1 未触发的收盘仅记录已评估状态，手动分析也不占用该额度。
-3. 定时入口以 `neutral` 风格使用 `RestMarketDataProvider` 获取 4h、1h、15m 收盘行情并直接评估 M1。事件超过收盘三分钟或快照对不上该收盘时跳过。M1 通过才运行 M2，交易方案经结构、步长和最新标记价格复核。同一收盘的去重与额度使用 OSS 条件追加，发生并发时只允许一个调用归档及继续执行。
+1. 定时器 `binance-market-analysis` 使用 Cron `5 */5 * * * *`，在每根 5m K 线收盘后第 5 秒执行。代码部署核验通过后，工作流尝试更新已有定时器的 Cron，保留其启用状态和触发消息。自动更新需要 `fc:GetTrigger` 和 `fc:UpdateTrigger`。部署摘要出现 `analysisSchedule` 警告时，在 FC 控制台检查该定时器和 Cron。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
+2. 设置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为正整数以启用定时分析。留空或设为 `0` 时跳过定时分析。限额按 5m 收盘所属的北京时间自然日统计，每次 M1 触发且取得归档额度时占一次。同日原有 15m 记录继续计入额度，M1 未触发的收盘和手动分析不占用额度。
+3. 定时入口以 `neutral` 风格使用 `RestMarketDataProvider` 获取 4h、1h、15m 结构数据及 5m 触发证据。事件超过该 5m 收盘三分钟或快照对不上该收盘时跳过。M1 通过才运行 M2，交易方案经结构、步长和最新标记价格复核。每根 5m 收盘独立去重，发生并发时只允许一个调用归档及继续执行。
 
 | OSS 路径 | 用途与权限 |
 | --- | --- |
@@ -242,7 +242,7 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 | `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | M1 触发后写入网站分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。扫描列表核对关联归档及读取详情需要 `records/` 的 `oss:GetObject`。根目录默认 `/private`。 |
 | `private/market-signal-scanner/v1/` | 历史扫描及旧分析关联，只读，需 `oss:GetObject`。原 `POST /scans` 和关联归档读取接口继续可用。 |
 
-归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。网站的自动扫描面板用 `POST /scans` 的 `version: 3` 按时间合并 M1 评估与旧扫描记录。此前只保存了收盘时间和状态的 M1 记录仍可显示这两项，后续记录附带评分、量比、趋势及可读取的分析归档。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
+归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。自动扫描面板使用 `POST /scans` 的 `version: 4`，按时间显示 5m、既有 15m M1 评估与旧扫描记录。此前只保存了收盘时间和状态的记录继续显示这些字段。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
 
 ### 自动委托
 
