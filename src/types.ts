@@ -25,6 +25,7 @@ export interface Snapshot {
   symbol: string; asOf: number; receivedAt: number; quote: Quote;
   frames: Frame[]; openInterest: { time: number; contracts: number; notional: number }[];
   triggerFrame?: Pick<Frame, "lastCloseTime" | "close" | "volumeRatio20" | "volumePrice"> & { interval: "5m" };
+  triggerCandles?: Candle[];
   tickSize: number; warnings: string[]; source: "rest" | "websocket";
 }
 export interface MarketDataProvider {

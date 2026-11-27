@@ -7,8 +7,9 @@ import { autoOrderBase, loadOrderConfig, makeOrderPermit } from "./order-auth.js
 import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrderStore } from "./order-oss.js";
-import { loadOssConfig } from "./oss-config.js";
-import type { Trend, TriggerInterval } from "./types.js";
+import { loadAnalysisArchiveConfig, loadOssConfig } from "./oss-config.js";
+import { makeTradeResultLog } from "./trade-result-log.js";
+import type { Snapshot, Trend, TriggerInterval } from "./types.js";
 
 export const AUTO_ANALYSIS_TRIGGER = "binance-market-analysis";
 export const AUTO_ANALYSIS_INTERVAL = "5m";
@@ -18,6 +19,9 @@ const limitField = "SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT";
 const hourMs = INTERVAL_MS["1h"];
 const closeFreshnessMs = 180_000;
 const maxHistoryTime = 9_999_999_999_999;
+const preflightFailures = new Set(["ORDER_EXECUTION_DISABLED", "AUTO_ORDER_NOT_CANDIDATE", "AUTO_ORDER_MARKET_MISMATCH",
+  "ORDERS_DISABLED", "ORDER_CONFIGURATION", "ORDER_RECOVERY_NOT_READY", "ORDER_ACCOUNT_BUSY", "ORDER_HEDGE_MODE_REQUIRED",
+  "ORDER_SUBMISSION_LOCKED", "AUTO_ORDER_DEADLINE", "ORDER_QUOTE_CHANGED", "ORDER_RULE_CHANGED"]);
 const beijingDay = (time: number) => new Date(time + 8 * hourMs).toISOString().slice(0, 10);
 type Store = ReturnType<typeof makeOrderStore>;
 type Stage = AnalysisStage | "configuration" | "quota" | "archive";
@@ -86,19 +90,7 @@ export async function reserveAutoAnalysisSlot(store: Pick<Store, "appendJsonLine
 }
 
 function historyStore(env: Env, now: () => number, request: typeof fetch) {
-  const root = env.PRIVATE_RESOURCE_ROOT?.trim() || "/private";
-  if (!/^(?:\/[a-zA-Z0-9_.-]+)+$/.test(root) || root.includes("..")) {
-    throw new AppError("AUTO_ANALYSIS_CONFIGURATION", "PRIVATE_RESOURCE_ROOT 无效。", 503, undefined, undefined,
-      { configurationField: "PRIVATE_RESOURCE_ROOT" });
-  }
-  const bucket = env.OSS_CONTENT_BUCKET?.trim();
-  const region = env.OSS_CONTENT_REGION?.trim().replace(/^oss-/, "");
-  if (Boolean(bucket) !== Boolean(region)) {
-    const field = bucket ? "OSS_CONTENT_REGION" : "OSS_CONTENT_BUCKET";
-    throw new AppError("AUTO_ANALYSIS_CONFIGURATION", `请配置 ${field}。`, 503, undefined, undefined, { configurationField: field });
-  }
-  const settings = bucket ? { ...env, OSS_BUCKET: bucket, OSS_REGION: region, OSS_NETWORK: "public" } : env;
-  return makeOrderStore({ ...loadOssConfig(settings, "SCAN"), prefix: `${root.slice(1)}/.trading/owner/market-signals` }, now, request, "SCAN");
+  return makeOrderStore(loadAnalysisArchiveConfig(env), now, request, "SCAN");
 }
 
 export async function readLinkedAnalysisArchive(env: Env, now: () => number, request: typeof fetch,
@@ -194,6 +186,7 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
   let stage: Stage = "configuration";
   let analysisId: string | undefined;
   let quotaClaimed = false;
+  const tradeResults = makeTradeResultLog(env, now, request, requestId, event => logger.error(JSON.stringify(event)));
 
   async function placeOrder(result: Awaited<ReturnType<typeof analyze>>, orderBase?: string) {
     if (env.SIGNAL_ORDER_EXECUTE !== "true") return { status: "skipped", code: "ORDER_EXECUTION_DISABLED" };
@@ -204,7 +197,7 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       if (settings.base !== orderBase) throw new AppError("AUTO_ORDER_MARKET_MISMATCH", "行情和下单端点不一致。", 409);
       const orderRequest = options.orderRequest;
       const execution = makeProtectedExecution(settings, makeOrderStore(settings, now, orderRequest),
-        makeOrderExchange(settings, now, orderRequest), now, event => logger.info(JSON.stringify({ ...ids, ...event })));
+        makeOrderExchange(settings, now, orderRequest), now, event => logger.info(JSON.stringify({ ...ids, ...event })), tradeResults);
       const order = await execution.submitAutomatic(plan, options.orderDeadline);
       return { status: order.state, clientId: order.clientId, protection: order.protection.state,
         exchangeStatus: order.exchangeStatus, executedQty: order.executedQty, exchangeCode: order.exchangeCode, code: order.reason };
@@ -226,6 +219,7 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
     if (timeLeft <= 0 || stale()) return { status: "stale", candleClosedAt };
     const release = acquire();
     if (!release) return { status: "busy", candleClosedAt };
+    let decisionWrite: Promise<void> | undefined;
     try {
       const config = loadConfig({ ...env, MARKET_DATA_MODE: "rest", USE_DETERMINISTIC_MODELS: "true" });
       if (!config.symbols.includes(symbol)) throw new AppError("SYMBOL_NOT_ALLOWED", "自动分析交易对不在允许列表中。", 400);
@@ -234,10 +228,12 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       const orderBase = autoOrderBase(env);
       const market = new RestMarketDataProvider(config, request, now, orderBase, AUTO_ANALYSIS_INTERVAL);
       const signal = AbortSignal.timeout(Math.min(config.requestTimeoutMs, timeLeft));
-      const result = await analyze(config, market, symbol, "neutral", signal, undefined, now, value => { stage = value; }, snapshot => {
-        if (stale() || snapshot.triggerFrame?.lastCloseTime !== candleClosedAt - 1) {
+      let snapshot: Snapshot | undefined;
+      const result = await analyze(config, market, symbol, "neutral", signal, undefined, now, value => { stage = value; }, input => {
+        if (stale() || input.triggerFrame?.lastCloseTime !== candleClosedAt - 1) {
           throw new AppError("AUTO_ANALYSIS_STALE_TIMER", "当前快照不对应本次定时事件的 5m 收盘。", 409);
         }
+        snapshot = input;
       });
       if (stale()) return { status: "stale", candleClosedAt };
       stage = "quota";
@@ -248,7 +244,15 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
         rvol20: short.volumeRatio20, trend4h, m1: { score: m1.score, reasons: m1.reasons },
         analysisId: result.analysisId } : undefined;
       const checked = await reserveAutoAnalysisSlot(store, candleClosedAt, limit, m1?.triggered === true, observation);
+      if (checked !== "duplicate" && snapshot) {
+        decisionWrite = tradeResults.logDecision(result, snapshot, { source: "automatic", scanId: requestId,
+          candleClosedAt, candleInterval: AUTO_ANALYSIS_INTERVAL, slot: checked,
+          marketMode: orderBase && env.SIGNAL_ORDER_MODE === "demo" ? "demo" : "live" });
+      }
       if (checked !== "reserved") {
+        if (checked !== "duplicate") await tradeResults.logOutcome(result.analysisId, "analysis", {
+          finalStatus: checked === "no_trigger" && result.status === "expired" ? "expired" : "not_executed", reason: checked,
+        });
         return { status: checked, candleClosedAt, m1Trigger: result.m1Trigger };
       }
       quotaClaimed = true;
@@ -261,12 +265,22 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
         decisionSource: result.decisionSource, m1Score: result.m1Trigger?.score,
         decisionReasons: result.decision.reasons.map(reason => reason.code), elapsedMs: now() - start }));
-      if (env.SIGNAL_AUTO_ORDER_EXECUTE !== "true") return { status: "completed", candleClosedAt, analysisId };
+      if (env.SIGNAL_AUTO_ORDER_EXECUTE !== "true") {
+        await tradeResults.logOutcome(analysisId, "analysis", { finalStatus: result.status === "expired" ? "expired" : "not_executed",
+          reason: result.decision.reasons[0]?.code ?? "auto_execution_disabled" });
+        return { status: "completed", candleClosedAt, analysisId };
+      }
       const order = await placeOrder(result, orderBase);
       logger.info(JSON.stringify({ event: "market_auto_order_outcome", ...ids, analysisId, ...order }));
+      if (order.status === "failed" || order.status === "skipped") {
+        const finalStatus = result.status === "expired" || order.code === "ORDER_DRAFT_EXPIRED" ? "expired" :
+          order.status === "skipped" || preflightFailures.has(order.code) ? "not_executed" : null;
+        await tradeResults.logOutcome(analysisId, "analysis", { finalStatus, reason: order.code });
+      }
       return { status: "completed", candleClosedAt, analysisId, order };
     } finally {
       release();
+      await decisionWrite;
     }
   } catch (error) {
     if (error instanceof AppError && error.code === "AUTO_ANALYSIS_STALE_TIMER") return { status: "stale", candleClosedAt };
@@ -276,6 +290,9 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       httpStatus: safe.status, elapsedMs: now() - start, quotaClaimed, configurationField: original?.configurationField,
       ...original?.upstream, validation: original?.validation, marketEndpoint: original?.marketEndpoint,
       marketHttpStatus: original?.marketHttpStatus, exception: exceptionChain(error) }));
+    if (analysisId && stage === "archive") await tradeResults.logOutcome(analysisId, "analysis", {
+      finalStatus: "not_executed", reason: safe.code,
+    });
     return { status: "failed", candleClosedAt, stage, errorCode: safe.code };
   }
 }

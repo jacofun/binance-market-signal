@@ -13,6 +13,7 @@ const protectionType = (leg: ProtectionLeg) => leg === "stop" ? "STOP_MARKET" : 
 export interface ExchangeOrder {
   state: "accepted" | "rejected" | "unknown";
   exchangeStatus?: string; childStatus?: string; childOrderId?: string; executedQty?: string; avgPrice?: string;
+  updatedAt?: number;
   exchangeCode?: number; upstreamStatus?: number; reason?: string;
 }
 export interface OrderExchange {
@@ -34,6 +35,7 @@ const status = (v: unknown) => typeof v === "string" && /^[A-Z_]{2,32}$/.test(v)
 function decimal(value: unknown, allowZero = false): value is string {
   return typeof value === "string" && DECIMAL.test(value) && (allowZero || Number(value) > 0);
 }
+const orderUpdate = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? { updatedAt: value } : {};
 const invalid = () => new AppError("ORDER_BINANCE_RESPONSE", "币安返回的委托校验数据不完整。", 502);
 const untriggeredTerminal = new Set(["CANCELED", "CANCELLED", "EXPIRED", "REJECTED"]);
 function parseOrder(data: unknown, clientId: string, algo: boolean): ExchangeOrder {
@@ -42,7 +44,7 @@ function parseOrder(data: unknown, clientId: string, algo: boolean): ExchangeOrd
   const exchangeStatus = status(data[algo ? "algoStatus" : "status"]);
   if (!exchangeStatus) throw invalid();
   return { state: "accepted", exchangeStatus, ...(!algo && decimal(data.executedQty, true) ? { executedQty: data.executedQty } : {}),
-    ...(!algo && decimal(data.avgPrice, true) ? { avgPrice: data.avgPrice } : {}) };
+    ...(!algo && decimal(data.avgPrice, true) ? { avgPrice: data.avgPrice } : {}), ...(!algo ? orderUpdate(data.updateTime) : {}) };
 }
 
 export function makeOrderExchange(config: OrderConfig, now: () => number, fetchImpl = fetch): OrderExchange {
@@ -217,7 +219,7 @@ export function makeOrderExchange(config: OrderConfig, now: () => number, fetchI
             child.side !== data.side || child.positionSide !== data.positionSide ||
             !status(child.status) || !decimal(child.executedQty, true)) throw invalid();
           return { ...order, childOrderId, childStatus: child.status as string, executedQty: child.executedQty,
-            ...(decimal(child.avgPrice, true) ? { avgPrice: child.avgPrice } : {}) };
+            ...(decimal(child.avgPrice, true) ? { avgPrice: child.avgPrice } : {}), ...orderUpdate(child.updateTime) };
         }
         if (data.actualOrderId === "" && Number(data.triggerTime) === 0 && untriggeredTerminal.has(order.exchangeStatus!)) {
           return { ...order, executedQty: "0" };

@@ -5,6 +5,7 @@ import { assertQuote, demoOrderPrices, orderOption, type OrderKind } from "./ord
 import type { ExchangeOrder, OrderExchange } from "./order-binance.js";
 import type { OrderStore } from "./order-oss.js";
 import { isProtectedIntent, makeProtectedExecution, pendingEntryMs, supportsExits, type ProtectedDraft } from "./order-execution.js";
+import type { TradeResultLog } from "./trade-result-log.js";
 
 interface Reservation { kind: OrderKind; clientId: string }
 interface Outcome extends ExchangeOrder { checkedAt: number; reason?: string }
@@ -15,8 +16,8 @@ const alreadySent = () => new AppError("ORDER_ALREADY_RESERVED", "本次研究�
 const invalidRequest = () => new AppError("INVALID_ORDER_REQUEST", "订单请求参数无效。", 400);
 
 export function makeOrders(config: OrderConfig, store: OrderStore, exchange: OrderExchange, now: () => number,
-  report: (event: Record<string, unknown>) => void) {
-  const execution = makeProtectedExecution(config, store, exchange, now, report);
+  report: (event: Record<string, unknown>) => void, tradeResults?: TradeResultLog) {
+  const execution = makeProtectedExecution(config, store, exchange, now, report, tradeResults);
   const path = (owner: string, id: string) => `attempts/${owner}/${id}`;
   async function status(owner: string, analysisId: string) {
     const key = path(owner, analysisId);

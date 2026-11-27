@@ -212,18 +212,19 @@ export class RestMarketDataProvider implements MarketDataProvider {
       }
     });
     tasks.push(() => this.tickSize(symbol, signal));
-    if (this.triggerInterval === "5m") tasks.push(async (): Promise<Snapshot["triggerFrame"]> => {
+    const readTrigger = async () => {
       const candles = await this.latestClosedCandles(symbol, "5m", at, signal);
       const last = candles.at(-1)!;
       const volumePrice = volumeBars(candles).slice(-5);
-      return { interval: "5m", lastCloseTime: last.closeTime, close: last.close, volumePrice,
-        volumeRatio20: volumePrice.at(-1)!.volumeRatio20 };
-    });
+      return { triggerFrame: { interval: "5m" as const, lastCloseTime: last.closeTime, close: last.close, volumePrice,
+        volumeRatio20: volumePrice.at(-1)!.volumeRatio20 }, triggerCandles: candles };
+    };
+    if (this.triggerInterval === "5m") tasks.push(readTrigger);
     const values = await limited(tasks);
-    const triggerFrame = values[6] as Snapshot["triggerFrame"];
+    const trigger = values[6] as Awaited<ReturnType<typeof readTrigger>> | undefined;
     return { symbol, asOf: at, receivedAt: this.now(), quote: values[3] as Quote,
       frames: values.slice(0, 3) as Frame[], tickSize: values[5] as number, openInterest: values[4] as Snapshot["openInterest"],
-      ...(triggerFrame ? { triggerFrame } : {}), warnings, source: "rest" };
+      ...trigger, warnings, source: "rest" };
   }
   close() {}
 }

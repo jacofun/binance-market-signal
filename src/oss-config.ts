@@ -24,3 +24,19 @@ export function loadOssConfig(env: Env, domain: "ORDER" | "SCAN") {
     ossSecret: required("ACCESS_KEY_SECRET", setting("ACCESS_KEY_SECRET"), /^[A-Za-z0-9_+/=-]{16,200}$/),
   };
 }
+
+export function loadAnalysisArchiveConfig(env: Env) {
+  const root = env.PRIVATE_RESOURCE_ROOT?.trim() || "/private";
+  if (!/^(?:\/[a-zA-Z0-9_.-]+)+$/.test(root) || root.includes("..")) {
+    throw new AppError("AUTO_ANALYSIS_CONFIGURATION", "PRIVATE_RESOURCE_ROOT 无效。", 503, undefined, undefined,
+      { configurationField: "PRIVATE_RESOURCE_ROOT" });
+  }
+  const bucket = env.OSS_CONTENT_BUCKET?.trim();
+  const region = env.OSS_CONTENT_REGION?.trim().replace(/^oss-/, "");
+  if (Boolean(bucket) !== Boolean(region)) {
+    const field = bucket ? "OSS_CONTENT_REGION" : "OSS_CONTENT_BUCKET";
+    throw new AppError("AUTO_ANALYSIS_CONFIGURATION", `请配置 ${field}。`, 503, undefined, undefined, { configurationField: field });
+  }
+  const settings = bucket ? { ...env, OSS_BUCKET: bucket, OSS_REGION: region, OSS_NETWORK: "public" } : env;
+  return { ...loadOssConfig(settings, "SCAN"), prefix: `${root.slice(1)}/.trading/owner/market-signals` };
+}
