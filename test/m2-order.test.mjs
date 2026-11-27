@@ -96,3 +96,20 @@ test("M2 neither invents targets nor skips a closer zone to obtain a higher R", 
   hourly(market).zones.push({ ...hourly(market).zones[3], id: "tickless-obstacle", lower: 10150.01, upper: 10150.04, touches: 2 });
   assert.equal(generateM2Order(market, trigger), null);
 });
+
+test("M2 reports the first failed gate with its inputs and leaves the result unchanged", () => {
+  const market = m2Snapshot();
+  const trigger = evaluateM1Trigger(market);
+  const messages = [];
+  const evaluate = () => generateM2Order(market, trigger, undefined, reason => messages.push(reason));
+  assert.deepEqual(evaluate(), generateM2Order(market, trigger));
+  assert.equal(messages.length, 0);
+  market.quote.price = 10071;
+  assert.equal(evaluate(), null);
+  assert.match(messages.pop(), /51\.00 USDT.*0\.5 ATR.*50\.00 USDT/);
+  market.quote.price = 10000;
+  const [support] = hourly(market).zones;
+  hourly(market).zones.push({ ...support, id: "retested", status: "retested", lower: 10071, upper: 10100 });
+  assert.equal(evaluate(), null);
+  assert.match(messages.pop(), /0\.70R.*1\.50R.*10071.*10015.*9935/);
+});

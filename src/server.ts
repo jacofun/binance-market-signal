@@ -16,7 +16,7 @@ import { makeOrders } from "./orders.js";
 import { makeScanHistory } from "./scan-history.js";
 import { makeTradeResultLog } from "./trade-result-log.js";
 import { analysisIdPattern, attachAutomaticScanArchive, AUTO_ANALYSIS_TRIGGER, readAutomaticScanRows,
-  readLinkedAnalysisArchive, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
+  readLinkedAnalysisArchive, readLinkedExecution, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
 
 const ORIGINS = new Set(["https://yanxiao.me", "https://www.yanxiao.me"]);
 const ALLOWED_HEADERS = new Set(["x-jwt-token", "content-type", "accept"]);
@@ -67,7 +67,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
     let isOrder = false;
-    let scanAction: "list" | "analysis" | undefined;
+    let scanAction: "list" | "analysis" | "execution" | undefined;
     let archiveId: string | undefined;
     let orderAction: string | undefined;
     let acquired = false;
@@ -157,8 +157,8 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const { sub } = claims;
       const input = await body(req);
       if (scanAction === "list") {
-        if (input.action === "analysis") {
-          scanAction = "analysis";
+        if (input.action === "analysis" || input.action === "execution") {
+          scanAction = input.action;
           if (claims.scope !== "trading:sync") throw new AppError("UNAUTHORIZED", "请通过站点所有者会话获取分析归档凭证。", 401);
           const { analysisId, scanId } = input;
           if (Object.keys(input).length !== 3 || typeof analysisId !== "string" || !analysisIdPattern.test(analysisId) ||
@@ -166,6 +166,10 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
             throw new AppError("INVALID_REQUEST", "分析编号或扫描编号无效。", 400);
           }
           archiveId = analysisId;
+          if (scanAction === "execution") {
+            const execution = await readLinkedExecution(env, now, analysisFetch, scanId, analysisId);
+            send(200, { requestId, execution }); return;
+          }
           const result = await readLinkedAnalysisArchive(env, now, analysisFetch, scanId, analysisId);
           send(200, { requestId, result }); return;
         }

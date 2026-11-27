@@ -31,8 +31,9 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
   if (config.useDeterministicModels) {
     onStage("deterministic");
     m1Trigger = evaluateM1Trigger(snapshot, style);
-    if (m1Trigger.triggered) m2Order = generateM2Order(snapshot, m1Trigger, style);
-    result = { proposal: deterministicProposal(snapshot, m1Trigger, m2Order), usage: { inputTokens: null, outputTokens: null } };
+    let m2Rejection: string | undefined;
+    if (m1Trigger.triggered) m2Order = generateM2Order(snapshot, m1Trigger, style, reason => { m2Rejection = reason; });
+    result = { proposal: deterministicProposal(snapshot, m1Trigger, m2Order, m2Rejection), usage: { inputTokens: null, outputTokens: null } };
   } else {
     if (config.useM1Trigger) m1Trigger = evaluateM1Trigger(snapshot, style);
     onStage("model");

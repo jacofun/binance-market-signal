@@ -1,9 +1,9 @@
 import type { analyze } from "./analysis.js";
 import type { Env } from "./config.js";
 import { AppError, exceptionChain } from "./errors.js";
-import { ORDER_ID } from "./order-auth.js";
+import { object, ORDER_ID } from "./order-auth.js";
 import type { ExchangeOrder, PositionSide, ProtectionLeg } from "./order-binance.js";
-import { makeOrderStore } from "./order-oss.js";
+import { makeOrderStore, type OrderStore } from "./order-oss.js";
 import { loadAnalysisArchiveConfig } from "./oss-config.js";
 import type { Snapshot, TriggerInterval } from "./types.js";
 
@@ -20,6 +20,8 @@ type DecisionContext = { source: "manual"; orderPermitIssued: boolean } | {
 interface Outcome {
   finalStatus: TradeFinalStatus | null;
   reason?: string;
+  message?: string;
+  exchangeCode?: number;
   execution?: {
     mode: "demo" | "live"; clientId: string; requestedQty: string; entryState: ExchangeOrder["state"];
     orderKind: "market" | "limit" | "conditional"; positionSide: PositionSide; stopLossPrice: string; takeProfitPrice: string;
@@ -68,6 +70,36 @@ export function makeTradeResultLog(env: Env, now: () => number, request: typeof 
 }
 
 export type TradeResultLog = ReturnType<typeof makeTradeResultLog>;
+
+export async function readAutomaticExecution(store: Pick<OrderStore, "read">, analysisId: string) {
+  // Prefer a resolved or recovered outcome over the initial IOC submission.
+  const phases = ["terminal", "closure", "recovery", "submission", "analysis"] as const;
+  const reads = await Promise.allSettled(phases.map(phase => store.read(`${prefix}/outcomes/${analysisId}/${phase}.json`, 8192)));
+  const record = reads.flatMap((read, i) => {
+    const value = read.status === "fulfilled" && read.value;
+    return object(value) && value.schemaVersion === schemaVersion && value.recordType === "outcome" &&
+      value.analysisId === analysisId && value.phase === phases[i] ? [value] : [];
+  })[0];
+  if (!record) return { state: "unavailable" as const };
+  const execution = object(record.execution) ? record.execution : {};
+  const text = (value: unknown, format: RegExp) => typeof value === "string" && format.test(value) ? value : undefined;
+  const executedQty = text(execution.executedQty, /^\d{1,16}(?:\.\d{1,12})?$/);
+  const requestedQty = text(execution.requestedQty, /^\d{1,16}(?:\.\d{1,12})?$/);
+  const exchangeStatus = text(execution.childStatus ?? execution.exchangeStatus, /^[A-Z_]{2,32}$/);
+  const upstreamCode = execution.exchangeCode ?? record.exchangeCode;
+  const exchangeCode = typeof upstreamCode === "number" && Number.isSafeInteger(upstreamCode) && upstreamCode < 0 ? upstreamCode : undefined;
+  const reasonCode = text(record.reason, /^[a-zA-Z_]{1,80}$/);
+  const clientId = text(execution.clientId, /^mse[a-f0-9]{30}$/);
+  const protection = text(execution.protection, /^(pending|active|attention|closed|not_required)$/);
+  const message = typeof record.message === "string" && record.message.length <= 240 ? record.message : undefined;
+  let state = "unknown";
+  if (Number(executedQty) > 0) state = Number(executedQty) < Number(requestedQty) ? "partially_filled" : "filled";
+  else if (execution.entryState === "rejected") state = clientId && exchangeCode !== undefined ? "rejected" : "blocked";
+  else if (executedQty !== undefined && (record.finalStatus === "expired" || record.finalStatus === "cancelled")) state = "unfilled";
+  else if (reasonCode === "entry_never_reserved" || record.phase === "analysis" &&
+    (record.finalStatus === "not_executed" || record.finalStatus === "expired")) state = "blocked";
+  return { state, reasonCode, message, clientId, exchangeStatus, executedQty, requestedQty, protection, exchangeCode };
+}
 
 export function closedTradeOutcome(entry: ExchangeOrder,
   exits: { leg: ProtectionLeg; order: ExchangeOrder }[], side: PositionSide, stop: string): Outcome {

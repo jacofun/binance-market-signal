@@ -55,10 +55,14 @@ export function assertQuote(plan: OrderPlan, quote: Quote, now: number) {
   const mark = Number(quote.mark);
   const validRange = plan.direction === "long" ? mark > plan.stop && mark < plan.target : mark < plan.stop && mark > plan.target;
   if (plan.expiresAt <= now) throw new AppError("ORDER_DRAFT_EXPIRED", "机会已过期，请重新分析。", 409);
-  if ([quote.markTime, quote.bookTime].some(time => time < now - 5000 || time > now + 2000) ||
-    drift(mark, plan.mark) > allowedDrift || !validRange) {
-    throw new AppError("ORDER_QUOTE_CHANGED", "盘口已偏离本次研究或报价不够新，请重新分析。", 409);
-  }
+  const oldestQuoteAge = now - Math.min(quote.markTime, quote.bookTime);
+  const newestQuoteLead = Math.max(quote.markTime, quote.bookTime) - now;
+  const change = drift(mark, plan.mark);
+  const failure = oldestQuoteAge > 5000 ? `最新标记价或盘口报价已过时（${oldestQuoteAge} 毫秒，上限 5000 毫秒）。` :
+    newestQuoteLead > 2000 ? `报价时间超前 ${newestQuoteLead} 毫秒，上限 2000 毫秒。` :
+    change > allowedDrift ? `标记价从 ${plan.mark} 变为 ${mark}，偏移 ${change.toFixed(2)} 基点，上限 ${allowedDrift} 基点。` :
+    !validRange ? `标记价 ${mark} 已触及或越过止损 ${plan.stop} 或首个目标 ${plan.target}。` : undefined;
+  if (failure) throw new AppError("ORDER_QUOTE_CHANGED", failure, 409);
 }
 
 export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rules: TradingRules,
@@ -85,7 +89,8 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   const risk = Math.abs(reference - plan.stop) * quantity;
   const notional = reference * quantity;
   if (!rules.kinds.includes(TYPES[kind]) || (!market && !rules.times.includes(immediate ? "IOC" : conditional ? "GTC" : "GTX"))) return "交易所未开放此委托类型。";
-  if (reference < plan.min || reference > plan.max || (crossing && (mark < plan.min || mark > plan.max))) return "预计入场价格须在研究入场区内。";
+  if (reference < plan.min || reference > plan.max) return `预计入场价格 ${reference} 超出研究入场区 ${plan.min}–${plan.max}。`;
+  if (crossing && (mark < plan.min || mark > plan.max)) return `标记价 ${mark} 超出研究入场区 ${plan.min}–${plan.max}。`;
   if (market && Number(buy ? quote.askQty : quote.bidQty) < quantity) {
     return "盘口深度不足或盘口价格已变化。";
   }
@@ -94,8 +99,9 @@ export function orderOption(kind: OrderKind, plan: OrderPlan, quote: Quote, rule
   if (!onGrid(config.quantity, rules.lot) || (market && !onGrid(config.quantity, rules.marketLot)) || (!market && !onGrid(price, rules.price))) {
     return "数量或价格不符合交易所步长与上下限。";
   }
-  if ((!market && (reference > mark * Number(rules.multiplierUp) || reference < mark * Number(rules.multiplierDown))) ||
-    (market ? mark * quantity : notional) + 1e-9 < Number(rules.notional)) return "价格或名义金额不符合交易所过滤器。";
-  if (risk > config.maxRisk + 1e-9) return "按研究失效价估算的价差风险超过配置上限。";
+  if (!market && (reference > mark * Number(rules.multiplierUp) || reference < mark * Number(rules.multiplierDown))) return "委托价格超过交易所标记价浮动限制。";
+  const checkedNotional = market ? mark * quantity : notional;
+  if (checkedNotional + 1e-9 < Number(rules.notional)) return `委托名义金额 ${checkedNotional.toFixed(4)} USDT，低于交易所最低要求 ${rules.notional} USDT。`;
+  if (risk > config.maxRisk + 1e-9) return `按研究失效价估算的价差风险 ${risk.toFixed(6)} USDT，超过配置上限 ${config.maxRisk} USDT。`;
   return { kind, price, ...(immediate ? { timeInForce: "IOC" as const } : {}), ...(triggerPrice ? { triggerPrice } : {}), stopLossPrice, takeProfitPrice, risk, notional };
 }

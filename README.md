@@ -250,6 +250,8 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 入口以最新对手价提交 `LIMIT/IOC`，确认成交后提交标记价止损和首个目标止盈。执行、保护和恢复沿用原订单路径。日志 `market_auto_order_outcome` 记录提交和保护结果，可用分析编号查单。
 
+自动扫描的分析记录会显示 M2 首个未通过的条件和相应数值，也会保留后续报价复核的判定原因。自动候选方案的详情使用 `/scans` 的 `execution` 操作读取同一分析编号下的委托回报，区分未提交、拒绝、未成交、部分成交及待确认。缺少回报时显示暂无记录。该读取操作使用现有扫描鉴权和 OSS 配置。
+
 ## M1/M2 交易结果日志
 
 日志复用现有分析归档的私有 OSS 桶和 `records/` 写入路径，无需新增环境变量。默认根路径为 `private/.trading/owner/market-signals/records/trade-results/v1/`。每个 JSON 对象包含 `schemaVersion: 1`，通过 `analysisId` 关联。
