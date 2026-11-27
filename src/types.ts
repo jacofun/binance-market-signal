@@ -1,4 +1,5 @@
 export type Interval = "4h" | "1h" | "15m";
+export type TriggerInterval = "15m" | "5m";
 export type Style = "trend" | "reversal" | "neutral";
 export interface Candle {
   openTime: number; closeTime: number; open: number; high: number; low: number;
@@ -23,6 +24,7 @@ export interface Frame {
 export interface Snapshot {
   symbol: string; asOf: number; receivedAt: number; quote: Quote;
   frames: Frame[]; openInterest: { time: number; contracts: number; notional: number }[];
+  triggerFrame?: Pick<Frame, "lastCloseTime" | "close" | "volumeRatio20" | "volumePrice"> & { interval: "5m" };
   tickSize: number; warnings: string[]; source: "rest" | "websocket";
 }
 export interface MarketDataProvider {

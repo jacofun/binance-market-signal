@@ -39,7 +39,7 @@ function invalid(outputReason: ModelOutputDetails["outputReason"] = "schema", ou
   throw new AppError("INVALID_MODEL_OUTPUT", hint, 502, undefined, { outputReason, ...(outputField ? { outputField } : {}) }, { validation, cause });
 }
 
-const volumePriceMetrics = (snapshot: Snapshot) => snapshot.frames
+const volumePriceMetrics = (snapshot: Snapshot) => [...snapshot.frames, ...(snapshot.triggerFrame ? [snapshot.triggerFrame] : [])]
   .filter(f => f.volumePrice.some(bar => bar.volumeRatio20 !== null))
   .map(f => `${f.interval}.volumePrice`);
 

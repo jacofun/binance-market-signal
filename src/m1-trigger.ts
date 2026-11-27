@@ -1,6 +1,6 @@
 import { distanceToZone, effectiveKind } from "./price-zones.js";
 import { structureZones, zoneUsable } from "./research.js";
-import type { Frame, Snapshot, Style } from "./types.js";
+import type { Snapshot, Style, TriggerInterval } from "./types.js";
 
 const thresholds = {
   minRvol20: 1.2,
@@ -22,6 +22,7 @@ export interface M1Result {
     asOf: number;
     style: Style;
     lastCloseTime?: number;
+    triggerInterval?: TriggerInterval;
     marketState?: "trend" | "range" | "transition";
     setup?: Setup | null;
     direction?: Direction | null;
@@ -30,14 +31,13 @@ export interface M1Result {
   confidence: "high" | "medium" | "low";
 }
 
-function nearestZone(snapshot: Snapshot, frame: Frame, direction: Direction | null) {
-  if (!direction || !Number.isFinite(frame.atr14) || frame.atr14 <= 0) return null;
-  const price = frame.close;
+function nearestZone(snapshot: Snapshot, price: number, atr14: number, direction: Direction | null) {
+  if (!direction || !Number.isFinite(atr14) || atr14 <= 0) return null;
   const kind = direction === "long" ? "support" : "resistance";
   const closest = structureZones(snapshot)
     .filter(zone => zoneUsable(zone) && effectiveKind(zone) === kind &&
       (direction === "long" ? price >= zone.lower : price <= zone.upper))
-    .map(zone => ({ zone, distanceAtr: distanceToZone(zone, price) / frame.atr14 }))
+    .map(zone => ({ zone, distanceAtr: distanceToZone(zone, price) / atr14 }))
     .sort((a, b) => a.distanceAtr - b.distanceAtr || a.zone.id.localeCompare(b.zone.id))[0];
   if (!closest) return null;
   const { id, interval, lower, upper } = closest.zone;
@@ -53,7 +53,9 @@ export function evaluateM1Trigger(snapshot: Snapshot, style: string = "neutral")
       keyFeatures: { asOf: snapshot.asOf, style: focus }, confidence: "low" };
   }
 
-  const latest = short.volumePrice.at(-1);
+  const triggerFrame = snapshot.triggerFrame ?? short;
+  const triggerInterval = snapshot.triggerFrame?.interval ?? "15m";
+  const latest = triggerFrame.volumePrice.at(-1);
   const closeChangePct = latest?.closeChangePct ?? null;
   const observations = latest?.observations ?? [];
   const lowerRecovery = observations.includes("high_volume_lower_recovery");
@@ -71,9 +73,9 @@ export function evaluateM1Trigger(snapshot: Snapshot, style: string = "neutral")
   const trends = { "4h": background.trend, "1h": hourly.trend, "15m": short.trend };
   const alignedFrames = Object.values(trends).filter(value => value === trend).length;
 
-  const zone = nearestZone(snapshot, short, direction);
+  const zone = nearestZone(snapshot, triggerFrame.close, short.atr14, direction);
   const nearZone = zone !== null && zone.distanceAtr <= thresholds.maxZoneDistanceAtr;
-  const rvol20 = short.volumeRatio20 ?? null;
+  const rvol20 = triggerFrame.volumeRatio20 ?? null;
   const atrPct = Number.isFinite(short.atrPct) ? short.atrPct : null;
   const atrInRange = atrPct !== null && atrPct >= thresholds.minAtrPct && atrPct <= thresholds.maxAtrPct;
   let score = 0;
@@ -99,8 +101,8 @@ export function evaluateM1Trigger(snapshot: Snapshot, style: string = "neutral")
   const triggered = setup !== null && nearZone && atrInRange && score >= thresholds.triggerScore;
   return {
     triggered, score, reasons,
-    keyFeatures: { asOf: snapshot.asOf, lastCloseTime: short.lastCloseTime, style: focus, marketState, setup,
-      direction, trends, alignedFrames, close: short.close, zone, rvol20, atrPct, closeChangePct, observations },
+    keyFeatures: { asOf: snapshot.asOf, lastCloseTime: triggerFrame.lastCloseTime, triggerInterval, style: focus, marketState, setup,
+      direction, trends, alignedFrames, close: triggerFrame.close, zone, rvol20, atrPct, closeChangePct, observations },
     confidence: !triggered ? "low" : score >= thresholds.highConfidenceScore ? "high" : "medium",
   };
 }

@@ -46,7 +46,8 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
 
   return {
     async list(input: Record<string, unknown>) {
-      if (input.version !== 2 && !(input.version === 3 && automatic)) return listLegacy(input);
+      const includeAutomatic = (input.version === 3 || input.version === 4) && automatic;
+      if (input.version !== 2 && !includeAutomatic) return listLegacy(input);
       const latest = now();
       const oldest = hourFor(latest) - historyDays * 24 * hour;
       const before = typeof input.before === "string" ? cursorFormat.exec(input.before) : null;
@@ -57,7 +58,7 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
       const hours = Array.from({ length: (hourFor(to) - hourFor(from)) / hour + 1 }, (_, i) => hourFor(to) - i * hour);
       const slots = Array.from({ length: pageSize + 1 }, (_, i) => slotFor(to) - i * interval).filter(slot => slot >= from);
       const reads: (() => Promise<unknown[]>)[] = hours.map(h => () => store.readJsonLines(logKey(h), 8 * 1024 * 1024));
-      if (input.version === 3 && automatic) reads.unshift(() => automatic.read(from, to));
+      if (includeAutomatic) reads.unshift(() => includeAutomatic.read(from, to));
       for (const slot of slots) reads.push(async () => {
         const row = asObject(await store.read(legacyKey(slot)));
         return row ? [{ ...row, time: slot, id: `legacy-${slot}`, scannedAt: null,

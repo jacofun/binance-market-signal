@@ -8,9 +8,10 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadOssConfig } from "./oss-config.js";
-import type { Trend } from "./types.js";
+import type { Trend, TriggerInterval } from "./types.js";
 
 export const AUTO_ANALYSIS_TRIGGER = "binance-market-analysis";
+export const AUTO_ANALYSIS_INTERVAL = "5m";
 export const analysisIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const symbol = "BTCUSDT";
 const limitField = "SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT";
@@ -25,6 +26,17 @@ type Observation = {
   requestId: string; triggeredAt: number; close: number; rvol20: number | null; trend4h: Trend;
   m1: { score: number; reasons: string[] }; analysisId: string;
 };
+
+function parseSlot(value: unknown): {
+  closedAt: number; status: Exclude<SlotStatus, "duplicate">; observation?: Observation; interval: TriggerInterval;
+} | null {
+  const item = value as { closedAt?: unknown; status?: unknown; candleInterval?: unknown; observation?: Observation } | null;
+  const interval = item?.candleInterval === undefined ? "15m" : item.candleInterval;
+  if (!item || typeof item.closedAt !== "number" || !Number.isSafeInteger(item.closedAt) || item.closedAt <= 0 ||
+    (interval !== "15m" && interval !== "5m") || item.closedAt % INTERVAL_MS[interval] !== 0 ||
+    (item.status !== "reserved" && item.status !== "no_trigger" && item.status !== "daily_limit")) return null;
+  return { closedAt: item.closedAt, status: item.status, observation: item.observation, interval };
+}
 
 const autoSlotsPath = (closedAt: number) => `${symbol}/slots/${beijingDay(closedAt)}.ndjson`;
 const makeAutoStore = (env: Env, now: () => number, request: typeof fetch) =>
@@ -57,10 +69,8 @@ export async function reserveAutoAnalysisSlot(store: Pick<Store, "appendJsonLine
     const seen = new Set<number>();
     let used = 0;
     for (const row of rows) {
-      const item = row as { closedAt?: unknown; status?: unknown } | null;
-      if (!item || typeof item.closedAt !== "number" || !Number.isSafeInteger(item.closedAt) || item.closedAt <= 0 ||
-        item.closedAt % INTERVAL_MS["15m"] !== 0 || beijingDay(item.closedAt) !== beijingDay(closedAt) || seen.has(item.closedAt) ||
-        !["no_trigger", "reserved", "daily_limit"].includes(item.status as string)) {
+      const item = parseSlot(row);
+      if (!item || beijingDay(item.closedAt) !== beijingDay(closedAt) || seen.has(item.closedAt)) {
         throw new AppError("AUTO_ANALYSIS_QUOTA_UNCONFIRMED", "自动分析额度记录无法验证。", 503);
       }
       seen.add(item.closedAt);
@@ -69,7 +79,8 @@ export async function reserveAutoAnalysisSlot(store: Pick<Store, "appendJsonLine
     if (seen.has(closedAt)) return "duplicate";
     const status = !triggered ? "no_trigger" : used >= limit ? "daily_limit" : "reserved";
     const position = rows.reduce<number>((bytes, row) => bytes + Buffer.byteLength(`${JSON.stringify(row)}\n`), 0);
-    if (await store.appendJsonLineAt(path, { closedAt, status, ...(observation ? { observation } : {}) }, position) === null) return status;
+    if (await store.appendJsonLineAt(path, { closedAt, status, candleInterval: AUTO_ANALYSIS_INTERVAL,
+      ...(observation ? { observation } : {}) }, position) === null) return status;
   }
   throw new AppError("AUTO_ANALYSIS_QUOTA_UNCONFIRMED", "无法确认自动分析额度。", 503);
 }
@@ -119,21 +130,21 @@ function isAutomaticRecord(saved: Awaited<ReturnType<typeof readArchivedAnalysis
     (candleClosedAt === undefined || saved.automaticAnalysis.candleClosedAt === candleClosedAt);
 }
 
-export async function readAutomaticScanRows(env: Env, now: () => number, request: typeof fetch, from: number, to: number) {
+export async function readAutomaticScanRows(env: Env, now: () => number, request: typeof fetch, from: number, to: number,
+  includeFiveMinute: boolean) {
   const store = makeAutoStore(env, now, request);
   const paths = new Set([autoSlotsPath(from), autoSlotsPath(to)]);
   const rows = (await Promise.all([...paths].map(path => store.readJsonLines(path, 256 * 1024)))).flat();
   return rows.flatMap(value => {
-    const item = value as { closedAt?: unknown; status?: unknown; observation?: Observation } | null;
-    if (!item || typeof item.closedAt !== "number" || !Number.isSafeInteger(item.closedAt) || item.closedAt <= 0 ||
-      item.closedAt % INTERVAL_MS["15m"] !== 0 ||
-      (item.status !== "reserved" && item.status !== "no_trigger" && item.status !== "daily_limit")) return [];
-    const { closedAt, observation } = item;
+    const item = parseSlot(value);
+    if (!item || (!includeFiveMinute && item.interval === "5m")) return [];
+    const { closedAt, observation, interval } = item;
     const run = observation && typeof observation.requestId === "string" && analysisIdPattern.test(observation.requestId) &&
-      Number.isSafeInteger(observation.triggeredAt) && closedCandleBoundary(observation.triggeredAt, "15m") === closedAt ?
+      Number.isSafeInteger(observation.triggeredAt) && closedCandleBoundary(observation.triggeredAt, interval) === closedAt ?
       observation : undefined;
     return [{ kind: "deterministic", symbol, id: run?.requestId ?? `m1-slot-${closedAt}`, time: run?.triggeredAt ?? closedAt,
       scannedAt: run?.triggeredAt ?? null, candleClosedAt: closedAt,
+      ...(includeFiveMinute ? { candleInterval: interval } : {}),
       status: item.status === "reserved" ? "triggered" : item.status,
       ...(run ? { m1: run.m1, close: run.close, rvol20: run.rvol20, trend4h: run.trend4h,
         ...(item.status === "reserved" && typeof run.analysisId === "string" && analysisIdPattern.test(run.analysisId) ?
@@ -152,7 +163,9 @@ export async function attachAutomaticScanArchive(env: Env, now: () => number, re
   return { ...row, analysisId, opportunityStatus };
 }
 
-async function archiveResult(store: Store, result: Awaited<ReturnType<typeof analyze>> & { requestId: string; automaticAnalysis: { triggeredAt: number; candleClosedAt: number } }) {
+async function archiveResult(store: Store, result: Awaited<ReturnType<typeof analyze>> & {
+  requestId: string; automaticAnalysis: { triggeredAt: number; candleClosedAt: number; candleInterval: typeof AUTO_ANALYSIS_INTERVAL };
+}) {
   const { analysisId, symbol, status, style, opportunity, timing: { completedAt } } = result;
   await store.create(`records/${analysisId}.json`, result);
   // Same queue key and publication order as the site's manual archive. The
@@ -176,8 +189,8 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
 }) {
   const { env, now, request, deadline, acquire, logger } = options;
   const start = now();
-  const candleClosedAt = closedCandleBoundary(triggeredAt, "15m");
-  const ids = { requestId, symbol, triggeredAt, candleClosedAt };
+  const candleClosedAt = closedCandleBoundary(triggeredAt, AUTO_ANALYSIS_INTERVAL);
+  const ids = { requestId, symbol, triggeredAt, candleClosedAt, candleInterval: AUTO_ANALYSIS_INTERVAL };
   let stage: Stage = "configuration";
   let analysisId: string | undefined;
   let quotaClaimed = false;
@@ -219,16 +232,16 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       const store = makeAutoStore(env, now, request);
       const history = historyStore(env, now, request);
       const orderBase = autoOrderBase(env);
-      const market = new RestMarketDataProvider(config, request, now, orderBase);
+      const market = new RestMarketDataProvider(config, request, now, orderBase, AUTO_ANALYSIS_INTERVAL);
       const signal = AbortSignal.timeout(Math.min(config.requestTimeoutMs, timeLeft));
       const result = await analyze(config, market, symbol, "neutral", signal, undefined, now, value => { stage = value; }, snapshot => {
-        if (stale() || snapshot.frames.find(frame => frame.interval === "15m")?.lastCloseTime !== candleClosedAt - 1) {
-          throw new AppError("AUTO_ANALYSIS_STALE_TIMER", "当前快照不对应本次定时事件的 15m 收盘。", 409);
+        if (stale() || snapshot.triggerFrame?.lastCloseTime !== candleClosedAt - 1) {
+          throw new AppError("AUTO_ANALYSIS_STALE_TIMER", "当前快照不对应本次定时事件的 5m 收盘。", 409);
         }
       });
       if (stale()) return { status: "stale", candleClosedAt };
       stage = "quota";
-      const short = result.market.frames.find(frame => frame.interval === "15m");
+      const short = result.market.triggerFrame;
       const trend4h = result.market.frames.find(frame => frame.interval === "4h")?.trend;
       const m1 = result.m1Trigger;
       const observation = short && trend4h && m1 ? { requestId, triggeredAt, close: short.close,
@@ -242,7 +255,9 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       analysisId = result.analysisId;
       stage = "archive";
       const notes = orderBase ? ["候选通过即时委托复核后可自动提交，实际结果以订单记录为准。", ...result.notes.slice(1)] : result.notes;
-      await archiveResult(history, { ...result, notes, requestId, automaticAnalysis: { triggeredAt, candleClosedAt } });
+      await archiveResult(history, { ...result, notes, requestId, automaticAnalysis: {
+        triggeredAt, candleClosedAt, candleInterval: AUTO_ANALYSIS_INTERVAL,
+      } });
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
         decisionSource: result.decisionSource, m1Score: result.m1Trigger?.score,
         decisionReasons: result.decision.reasons.map(reason => reason.code), elapsedMs: now() - start }));

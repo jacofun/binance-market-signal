@@ -7,7 +7,7 @@ import { SOURCE_COMMIT } from "./version.js";
 import { assessResearch, researchContext } from "./research.js";
 import { candleRow } from "./market.js";
 import { evaluateM1Trigger, type M1Result } from "./m1-trigger.js";
-import { DETERMINISTIC_VERSION, deterministicProposal, generateM2Order, type M2Order } from "./m2-order.js";
+import { DETERMINISTIC_5M_VERSION, DETERMINISTIC_VERSION, deterministicProposal, generateM2Order, type M2Order } from "./m2-order.js";
 
 export type Model = typeof analyzeWithModel;
 export type AnalysisStage = "market_snapshot" | "deterministic" | "model" | "proposal_validation" | "quote_verification";
@@ -80,6 +80,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
       triggerVerified: false, priceReference: "markPrice", expiredReasons: expiryReasons.map(reason => reason.message) },
     research: assessResearch(snapshot, p),
     market: { tickSize: snapshot.tickSize, ...researchContext(snapshot), asOf: snapshot.asOf, frames: snapshot.frames.map(({ recentCandles: _candles, zones: _zones, historicalRanges: _ranges, priceLevels: _priceLevels, ...f }) => f),
+      ...(snapshot.triggerFrame ? { triggerFrame: snapshot.triggerFrame } : {}),
       chart: snapshot.frames.map(f => ({ interval: f.interval, candles: f.recentCandles.map(candleRow) })),
       initialQuote: snapshot.quote, latestQuote: latest, priceDriftBps: driftBps, openInterest: snapshot.openInterest, source: snapshot.source, warnings: snapshot.warnings },
     timing: { requestedAt: start, completedAt: end, finalQuoteTime: latest.time,
@@ -88,7 +89,8 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
       ...(config.useDeterministicModels ? { deterministicMs: modelEnd - modelStart } : {}),
       verificationMs: end - modelEnd, totalMs: end - start },
     model: { name: config.useDeterministicModels ? "m1-m2" : config.model,
-      promptVersion: config.useDeterministicModels ? DETERMINISTIC_VERSION : RESEARCH_PROMPT_VERSION, ...result.usage }, codeVersion: SOURCE_COMMIT,
+      promptVersion: config.useDeterministicModels ? (snapshot.triggerFrame ? DETERMINISTIC_5M_VERSION : DETERMINISTIC_VERSION) :
+        RESEARCH_PROMPT_VERSION, ...result.usage }, codeVersion: SOURCE_COMMIT,
     notes: [config.useDeterministicModels ? "手动交易须复核价格并确认委托。" : "百炼结果用于研究比较。",
       "盈亏比按入场区间不利端估算，未计手续费、滑点和资金费。"],
   };
