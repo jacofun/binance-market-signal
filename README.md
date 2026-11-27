@@ -250,6 +250,17 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 入口以最新对手价提交 `LIMIT/IOC`，确认成交后提交标记价止损和首个目标止盈。执行、保护和恢复沿用原订单路径。日志 `market_auto_order_outcome` 记录提交和保护结果，可用分析编号查单。
 
+## M1/M2 交易结果日志
+
+日志复用现有分析归档的私有 OSS 桶和 `records/` 写入路径，无需新增环境变量。默认根路径为 `private/.trading/owner/market-signals/records/trade-results/v1/`。每个 JSON 对象包含 `schemaVersion: 1`，通过 `analysisId` 关联。
+
+| 相对路径 | 内容 |
+| --- | --- |
+| `decisions/<analysisId>.json` | 手动和定时确定性分析的决策记录，包含请求和扫描编号、时间、代码与规则版本、完整 M1/M2 输出、报价复核结论，以及当时的行情快照。包含 M1 未触发和额度已用完的收盘，定时重复调用只留一条。快照保留结构区、指标和各周期原始收盘 K 线，供后续人工或离线模型回放、修改规则及比较新旧规则。 |
+| `outcomes/<analysisId>/<phase>.json` | 分析跳过或失效记录、委托回报、保护恢复观察，以及确认的终局。`finalStatus` 取 `win`、`loss`、`breakeven`、`expired`、`cancelled`、`not_executed` 或 `null`。待提交的手动草稿可按 `validUntil` 判断是否过期，之后执行的订单由单独的回报关联。 |
+
+保护恢复在可核对开仓和保护退出成交数量一致时，依据币安成交均价记录退出价、估算的毛已实现盈亏和 R 倍数，费用与资金费未计入。成交订单的更新时间齐全时记录退出时间和持有时长。手动平仓或成交证据不足的退出保留 `finalStatus: null`，不以行情触及目标或止损替代真实成交。分析及委托照常处理，OSS 日志写入失败单独记录 `trade_result_log_failed`。
+
 ## 本地验证
 
 ```sh
@@ -261,6 +272,6 @@ python3 -m unittest discover -s test -p 'test_deploy_fc.py' -v
 npm run package
 ```
 
-测试使用模拟 REST、OSS 和币安委托接口，覆盖新旧定时入口、收盘重试、M1/M2、每日额度、并发去重、归档及保护委托风险校验。另覆盖手动接口、历史扫描读取、WebSocket 缓存补齐和部署配置保留。
+测试使用模拟 REST、OSS 和币安委托接口，覆盖新旧定时入口、收盘重试、M1/M2、每日额度、并发去重、归档及保护委托风险校验。另覆盖手动接口、历史扫描读取、WebSocket 缓存补齐、交易结果日志和部署配置保留。
 
 参考：[FC自定义运行时](https://www.alibabacloud.com/help/en/functioncompute/custom-runtime/)、[百炼兼容接口](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)、[币安USD-M行情](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data)。

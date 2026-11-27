@@ -113,6 +113,7 @@ export interface OrderPlan {
   id: string; owner: string; status: "candidate" | "watch"; direction: "long" | "short";
   min: number; max: number; stop: number; target: number;
   mark: number; expiresAt: number;
+  decisionSource?: "deterministic";
 }
 export function makeOrderPermit(result: Awaited<ReturnType<typeof analyze>>, owner: string, now: number): OrderPlan | undefined {
   const { direction, entry, stopLoss, targets } = result.opportunity;
@@ -121,5 +122,6 @@ export function makeOrderPermit(result: Awaited<ReturnType<typeof analyze>>, own
   return {
     id: result.analysisId, owner: digest(owner), status: result.status, direction, min: entry.min, max: entry.max, stop: stopLoss,
     target: targets[0].price, mark: result.market.latestQuote.price, expiresAt: result.timing.validUntil,
+    ...(result.decisionSource ? { decisionSource: result.decisionSource } : {}),
   };
 }

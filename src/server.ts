@@ -6,7 +6,7 @@ import { loadConfig, type Config, type Env } from "./config.js";
 import { RestMarketDataProvider } from "./market.js";
 import { WebSocketMarketDataProvider } from "./websocket-market.js";
 import { analyze, type AnalysisStage, type Model } from "./analysis.js";
-import type { MarketDataProvider, Style } from "./types.js";
+import type { MarketDataProvider, Snapshot, Style } from "./types.js";
 import { SOURCE_COMMIT } from "./version.js";
 import { loadOrderConfig, makeOrderPermit, orderSubject, storeOrderReference, validateRecoveryTimer, type OrderConfig } from "./order-auth.js";
 import { makeOrderStore } from "./order-oss.js";
@@ -14,6 +14,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeScanHistory } from "./scan-history.js";
+import { makeTradeResultLog } from "./trade-result-log.js";
 import { analysisIdPattern, attachAutomaticScanArchive, AUTO_ANALYSIS_TRIGGER, readAutomaticScanRows,
   readLinkedAnalysisArchive, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
 
@@ -56,6 +57,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
   const cooldowns = new Map<string, number>();
   const server = createServer(async (req, res) => {
     const requestId = randomUUID();
+    const tradeResults = makeTradeResultLog(env, now, analysisFetch, requestId, event => logger.error(JSON.stringify(event)));
     const startedAt = now();
     const trace: { stage: "request" | AnalysisStage; symbol?: string; style?: Style } = { stage: "request" };
     const origin = req.headers.origin;
@@ -124,7 +126,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           validateRecoveryTimer(input, now());
           const settings = ordersConfig();
           const execution = makeProtectedExecution(settings, makeOrderStore(settings, now, orderFetch),
-            makeOrderExchange(settings, now, orderFetch), now, event => logger.info(JSON.stringify({ requestId, ...event })));
+            makeOrderExchange(settings, now, orderFetch), now, event => logger.info(JSON.stringify({ requestId, ...event })), tradeResults);
           const result = await execution.recover();
           logger.info(JSON.stringify({ event: "order_protection_recovery", requestId, ...result }));
           send(200, { requestId, ...result }); return;
@@ -146,7 +148,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
         const input = await body(req);
         if (input.action === "preview" || input.action === "submit" || input.action === "status" || input.action === "demo-plan") orderAction = input.action;
         const orders = makeOrders(settings, makeOrderStore(settings, now, orderFetch), makeOrderExchange(settings, now, orderFetch),
-          now, event => logger.info(JSON.stringify({ requestId, ...event })));
+          now, event => logger.info(JSON.stringify({ requestId, ...event })), tradeResults);
         const result = await orders(input, token);
         send(200, { requestId, ...result });
         return;
@@ -189,7 +191,9 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       cooldowns.set(sub, now());
       req.on("aborted", disconnected); res.on("close", disconnected);
       timer = setTimeout(() => cancel("request_deadline"), config.requestTimeoutMs); timer.unref();
-      const result = await analyze(config, getMarket(config), trace.symbol, trace.style, abort.signal, model, now, stage => { trace.stage = stage; });
+      let snapshot: Snapshot | undefined;
+      const result = await analyze(config, getMarket(config), trace.symbol, trace.style, abort.signal, model, now,
+        stage => { trace.stage = stage; }, input => { snapshot = input; });
       let orderPermit: string | undefined;
       if (result.decisionSource === "deterministic" && (env.SIGNAL_ORDER_MODE === "demo" || env.SIGNAL_ORDER_MODE === "live") &&
           result.symbol === "BTCUSDT" && result.opportunity.direction && (result.status === "candidate" || result.status === "watch")) {
@@ -205,6 +209,13 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
             ...(error instanceof AppError ? error.upstream : {}),
           }));
         }
+      }
+      if (result.decisionSource === "deterministic" && snapshot) {
+        await Promise.all([tradeResults.logDecision(result, snapshot, { source: "manual", orderPermitIssued: !!orderPermit }),
+          !orderPermit && tradeResults.logOutcome(result.analysisId, "analysis", {
+            finalStatus: result.status === "expired" ? "expired" : "not_executed",
+            reason: result.decision.reasons[0]?.code ?? "no_order_permit",
+          })]);
       }
       send(200, { requestId, ...result, ...(orderPermit ? { orderPermit } : {}) });
       logger.info(JSON.stringify({ event: "analysis_completed", requestId, analysisId: result.analysisId,

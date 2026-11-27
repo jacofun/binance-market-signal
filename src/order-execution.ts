@@ -3,6 +3,7 @@ import { digest, object, ORDER_ID, type OrderConfig, type OrderPlan } from "./or
 import type { ExchangeOrder, OrderExchange, PositionSide, ProtectionLeg } from "./order-binance.js";
 import { assertQuote, DECIMAL, orderOption, type OrderOption, type TradingRules } from "./order-rules.js";
 import type { OrderStore } from "./order-oss.js";
+import { closedTradeOutcome, type TradeResultLog } from "./trade-result-log.js";
 
 const activePath = "locks/btcusdt.json";
 const heartbeatPath = "protection/heartbeat.json";
@@ -22,6 +23,7 @@ export interface ProtectedDraft {
 type Intent = {
   analysisId: string; owner: string; clientId: string;
   apiKeyHash: string; side: PositionSide; quantity: string; stop: string; target: string; openingUntil: number;
+  decisionSource?: "deterministic";
 } & ({ version: 2; kind: "market" } | { version: 3; kind: "limit" | "conditional"; entryExpiresAt: number });
 const orderPath = (owner: string, id: string) => `attempts/${owner}/${id}`;
 const detailedError = (error: unknown) => ({
@@ -45,7 +47,7 @@ const hasFinalFill = (entry: ExchangeOrder) =>
 const legId = (intent: Intent, leg: ProtectionLeg) => `ms${leg === "stop" ? "s" : "t"}${intent.clientId.slice(3)}`;
 
 export function makeProtectedExecution(config: OrderConfig, store: OrderStore, exchange: OrderExchange, now: () => number,
-  report: (event: Record<string, unknown>) => void) {
+  report: (event: Record<string, unknown>) => void, tradeResults?: TradeResultLog) {
   const credentials = digest(config.apiKey);
   const path = (intent: Intent) => orderPath(intent.owner, intent.analysisId);
   const context = (intent: Intent) => ({ analysisId: intent.analysisId, clientId: intent.clientId });
@@ -59,6 +61,38 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     mode: config.mode, ...context(intent), kind: intent.kind, ...(entry ?? { state: "unknown" as const }), protection,
     ...(intent.version === 3 ? { entryExpiresAt: intent.entryExpiresAt } : {}),
   });
+  async function logExecution(intent: Intent, outcome: ReturnType<typeof result>, phase: "submission" | "recovery",
+    submitted?: { issuedAt: number; option: OrderOption }) {
+    if (!tradeResults || intent.decisionSource !== "deterministic") return;
+    const { protection, executedQty, avgPrice, exchangeStatus, childStatus, exchangeCode, updatedAt } = outcome;
+    const execution = { mode: config.mode, clientId: intent.clientId, requestedQty: intent.quantity,
+      orderKind: intent.kind, positionSide: intent.side, stopLossPrice: intent.stop, takeProfitPrice: intent.target,
+      ...(submitted ? { submission: { issuedAt: submitted.issuedAt, referencePrice: submitted.option.price,
+        timeInForce: submitted.option.timeInForce, triggerPrice: submitted.option.triggerPrice } } : {}),
+      entryState: outcome.state, executedQty, avgEntryPrice: avgPrice, exchangeStatus, childStatus, exchangeCode,
+      entryUpdatedAt: updatedAt, protection: protection.state, stopStatus: protection.stop.exchangeStatus,
+      targetStatus: protection.target.exchangeStatus };
+    if (protection.state === "closed") {
+      let resolved = closedTradeOutcome(outcome, [], intent.side, intent.stop);
+      try {
+        const exits = await Promise.all(legs.filter(leg => protection[leg].exchangeStatus === "FINISHED").map(async leg => ({
+          leg, order: await exchange.query("conditional", legId(intent, leg)),
+        })));
+        resolved = closedTradeOutcome(outcome, exits, intent.side, intent.stop);
+      } catch (error) {
+        report({ event: "trade_result_exit_lookup_failed", ...context(intent), ...detailedError(error) });
+      }
+      await tradeResults.logOutcome(intent.analysisId, resolved.finalStatus ? "terminal" : "closure", { execution, ...resolved });
+    } else if (protection.state === "not_required") {
+      const state = childStatus ?? exchangeStatus;
+      const finalStatus = state === "EXPIRED" || state === "EXPIRED_IN_MATCH" || outcome.reason === "ORDER_DRAFT_EXPIRED" ? "expired" :
+        state === "CANCELED" || state === "CANCELLED" ? "cancelled" : "not_executed";
+      await tradeResults.logOutcome(intent.analysisId, "terminal", { execution, finalStatus, reason: outcome.reason ?? state });
+    } else {
+      await tradeResults.logOutcome(intent.analysisId, phase, { execution, finalStatus: null,
+        reason: outcome.state === "unknown" ? "entry_unknown" : outcome.reason });
+    }
+  }
   async function rememberEntry(intent: Intent, entry: ExchangeOrder) {
     if (!hasFinalFill(entry) && entry.state !== "rejected") return;
     try { await store.create(`${path(intent)}/entry.json`, entry); }
@@ -194,6 +228,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       clientId: `mse${digest(`${config.mode}/${plan.owner}/${plan.id}`).slice(0, 30)}`,
       apiKeyHash: credentials, side: plan.direction === "long" ? "LONG" : "SHORT", quantity,
       stop: option.stopLossPrice, target: option.takeProfitPrice,
+      ...(plan.decisionSource === "deterministic" ? { decisionSource: plan.decisionSource } : {}),
       openingUntil: Math.min(expiresAt, plan.expiresAt, now() + 15000, deadline - autoProtectionBudgetMs) };
     if (deadline - now() <= autoProtectionBudgetMs + 3000) {
       throw new AppError("AUTO_ORDER_DEADLINE", "扫描调用剩余时间不足以开仓并提交保护单。", 409);
@@ -210,13 +245,16 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     }
     const issuedAt = now();
     let entry: ExchangeOrder;
-    if (issuedAt + 3000 >= intent.openingUntil || issuedAt - Math.min(quote.bookTime, quote.markTime) > 5000) {
+    const quoteExpired = issuedAt + 3000 >= intent.openingUntil || issuedAt - Math.min(quote.bookTime, quote.markTime) > 5000;
+    if (quoteExpired) {
       entry = { state: "rejected", reason: "ORDER_DRAFT_EXPIRED" };
     } else {
       try { entry = await exchange.enter(intent.side, quantity, intent.clientId, issuedAt, option); }
       catch (error) {
         report({ event: "order_entry_unknown", ...context(intent), ...detailedError(error) });
-        return result(intent, protectedStatus(intent, "pending"));
+        const outcome = result(intent, protectedStatus(intent, "pending"));
+        await logExecution(intent, outcome, "submission", { issuedAt, option });
+        return outcome;
       }
     }
     // The recovery task can query a filled order using its persisted client ID.
@@ -230,6 +268,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     if (entry.state !== "rejected") await rememberEntry(intent, entry);
     report({ event: "order_execution_completed", ...context(intent), entry: entry.state,
       executedQty: entry.executedQty, protection: outcome.protection.state });
+    await logExecution(intent, outcome, "submission", quoteExpired ? undefined : { issuedAt, option });
     return outcome;
   }
   return {
@@ -275,6 +314,9 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       const reserved = await store.read(`${path(intent)}/intent.json`);
       if (reserved === null) {
         await release(intent, "not_required");
+        if (intent.decisionSource === "deterministic") await tradeResults?.logOutcome(intent.analysisId, "terminal", {
+          finalStatus: "not_executed", reason: "entry_never_reserved",
+        });
         return { recovered: true, ...context(intent), reason: "entry_never_reserved" };
       }
       if (!isProtectedIntent(reserved) || (Object.keys(intent) as (keyof Intent)[]).some(key => intent[key] !== reserved[key])) {
@@ -290,6 +332,9 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       const outcome = await settle(intent, entry, false, until);
       if (!cached) await rememberEntry(intent, entry);
       await store.write(heartbeatPath, { at: now(), apiKeyHash: credentials });
+      if (!cached || outcome.protection.state === "closed" || outcome.protection.state === "not_required") {
+        await logExecution(intent, outcome, "recovery");
+      }
       return { recovered: true, ...outcome };
     },
   };

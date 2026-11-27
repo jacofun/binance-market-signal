@@ -37,6 +37,7 @@ function symbolRules(notional = "5", tickSize = "0.1") {
   }] };
 }
 const ossHeader = { "x-oss-request-id": "test-object-request-id" };
+const tradeLogs = "/private/.trading/owner/market-signals/records/trade-results/v1";
 const makeMock = () => {
   const objects = new Map();
   const calls = [];
@@ -128,7 +129,8 @@ async function start(t, override = {}) {
   const logs = [];
   let modelCalls = 0;
   const server = makeServer({ env: { ...settings, ...override }, logger: { info: value => logs.push(value), error: value => logs.push(value) },
-    now: () => mock.state.clock, model: async () => { modelCalls++; return modelResult(); }, provider: provider({ snapshot: async () => m2Snapshot() }), orderFetch: mock.mockFetch });
+    now: () => mock.state.clock, model: async () => { modelCalls++; return modelResult(); }, provider: provider({ snapshot: async () => m2Snapshot() }),
+    orderFetch: mock.mockFetch, analysisFetch: mock.mockFetch });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
@@ -176,7 +178,7 @@ test("analysis succeeds with orders disabled, incomplete configuration or a non-
     assert.equal(result.http, 200);
     assert.equal(result.data.orderPermit, undefined);
     assert.equal(result.data.status, "candidate");
-    assert.deepEqual(app.calls, []);
+    assert.deepEqual(app.calls.filter(call => !call.path.startsWith(tradeLogs)), []);
   }
 });
 
@@ -335,6 +337,26 @@ test("legacy accepted, uncertain and rejected records remain readable only by th
 
 const mutations = app => app.calls.filter(call => call.path.startsWith("/fapi/") && call.method !== "GET");
 const entryDraft = preview => preview.options.find(option => option.kind === "market").draft;
+
+test("manual analysis and submission share an analysis ID in the trade logs", async t => {
+  const app = await start(t, { SIGNAL_ORDER_EXECUTE: "true" });
+  await app.recover();
+  const preview = await app.preview();
+  const decision = app.objects.get(`${tradeLogs}/decisions/${preview.analysisId}.json`);
+  assert.equal(decision.source, "manual");
+  assert.equal(decision.orderPermitIssued, true);
+  assert.equal(decision.decisionSource, "deterministic");
+  assert.deepEqual(decision.snapshot, m2Snapshot());
+  assert.equal(decision.deterministicVersion, "deterministic-m1-m2-v1");
+  const submission = await app.submit(entryDraft(preview));
+  assert.equal(submission.http, 200);
+  const outcome = app.objects.get(`${tradeLogs}/outcomes/${preview.analysisId}/submission.json`);
+  assert.equal(outcome.finalStatus, null);
+  assert.equal(outcome.requestId, submission.data.requestId);
+  assert.equal(outcome.execution.executedQty, "0.001");
+  assert.equal(outcome.execution.protection, "active");
+  assert.equal(outcome.execution.clientId, submission.data.clientId);
+});
 
 test("test plans preview and submit protected market orders without running analysis", async t => {
   for (const direction of ["long", "short"]) {
