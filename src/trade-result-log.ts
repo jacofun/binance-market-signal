@@ -7,7 +7,8 @@ import { makeOrderStore, type OrderStore } from "./order-oss.js";
 import { loadAnalysisArchiveConfig } from "./oss-config.js";
 import type { Snapshot, TriggerInterval } from "./types.js";
 
-const prefix = "records/trade-results/v1";
+export const tradeResultPrefix = "records/trade-results/v1";
+export const tradeDecisionPath = (analysisId: string) => `${tradeResultPrefix}/decisions/${analysisId}.json`;
 const schemaVersion = 1;
 type Phase = "analysis" | "submission" | "recovery" | "closure" | "terminal";
 export type TradeFinalStatus = "win" | "loss" | "breakeven" | "expired" | "cancelled" | "not_executed";
@@ -42,7 +43,7 @@ export function makeTradeResultLog(env: Env, now: () => number, request: typeof 
   async function write(recordType: "decision" | "outcome", analysisId: string, path: string, fields: object) {
     try {
       const store = makeOrderStore(loadAnalysisArchiveConfig(env), now, request, "SCAN");
-      await store.create(`${prefix}/${path}`, { schemaVersion, recordType, analysisId, requestId, recordedAt: now(), ...fields });
+      await store.create(path, { schemaVersion, recordType, analysisId, requestId, recordedAt: now(), ...fields });
     } catch (error) {
       report({ event: "trade_result_log_failed", recordType, analysisId, requestId,
         code: error instanceof AppError ? error.code : "INTERNAL_ERROR",
@@ -53,7 +54,7 @@ export function makeTradeResultLog(env: Env, now: () => number, request: typeof 
   return {
     async logDecision(result: Analysis, snapshot: Snapshot, context: DecisionContext) {
       if (result.decisionSource !== "deterministic" || !result.m1Trigger) return;
-      await write("decision", result.analysisId, `decisions/${result.analysisId}.json`, {
+      await write("decision", result.analysisId, tradeDecisionPath(result.analysisId), {
         ...context, symbol: result.symbol, style: result.style, asOf: snapshot.asOf,
         decidedAt: result.timing.completedAt, validUntil: result.timing.validUntil,
         codeVersion: result.codeVersion, deterministicVersion: result.model.promptVersion,
@@ -64,7 +65,7 @@ export function makeTradeResultLog(env: Env, now: () => number, request: typeof 
     },
     async logOutcome(analysisId: string, phase: Phase, outcome: Outcome) {
       if (!ORDER_ID.test(analysisId)) return;
-      await write("outcome", analysisId, `outcomes/${analysisId}/${phase}.json`, { phase, ...outcome });
+      await write("outcome", analysisId, `${tradeResultPrefix}/outcomes/${analysisId}/${phase}.json`, { phase, ...outcome });
     },
   };
 }
@@ -74,7 +75,7 @@ export type TradeResultLog = ReturnType<typeof makeTradeResultLog>;
 export async function readAutomaticExecution(store: Pick<OrderStore, "read">, analysisId: string) {
   // Prefer a resolved or recovered outcome over the initial IOC submission.
   const phases = ["terminal", "closure", "recovery", "submission", "analysis"] as const;
-  const reads = await Promise.allSettled(phases.map(phase => store.read(`${prefix}/outcomes/${analysisId}/${phase}.json`, 8192)));
+  const reads = await Promise.allSettled(phases.map(phase => store.read(`${tradeResultPrefix}/outcomes/${analysisId}/${phase}.json`, 8192)));
   const record = reads.flatMap((read, i) => {
     const value = read.status === "fulfilled" && read.value;
     return object(value) && value.schemaVersion === schemaVersion && value.recordType === "outcome" &&

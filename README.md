@@ -263,6 +263,10 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 保护恢复在可核对开仓和保护退出成交数量一致时，依据币安成交均价记录退出价、估算的毛已实现盈亏和 R 倍数，费用与资金费未计入。成交订单的更新时间齐全时记录退出时间和持有时长。手动平仓或成交证据不足的退出保留 `finalStatus: null`，不以行情触及目标或止损替代真实成交。分析及委托照常处理，OSS 日志写入失败单独记录 `trade_result_log_failed`。
 
+站点所有者可在「交易日志 → 自动扫描」导出研究清单。`POST /scans` 的 `version: 5` 为已有决策日志的自动扫描返回 `exportAnalysisId`，包括 M1 未触发和达到每日额度的记录。以 `action: "export"` 提交最多 100 个 `analysisIds`，或提交相差不超过 7 天的毫秒时间戳 `from`、`to`。时间区间按北京时间输入，包含两端的 K 线收盘。云函数检查日志可用性，告知跳过数量。
+
+每次导出写入同一 OSS 归档下的 `records/trade-results/v1/exports/<exportId>.json`，返回 `static.yanxiao.me` 上的可复制 URL。清单仅包含分析编号、数量、导出时间和所选区间等元数据。无需新增环境变量。现有归档权限需覆盖 `decisions/` 读取和 `exports/` 写入，CDN 需允许读取导出路径。
+
 ## 本地验证
 
 ```sh

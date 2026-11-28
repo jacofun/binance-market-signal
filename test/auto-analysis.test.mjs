@@ -43,6 +43,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
       if (state.rejectQuota && url.pathname.startsWith(storage)) return new Response(null, { status: 503, headers: ossHeaders });
       if (state.rejectArchive && url.pathname.includes("/review-queue/")) return new Response(null, { status: 403, headers: ossHeaders });
       if (state.rejectTradeLogs && url.pathname.startsWith(tradeLogs)) return new Response(null, { status: 403, headers: ossHeaders });
+      if (options.method === "HEAD") return new Response(null, { status: current === undefined ? 404 : 200, headers: ossHeaders });
       if (options.method === "POST") {
         const length = Buffer.byteLength(current ?? "");
         if (Number(url.searchParams.get("position")) !== length) return new Response(null, {
@@ -270,6 +271,59 @@ test("a slot claim is atomic across instances and the limit resets at Beijing mi
   assert.equal((await first.invoke()).status, "completed");
   assert.equal([...objects.keys()].filter(key => key.startsWith(storage)).length, 2);
   assert.equal([...objects.keys()].filter(archiveRecord).length, 2);
+});
+
+test("selected scan export verifies decisions, deduplicates IDs and shares a versioned manifest", async t => {
+  const app = await testServer(t, "1", { now: NOW + 5000, noTrigger: true });
+  const idle = await app.invoke();
+  const page = (await app.post("/scans", { version: 5 }, app.ticket())).data;
+  const row = page.records.find(row => row.id === idle.requestId);
+  const id = row.exportAnalysisId;
+  assert.equal(row.status, "no_trigger");
+  assert.equal(row.analysisId, undefined);
+  assert.equal(app.decision(id).scanId, idle.requestId);
+  assert.equal((await app.post("/scans", { version: 4 }, app.ticket())).data.records[0].exportAnalysisId, undefined);
+  const exportScans = (input, headers = app.ticket()) => app.post("/scans", { action: "export", ...input }, headers);
+  assert.equal((await exportScans({ analysisIds: [id] }, app.ticket("trading:orders:read"))).http, 401);
+  assert.equal((await exportScans({ analysisIds: ["../outside"] })).http, 400);
+  const { http, data } = await exportScans({ analysisIds: [id, id, legacyAnalysisId] });
+  assert.equal(http, 200);
+  const { pathname, origin } = new URL(data.url);
+  assert.equal(origin, "https://static.yanxiao.me");
+  assert.equal(pathname, `${tradeLogs}/exports/${data.exportId}.json`);
+  assert.deepEqual(JSON.parse(app.objects.get(pathname)), {
+    schemaVersion: 1, exportId: data.exportId, exportedAt: app.state.now, symbol: "BTCUSDT", count: 1, skippedCount: 1, analysisIds: [id],
+  });
+  const second = await exportScans({ analysisIds: [id] });
+  assert.notEqual(second.data.exportId, data.exportId);
+  assert.equal(app.submissions.length, 0);
+});
+
+test("range export includes intervening Beijing days and skips records without a decision", async t => {
+  const day = 24 * 3600000;
+  const first = Date.UTC(2026, 10, 18, 15, 55);
+  const app = await testServer(t, "1", { now: first + 5000, noTrigger: true });
+  await app.invoke();
+  app.state.now += day;
+  app.state.noTrigger = false;
+  await app.invoke();
+  app.state.now += period;
+  await app.invoke();
+  app.state.now += period;
+  await app.invoke();
+  const ids = [...app.objects.entries()].filter(([key]) => key.startsWith(`${tradeLogs}/decisions/`))
+    .map(([key, json]) => ({ key, ...JSON.parse(json) }));
+  app.objects.delete(ids[2].key);
+  const from = first;
+  const to = first + day + period;
+  const { http, data } = await app.post("/scans", { action: "export", from, to }, app.ticket());
+  assert.equal(http, 200);
+  const manifest = JSON.parse(app.objects.get(new URL(data.url).pathname));
+  assert.deepEqual(manifest.range, { from, to });
+  assert.deepEqual(manifest.analysisIds, ids.slice(0, 2).map(row => row.analysisId));
+  assert.equal(manifest.skippedCount, 1);
+  assert.equal((await app.post("/scans", { action: "export", from: first - 8 * day, to }, app.ticket())).http, 400);
+  assert.equal((await app.post("/scans", { action: "export", from: to, to }, app.ticket())).http, 404);
 });
 
 test("corrupt ledger fails closed without appending", async () => {

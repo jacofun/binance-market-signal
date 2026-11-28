@@ -1,6 +1,7 @@
 import { analyze, type AnalysisStage } from "./analysis.js";
 import { loadConfig, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
+import { limited } from "./http.js";
 import { closedCandleBoundary, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { legacyOutcomePath, makeLegacyScanStore } from "./scan-history.js";
 import { autoOrderBase, loadOrderConfig, makeOrderPermit, object } from "./order-auth.js";
@@ -8,7 +9,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrderStore } from "./order-oss.js";
 import { loadAnalysisArchiveConfig, loadOssConfig } from "./oss-config.js";
-import { makeTradeResultLog, readAutomaticExecution } from "./trade-result-log.js";
+import { makeTradeResultLog, readAutomaticExecution, tradeDecisionPath } from "./trade-result-log.js";
 import type { Snapshot, Trend, TriggerInterval } from "./types.js";
 
 export const AUTO_ANALYSIS_TRIGGER = "binance-market-analysis";
@@ -17,12 +18,14 @@ export const analysisIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 const symbol = "BTCUSDT";
 const limitField = "SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT";
 const hourMs = INTERVAL_MS["1h"];
+const dayMs = 24 * hourMs;
+const beijingOffsetMs = 8 * hourMs;
 const closeFreshnessMs = 180_000;
 const maxHistoryTime = 9_999_999_999_999;
 const preflightFailures = new Set(["ORDER_EXECUTION_DISABLED", "AUTO_ORDER_NOT_CANDIDATE", "AUTO_ORDER_MARKET_MISMATCH",
   "ORDERS_DISABLED", "ORDER_CONFIGURATION", "ORDER_RECOVERY_NOT_READY", "ORDER_ACCOUNT_BUSY", "ORDER_HEDGE_MODE_REQUIRED",
   "ORDER_SUBMISSION_LOCKED", "AUTO_ORDER_DEADLINE", "ORDER_QUOTE_CHANGED", "ORDER_RULE_CHANGED"]);
-const beijingDay = (time: number) => new Date(time + 8 * hourMs).toISOString().slice(0, 10);
+const beijingDay = (time: number) => new Date(time + beijingOffsetMs).toISOString().slice(0, 10);
 type Store = ReturnType<typeof makeOrderStore>;
 type Stage = AnalysisStage | "configuration" | "quota" | "archive";
 type SlotStatus = "reserved" | "duplicate" | "daily_limit" | "no_trigger";
@@ -132,10 +135,15 @@ function isAutomaticRecord(saved: Awaited<ReturnType<typeof readArchivedAnalysis
 }
 
 export async function readAutomaticScanRows(env: Env, now: () => number, request: typeof fetch, from: number, to: number,
-  includeFiveMinute: boolean) {
+  includeFiveMinute: boolean, includeExport = false) {
   const store = makeAutoStore(env, now, request);
-  const paths = new Set([autoSlotsPath(from), autoSlotsPath(to)]);
-  const rows = (await Promise.all([...paths].map(path => store.readJsonLines(path, 256 * 1024)))).flat();
+  const firstDay = Math.floor((from + beijingOffsetMs) / dayMs) * dayMs - beijingOffsetMs;
+  const reads: (() => Promise<unknown[]>)[] = [];
+  for (let day = firstDay; day <= to; day += dayMs) {
+    const path = autoSlotsPath(day);
+    reads.push(() => store.readJsonLines(path, 256 * 1024));
+  }
+  const rows = (await limited(reads, 4)).flat();
   return rows.flatMap(value => {
     const item = parseSlot(value);
     if (!item || (!includeFiveMinute && item.interval === "5m")) return [];
@@ -143,21 +151,27 @@ export async function readAutomaticScanRows(env: Env, now: () => number, request
     const run = observation && typeof observation.requestId === "string" && analysisIdPattern.test(observation.requestId) &&
       Number.isSafeInteger(observation.triggeredAt) && closedCandleBoundary(observation.triggeredAt, interval) === closedAt ?
       observation : undefined;
+    const analysisId = typeof run?.analysisId === "string" && analysisIdPattern.test(run.analysisId) ? run.analysisId : undefined;
     return [{ kind: "deterministic", symbol, id: run?.requestId ?? `m1-slot-${closedAt}`, time: run?.triggeredAt ?? closedAt,
       scannedAt: run?.triggeredAt ?? null, candleClosedAt: closedAt,
       ...(includeFiveMinute ? { candleInterval: interval } : {}),
       status: item.status === "reserved" ? "triggered" : item.status,
       ...(run ? { m1: run.m1, close: run.close, rvol20: run.rvol20, trend4h: run.trend4h,
-        ...(item.status === "reserved" && typeof run.analysisId === "string" && analysisIdPattern.test(run.analysisId) ?
-          { analysisId: run.analysisId } : {}) } : {}) }];
+        ...(item.status === "reserved" && analysisId ? { analysisId } : {}),
+        ...(includeExport && analysisId ? { exportAnalysisId: analysisId } : {}) } : {}) }];
   });
 }
 
 export async function attachAutomaticScanArchive(env: Env, now: () => number, request: typeof fetch, record: Record<string, unknown>) {
-  const { analysisId, ...row } = record;
+  const { analysisId, exportAnalysisId, ...row } = record;
+  if (!analysisId && !exportAnalysisId) return row;
+  const store = historyStore(env, now, request);
+  const exportReady = typeof exportAnalysisId === "string" && analysisIdPattern.test(exportAnalysisId) &&
+    await store.exists(tradeDecisionPath(exportAnalysisId)).catch(() => false);
+  if (exportReady) row.exportAnalysisId = exportAnalysisId;
   if (typeof analysisId !== "string" || !analysisIdPattern.test(analysisId) || typeof row.id !== "string" ||
     typeof row.candleClosedAt !== "number") return row;
-  const saved = await readArchivedAnalysis(historyStore(env, now, request), analysisId);
+  const saved = await readArchivedAnalysis(store, analysisId).catch(() => null);
   const opportunityStatus = saved?.status;
   if (!isAutomaticRecord(saved, row.id, analysisId, row.candleClosedAt) ||
     (opportunityStatus !== "candidate" && opportunityStatus !== "watch" && opportunityStatus !== "none" && opportunityStatus !== "expired")) return row;

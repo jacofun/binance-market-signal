@@ -14,6 +14,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeScanHistory } from "./scan-history.js";
+import { exportScanDecisions } from "./scan-export.js";
 import { makeTradeResultLog } from "./trade-result-log.js";
 import { analysisIdPattern, attachAutomaticScanArchive, AUTO_ANALYSIS_TRIGGER, readAutomaticScanRows,
   readLinkedAnalysisArchive, readLinkedExecution, runAutoAnalysis, validateAutoAnalysisTimer } from "./auto-analysis.js";
@@ -67,7 +68,7 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       if (!res.destroyed && !res.writableEnded) { res.writeHead(status, { ...headers, ...extra }); res.end(value === null ? "" : JSON.stringify(value)); }
     };
     let isOrder = false;
-    let scanAction: "list" | "analysis" | "execution" | undefined;
+    let scanAction: "list" | "analysis" | "execution" | "export" | undefined;
     let archiveId: string | undefined;
     let orderAction: string | undefined;
     let acquired = false;
@@ -157,6 +158,14 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
       const { sub } = claims;
       const input = await body(req);
       if (scanAction === "list") {
+        if (input.action === "export") {
+          scanAction = "export";
+          if (claims.scope !== "trading:sync") throw new AppError("UNAUTHORIZED", "请通过站点所有者会话导出扫描记录。", 401);
+          const result = await exportScanDecisions(env, now, analysisFetch, input);
+          logger.info(JSON.stringify({ event: "market_scan_exported", requestId, exportId: result.exportId, count: result.count,
+            skippedCount: result.skippedCount }));
+          send(200, { requestId, ...result }); return;
+        }
         if (input.action === "analysis" || input.action === "execution") {
           scanAction = input.action;
           if (claims.scope !== "trading:sync") throw new AppError("UNAUTHORIZED", "请通过站点所有者会话获取分析归档凭证。", 401);
@@ -173,8 +182,11 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           const result = await readLinkedAnalysisArchive(env, now, analysisFetch, scanId, analysisId);
           send(200, { requestId, result }); return;
         }
+        if (input.version === 5 && claims.scope !== "trading:sync") {
+          throw new AppError("UNAUTHORIZED", "请通过站点所有者会话读取扫描记录。", 401);
+        }
         const result = await makeScanHistory(env, now, analysisFetch, {
-          read: (from, to) => readAutomaticScanRows(env, now, analysisFetch, from, to, input.version === 4),
+          read: (from, to) => readAutomaticScanRows(env, now, analysisFetch, from, to, input.version === 4 || input.version === 5, input.version === 5),
           attachArchive: row => attachAutomaticScanArchive(env, now, analysisFetch, row),
         }).list(input);
         send(200, { requestId, ...result }); return;
