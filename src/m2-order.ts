@@ -1,14 +1,13 @@
 import type { M1Result } from "./m1-trigger.js";
 import { tickPriceRange } from "./price-grid.js";
-import { distanceToZone, effectiveKind } from "./price-zones.js";
+import { effectiveKind } from "./price-zones.js";
 import { blockingTargetObstacle, structureZones, zoneUsable } from "./research.js";
 import type { Proposal, Snapshot, Style, TriggerInterval } from "./types.js";
 
-export const DETERMINISTIC_VERSION = "deterministic-m1-m2-v1";
-export const DETERMINISTIC_5M_VERSION = "deterministic-m1-m2-v2-5m";
+export const DETERMINISTIC_VERSION = "deterministic-m1-m2-v3";
+export const DETERMINISTIC_5M_VERSION = "deterministic-m1-m2-v3-5m";
 const thresholds = {
-  entryHalfWidthAtr: 0.15,
-  maxEntryDistanceAtr: 0.5,
+  referenceHalfWidthAtr: 0.15,
   stopBufferAtr: 0.15,
   minStopDistanceAtr: 0.5,
   maxRiskAtr: 2,
@@ -49,7 +48,8 @@ export function generateM2Order(snapshot: Snapshot, m1Result: M1Result, style?: 
   const { tickSize } = snapshot;
   const markPrice = snapshot.quote.price;
   if (!Number.isFinite(atr) || atr <= 0 || rvol20 == null || !Number.isFinite(rvol20) ||
-    !Number.isFinite(markPrice) || markPrice <= 0 || !Number.isFinite(tickSize) || tickSize <= 0) {
+    !Number.isFinite(markPrice) || markPrice <= 0 || !Number.isFinite(triggerFrame.close) || triggerFrame.close <= 0 ||
+    !Number.isFinite(tickSize) || tickSize <= 0) {
     return reject("缺少有效的 15 分钟 ATR、触发周期量比、标记价或价格步长。");
   }
 
@@ -61,63 +61,68 @@ export function generateM2Order(snapshot: Snapshot, m1Result: M1Result, style?: 
   if (long ? markPrice < zone.lower : markPrice > zone.upper) {
     return reject(`标记价 ${priceText(markPrice)} 已${long ? `跌破支撑区下沿 ${priceText(zone.lower)}` : `涨破阻力区上沿 ${priceText(zone.upper)}`}。`);
   }
-  const distanceToEntry = distanceToZone(zone, markPrice);
-  if (distanceToEntry > thresholds.maxEntryDistanceAtr * atr) {
-    return reject(`标记价 ${priceText(markPrice)} 距入场关键区 ${distanceToEntry.toFixed(2)} USDT，超过 ${thresholds.maxEntryDistanceAtr} ATR 上限（${(thresholds.maxEntryDistanceAtr * atr).toFixed(2)} USDT）。`);
-  }
-
   const minPrice = Math.max(tickSize, markPrice * 0.5);
   const maxPrice = Math.min(1e12, markPrice * 1.5);
-  const center = Math.min(zone.upper, Math.max(zone.lower, markPrice));
-  const halfWidth = thresholds.entryHalfWidthAtr * atr;
-  const reach = thresholds.maxEntryDistanceAtr * atr;
-  const entryRange = tickPriceRange(Math.max(zone.lower, center - halfWidth, markPrice - reach, minPrice),
-    Math.min(zone.upper, center + halfWidth, markPrice + reach, maxPrice), tickSize);
-  if (!entryRange) return reject(`候选入场区间内没有符合价格步长 ${tickSize} 的可委托价位。`);
-
   const buffer = Math.max(tickSize, thresholds.stopBufferAtr * atr);
-  const minStop = thresholds.minStopDistanceAtr * atr;
+  const minRisk = thresholds.minStopDistanceAtr * atr;
+  // Preserve the minimum stop distance around the triggering close. Later
+  // mark prices can qualify the entry, but do not set the structural stop.
+  const center = Math.min(zone.upper, Math.max(zone.lower, triggerFrame.close));
+  const halfWidth = thresholds.referenceHalfWidthAtr * atr;
+  const reference = long ? Math.max(zone.lower, center - halfWidth) : Math.min(zone.upper, center + halfWidth);
   const stopLoss = long ?
-    tickPriceRange(minPrice, Math.min(zone.lower - buffer, entryRange.min - minStop), tickSize)?.max :
-    tickPriceRange(Math.max(zone.upper + buffer, entryRange.max + minStop), maxPrice, tickSize)?.min;
-  if (stopLoss === undefined || (long ? stopLoss >= entryRange.min : stopLoss <= entryRange.max)) return reject("无法在入场区间外设置符合价格步长和方向要求的止损。");
-  const worstEntryPrice = long ? entryRange.max : entryRange.min;
-  const riskDistance = (worstEntryPrice - stopLoss) * side;
-  if (riskDistance <= 0) return reject("入场参考价与止损价之间没有有效的风险价差。");
-  if (riskDistance > thresholds.maxRiskAtr * atr) {
-    return reject(`入场至止损的风险价差 ${riskDistance.toFixed(2)} USDT，超过 ${thresholds.maxRiskAtr} ATR 上限（${(thresholds.maxRiskAtr * atr).toFixed(2)} USDT）。`);
-  }
+    tickPriceRange(minPrice, Math.min(zone.lower - buffer, reference - minRisk), tickSize)?.max :
+    tickPriceRange(Math.max(zone.upper + buffer, reference + minRisk), maxPrice, tickSize)?.min;
+  if (stopLoss === undefined) return reject("无法在关键区外设置符合价格步长和方向要求的结构止损。");
+  const maxRisk = thresholds.maxRiskAtr * atr;
+  const riskRange = tickPriceRange(Math.max(zone.lower, minPrice, long ? stopLoss + minRisk : stopLoss - maxRisk),
+    Math.min(zone.upper, maxPrice, long ? stopLoss + maxRisk : stopLoss - minRisk), tickSize);
+  if (!riskRange) return reject(`关键区内没有符合价格步长 ${tickSize} 且距结构止损 ${thresholds.minStopDistanceAtr}–${thresholds.maxRiskAtr} ATR 的入场价。止损 ${stopLoss}。`);
 
+  // Use the favorable edge to keep any closer opposing zone in consideration
+  // before clipping the entry interval to the first target's reward-to-risk.
+  const bestEntry = long ? riskRange.min : riskRange.max;
   const targetZones = zones.filter(item => zoneUsable(item) && effectiveKind(item) === (long ? "resistance" : "support") &&
-    (long ? item.lower > worstEntryPrice : item.upper < worstEntryPrice))
+    (long ? item.lower > bestEntry : item.upper < bestEntry))
     .sort((a, b) => (long ? a.lower - b.lower : b.upper - a.upper) || a.id.localeCompare(b.id));
   const takeProfits: M2Order["takeProfits"] = [];
-  const plan = { direction, entry: entryRange, research: { entryZoneId: zone.id } };
-  let targetRejection: string | undefined;
+  let entryRange: M2Order["entryRange"] | undefined;
   for (const targetZone of targetZones) {
     const range = tickPriceRange(Math.max(targetZone.lower, minPrice), Math.min(targetZone.upper, maxPrice), tickSize);
     if (!range) continue;
     const price = long ? range.min : range.max;
-    const distance = (price - worstEntryPrice) * side;
     const previous = takeProfits.at(-1);
     if (previous && ((price - previous.price) * side <= 0 ||
       (long ? previous.price >= targetZone.lower : previous.price <= targetZone.upper))) continue;
-    const target = { price, zoneId: targetZone.id, rMultiple: distance / riskDistance };
-    if ((price - markPrice) * side <= 0) targetRejection = `标记价 ${priceText(markPrice)} 已达到或越过首个止盈参考价 ${price}。`;
-    else if (distance > thresholds.maxTargetDistanceAtr * atr) targetRejection = `首个止盈目标 ${price} 距入场参考价 ${distance.toFixed(2)} USDT，超过 ${thresholds.maxTargetDistanceAtr} ATR 上限。`;
-    else if (target.rMultiple < thresholds.minFirstTargetR) {
-      const ratio = target.rMultiple.toFixed(2) === thresholds.minFirstTargetR.toFixed(2) ? String(target.rMultiple) : target.rMultiple.toFixed(2);
-      targetRejection = `首个止盈目标的盈亏比 ${ratio}R，低于 ${thresholds.minFirstTargetR.toFixed(2)}R。目标 ${price}，最不利入场 ${worstEntryPrice}，止损 ${stopLoss}。`;
-    } else {
-      const obstacle = blockingTargetObstacle(zones, plan, target, takeProfits);
-      if (obstacle) targetRejection = `通往首个止盈目标 ${price} 的路径上有 ${obstacle.interval} ${long ? "阻力区" : "支撑区"} ${priceText(obstacle.lower)}–${priceText(obstacle.upper)}。`;
+    if (!entryRange) {
+      if ((price - markPrice) * side <= 0) return reject(`标记价 ${priceText(markPrice)} 已达到或越过首个止盈参考价 ${price}。`);
+      const boundary = stopLoss + (price - stopLoss) / (1 + thresholds.minFirstTargetR);
+      const rewardRange = tickPriceRange(long ? riskRange.min : Math.max(riskRange.min, boundary),
+        long ? Math.min(riskRange.max, boundary) : riskRange.max, tickSize);
+      if (!rewardRange) return reject(`按结构止损 ${stopLoss} 和首个目标 ${price} 反推，关键区内没有达到 ${thresholds.minFirstTargetR.toFixed(2)}R 的入场价。`);
+      const maxTargetDistance = thresholds.maxTargetDistanceAtr * atr;
+      entryRange = tickPriceRange(long ? Math.max(rewardRange.min, price - maxTargetDistance) : rewardRange.min,
+        long ? rewardRange.max : Math.min(rewardRange.max, price + maxTargetDistance), tickSize) ?? undefined;
+      if (!entryRange) return reject(`首个止盈目标 ${price} 距可用入场价超过 ${thresholds.maxTargetDistanceAtr} ATR 上限。`);
     }
-    if (targetRejection) break;
+    const worstEntryPrice = long ? entryRange.max : entryRange.min;
+    const riskDistance = (worstEntryPrice - stopLoss) * side;
+    const distance = (price - worstEntryPrice) * side;
+    const target = { price, zoneId: targetZone.id, rMultiple: distance / riskDistance };
+    const plan = { direction, entry: entryRange, research: { entryZoneId: zone.id } };
+    const obstacle = blockingTargetObstacle(zones, plan, target, takeProfits);
+    if (obstacle) {
+      if (!previous) return reject(`通往首个止盈目标 ${price} 的路径上有 ${obstacle.interval} ${long ? "阻力区" : "支撑区"} ${priceText(obstacle.lower)}–${priceText(obstacle.upper)}。`);
+      break;
+    }
+    if (previous && (distance > thresholds.maxTargetDistanceAtr * atr || target.rMultiple < thresholds.minFirstTargetR)) break;
     takeProfits.push(target);
     if (takeProfits.length === thresholds.maxTargets) break;
   }
   const first = takeProfits[0];
-  if (!first) return reject(targetRejection ?? (targetZones.length ? "对向关键区内没有符合价格步长的止盈价位。" : "没有位于盈利方向的有效对向关键区，无法设置止盈。"));
+  if (!first || !entryRange) return reject(targetZones.length ? "对向关键区内没有符合价格步长的止盈价位。" : "没有位于盈利方向的有效对向关键区，无法设置止盈。");
+  const worstEntryPrice = long ? entryRange.max : entryRange.min;
+  const riskDistance = (worstEntryPrice - stopLoss) * side;
   return {
     direction, entryRange, stopLoss, takeProfits, riskReward: first.rMultiple,
     reasons: ["m1_triggered", "entry_in_confirmed_zone", "stop_beyond_zone", "targets_at_confirmed_zones"],

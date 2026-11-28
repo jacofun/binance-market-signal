@@ -86,10 +86,16 @@ test("deterministic HTTP analysis needs no LLM configuration and handles every d
   assert.equal(candidate.m1Trigger.triggered, true);
   assert.deepEqual(candidate.opportunity.entry, candidate.m2Order.entryRange);
 
-  mark = 10020;
+  mark = 10021;
   const requoted = await (await request()).json();
   assert.equal(requoted.status, "watch");
   assert.equal(requoted.decision.reasons[0].code, "quote_outside_entry");
+  assert.equal(requoted.opportunity.title, "M2 方案等待入场");
+  assert.deepEqual(requoted.opportunity.entry, candidate.opportunity.entry);
+  mark = 10180;
+  const crossed = await (await request()).json();
+  assert.equal(crossed.status, "expired");
+  assert.ok(crossed.decision.reasons.some(reason => reason.code === "quote_crossed_exit"));
 
   mark = 10000;
   market = snapshot();
