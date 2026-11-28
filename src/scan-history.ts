@@ -46,7 +46,7 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
 
   return {
     async list(input: Record<string, unknown>) {
-      const includeAutomatic = (input.version === 3 || input.version === 4) && automatic;
+      const includeAutomatic = (input.version === 3 || input.version === 4 || input.version === 5) && automatic;
       if (input.version !== 2 && !includeAutomatic) return listLegacy(input);
       const latest = now();
       const oldest = hourFor(latest) - historyDays * 24 * hour;
@@ -77,7 +77,7 @@ export function makeScanHistory(env: Env, now: () => number, request: typeof fet
       const records = await limited(visible.map(({ record, id }) => async () => {
         if (record.kind === "deterministic" && automatic) {
           return automatic.attachArchive(record).catch(() => {
-            const { analysisId: _unverified, ...row } = record;
+            const { analysisId: _unverified, exportAnalysisId: _unverifiedExport, ...row } = record;
             return row;
           });
         }

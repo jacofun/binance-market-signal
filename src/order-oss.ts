@@ -14,6 +14,7 @@ export interface OrderStore {
 type OssConfig = ReturnType<typeof loadOssConfig> & { prefix: string };
 
 export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl = fetch, domain: "ORDER" | "SCAN" = "ORDER"): OrderStore & {
+  exists(path: string): Promise<boolean>;
   appendJsonLineAt(path: string, value: unknown, position: number): Promise<number | null>;
   readJsonLines(path: string, limit: number): Promise<unknown[]>;
 } {
@@ -67,6 +68,13 @@ export function makeOrderStore(config: OssConfig, now: () => number, fetchImpl =
   }
   return {
     appendJsonLineAt,
+    async exists(path) {
+      const response = await request("HEAD", path);
+      await response.body?.cancel().catch(() => {});
+      if (response.ok) return true;
+      if (response.status === 404 && response.headers.get("x-oss-request-id")) return false;
+      throw unavailable(response);
+    },
     async assertAtomicWrites() {
       const response = await request("GET", "", undefined, "versioning");
       if (!response.ok) { await response.body?.cancel(); throw unavailable(response); }
