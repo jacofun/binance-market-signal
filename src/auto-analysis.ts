@@ -1,6 +1,7 @@
 import { analyze, type AnalysisStage } from "./analysis.js";
 import { loadConfig, type Env } from "./config.js";
 import { AppError, exceptionChain, publicError } from "./errors.js";
+import { readEntryWait, retainEntryWait } from "./entry-wait.js";
 import { limited } from "./http.js";
 import { closedCandleBoundary, INTERVAL_MS, RestMarketDataProvider } from "./market.js";
 import { legacyOutcomePath, makeLegacyScanStore } from "./scan-history.js";
@@ -116,8 +117,15 @@ export async function readLinkedAnalysisArchive(env: Env, now: () => number, req
 export async function readLinkedExecution(env: Env, now: () => number, request: typeof fetch, scanId: string, analysisId: string) {
   const store = historyStore(env, now, request);
   const archive = await readArchivedAnalysis(store, analysisId);
-  if (!isAutomaticRecord(archive, scanId, analysisId) || archive?.status !== "candidate") {
+  if (!isAutomaticRecord(archive, scanId, analysisId) || (archive?.status !== "candidate" && archive?.status !== "watch")) {
     throw new AppError("SIGNAL_NOT_FOUND", "未找到与这次扫描匹配的候选方案。", 404);
+  }
+  const closedAt = archive.automaticAnalysis?.candleClosedAt;
+  if (archive.status === "watch" && typeof closedAt === "number") {
+    const wait = await readEntryWait(store, closedAt, analysisId, now());
+    if (wait.state !== "unavailable") return wait;
+    const outcome = await readAutomaticExecution(store, analysisId);
+    return outcome.state !== "unavailable" && outcome.reasonCode === "ENTRY_WAIT_DUPLICATE" ? outcome : wait;
   }
   return readAutomaticExecution(store, analysisId);
 }
@@ -293,6 +301,14 @@ export async function runAutoAnalysis(requestId: string, triggeredAt: number, op
       logger.info(JSON.stringify({ event: "market_auto_analysis_completed", ...ids, analysisId, status: result.status,
         decisionSource: result.decisionSource, m1Score: result.m1Trigger?.score,
         decisionReasons: result.decision.reasons.map(reason => reason.code), elapsedMs: now() - start }));
+      const wait = await retainEntryWait(history, env, now, result, candleClosedAt, orderBase);
+      if (wait) {
+        logger.info(JSON.stringify({ event: "market_entry_wait_retained", ...ids, analysisId, entryWait: wait }));
+        if (wait.state === "existing") await tradeResults.logOutcome(analysisId, "analysis", {
+          finalStatus: "not_executed", reason: "ENTRY_WAIT_DUPLICATE", message: `同方向、同关键区已有等待方案 ${wait.analysisId}。`,
+        });
+        return { status: "completed", candleClosedAt, analysisId, entryWait: wait };
+      }
       if (env.SIGNAL_AUTO_ORDER_EXECUTE !== "true") {
         await tradeResults.logOutcome(analysisId, "analysis", { finalStatus: result.status === "expired" ? "expired" : "not_executed",
           reason: result.decision.reasons[0]?.code ?? "auto_execution_disabled" });

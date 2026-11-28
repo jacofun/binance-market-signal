@@ -147,7 +147,7 @@ CDN 的业务 POST 使用已开启原生 JWT 且覆盖业务路径的 FC 自定�
 | 止损 | 做多放在支撑区下沿外，做空放在阻力区上沿外。区域缓冲取 0.15 倍 ATR 和一个价格步长中的较大值，并与触发收盘价附近的参考入场边缘保持至少 0.5 倍 ATR。最终入场区内每个价位距止损 0.5–2 倍 ATR。 |
 | 目标 | 按路径选取对向确认区域的近端可用价位，最多两个。首个目标至少 1.5R，目标距入场不利端最多 6 倍 ATR。实单沿用首个目标作为止盈保护价。 |
 
-响应和自动归档包含 `decisionSource: "deterministic"`、`m1Trigger` 与 `m2Order`。M1 未触发时返回 `none`。M1 触发但 M2 无合法方案时返回无交易计划的 `watch`。有合法区间且最终标记价尚未进入时，返回保留价位的「M2 方案等待入场」。这次评估的等待状态只用于研究与现有报价复核。下一次定时扫描独立评估信号。订单预览及提交继续校验盘口、交易所过滤器和账户风险上限，自动提交只接受通过复核的 `candidate`，并受独立执行开关控制。规则参数在 `src/m2-order.ts` 中，尚待历史回放校准。
+响应和自动归档包含 `decisionSource: "deterministic"`、`m1Trigger` 与 `m2Order`。M1 未触发时返回 `none`。M1 触发但 M2 无合法方案时返回无交易计划的 `watch`。有合法区间且最终标记价尚未进入时，返回保留价位的「M2 方案等待入场」。定时分析归档后登记等待方案。订单预览及提交继续校验盘口、交易所过滤器和账户风险上限。规则参数在 `src/m2-order.ts` 中，尚待历史回放校准。
 
 
 ## HTTP触发器与CDN
@@ -235,11 +235,13 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 1. 定时器 `binance-market-analysis` 使用 Cron `5 */5 * * * *`，在每根 5m K 线收盘后第 5 秒执行。代码部署核验通过后，工作流尝试更新已有定时器的 Cron，保留其启用状态和触发消息。自动更新需要 `fc:GetTrigger` 和 `fc:UpdateTrigger`。部署摘要出现 `analysisSchedule` 警告时，在 FC 控制台检查该定时器和 Cron。[FC 定时触发器](https://www.alibabacloud.com/help/en/functioncompute/time-triggers)
 2. 设置 `SIGNAL_AUTO_ANALYSIS_DAILY_LIMIT` 为正整数以启用定时分析。留空或设为 `0` 时跳过定时分析。限额按 5m 收盘所属的北京时间自然日统计，每次 M1 触发且取得归档额度时占一次。同日原有 15m 记录继续计入额度，M1 未触发的收盘和手动分析不占用额度。
 3. 定时入口以 `neutral` 风格使用 `RestMarketDataProvider` 获取 4h、1h、15m 结构数据及 5m 触发证据。事件超过该 5m 收盘三分钟或快照对不上该收盘时跳过。M1 通过才运行 M2，交易方案经结构、步长和最新标记价格复核。每根 5m 收盘独立去重，发生并发时只允许一个调用归档及继续执行。
+4. 在同一 FC 函数上创建并启用名为 `market-entry-recheck` 的定时触发器，Cron 为 `15 * * * * *`，使用 FC 默认定时事件。它在每分钟第 15 秒复查等待方案。部署核验只更新已有触发器的 Cron 并保留其启用状态和触发消息。出现 `entryRecheckSchedule` 警告时，在 FC 控制台检查触发器。复查复用现有配置，无需新增环境变量。
 
 | OSS 路径 | 用途与权限 |
 | --- | --- |
 | `private/market-signal-auto-analysis/v1/BTCUSDT/slots/<北京时间日期>.ndjson` | 定时分析去重和每日额度，需 `oss:GetObject` 和 `oss:PutObject`。Bucket 策略须允许追加对象。 |
 | `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/{records,index,review-queue,review-enqueued}/` | M1 触发后写入网站分析历史和 4h、12h、24h 复盘队列，需 `oss:PutObject`。扫描列表核对关联归档及读取详情需要 `records/` 的 `oss:GetObject`。根目录默认 `/private`。 |
+| `<PRIVATE_RESOURCE_ROOT>/.trading/owner/market-signals/records/entry-waits/v1/` | 原始等待方案、一次性处理凭据和复查错误。使用现有归档桶及 `oss:GetObject`、`oss:PutObject`。一次性处理要求该桶从未启用版本控制，并允许 `oss:GetBucketVersioning`。 |
 | `private/market-signal-scanner/v1/` | 历史扫描及旧分析关联，只读，需 `oss:GetObject`。原 `POST /scans` 和关联归档读取接口继续可用。 |
 
 归档默认使用共用 OSS 桶。网站历史使用独立桶时，可设置 `OSS_CONTENT_BUCKET` 和 `OSS_CONTENT_REGION`。自动扫描面板使用 `POST /scans` 的 `version: 4`，按时间显示 5m、既有 15m M1 评估与旧扫描记录。此前只保存了收盘时间和状态的记录继续显示这些字段。日志事件 `market_auto_analysis_run` 记录定时执行结果，`market_auto_analysis_completed` 关联归档编号，`market_auto_analysis_failed` 记录行情、配额或归档错误。M1/M2 的阈值为原型参数，尚待历史校准。
@@ -248,9 +250,13 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 
 `SIGNAL_AUTO_ORDER_EXECUTE=true` 与 `SIGNAL_ORDER_EXECUTE=true` 同时开启后，已归档的有效 `candidate` 可进入自动委托复核。复核使用与账户相同的 `BINANCE_BASE_URL`，沿用 `market-order-protection` 恢复心跳、最新盘口、入场区间、过期时间、既有持仓和委托检查、交易所过滤器以及价差风险上限。关闭自动执行开关时，定时任务只做分析及归档。
 
+定时分析生成有效方案、但标记价仍在入场区间外时，从分析完成起保留原区间、原止损和原首个止盈 15 分钟。后续 5m 分析照常运行。同交易环境、同方向和同入场关键区的信号在这段时间内复用原先的等待窗口。复查器用 REST 获取最新标记价和连续的 1m 标记价高低点。分钟 K 线包含信号所在整分钟的行情，因此信号当分钟更早的极值也会保守地用于判定失效。缺少连续行情时跳过当次开仓。
+
+复查期间，新 15m 结构破坏原价位关系、标记价先触及原止损或止盈，或达到等待截止时间，都会关闭方案。标记价回到区间时，复查器验证原结构和现有盘口、风控规则，并用真实对手价计算首个止盈是否仍达到 1.5R。通过后以原分析编号提交。一次性处理凭据和订单锁防止并发或重试重复下单。取得凭据后遇到不确定回报时，通过既有订单恢复与查单核对。
+
 入口以最新对手价提交 `LIMIT/IOC`，确认成交后提交标记价止损和首个目标止盈。执行、保护和恢复沿用原订单路径。日志 `market_auto_order_outcome` 记录提交和保护结果，可用分析编号查单。
 
-自动扫描的分析记录会显示 M2 首个未通过的条件和相应数值，也会保留后续报价复核的判定原因。自动候选方案的详情使用 `/scans` 的 `execution` 操作读取同一分析编号下的委托回报，区分未提交、拒绝、未成交、部分成交及待确认。缺少回报时显示暂无记录。该读取操作使用现有扫描鉴权和 OSS 配置。
+自动扫描的分析记录会显示 M2 首个未通过的条件和相应数值，也会保留报价复核的判定原因。自动候选及等待方案使用 `/scans` 的 `execution` 操作查看等待截止时间、复查拒绝原因及委托回报。该读取操作使用现有扫描鉴权和 OSS 配置。
 
 ## M1/M2 交易结果日志
 
@@ -259,7 +265,7 @@ CI编译并将约数十KB的代码ZIP直接上传FC，不依赖北京OSS；校�
 | 相对路径 | 内容 |
 | --- | --- |
 | `decisions/<analysisId>.json` | 手动和定时确定性分析的决策记录，包含请求和扫描编号、时间、代码与规则版本、完整 M1/M2 输出、报价复核结论，以及当时的行情快照。包含 M1 未触发和额度已用完的收盘，定时重复调用只留一条。快照保留结构区、指标和各周期原始收盘 K 线，供后续人工或离线模型回放、修改规则及比较新旧规则。 |
-| `outcomes/<analysisId>/<phase>.json` | 分析跳过或失效记录、委托回报、保护恢复观察，以及确认的终局。`finalStatus` 取 `win`、`loss`、`breakeven`、`expired`、`cancelled`、`not_executed` 或 `null`。待提交的手动草稿可按 `validUntil` 判断是否过期，之后执行的订单由单独的回报关联。 |
+| `outcomes/<analysisId>/<phase>.json` | 分析跳过或失效记录、委托回报、保护恢复观察，以及确认的终局。`entry-wait.json` 记录等待方案未开仓时的关闭原因。`finalStatus` 取 `win`、`loss`、`breakeven`、`expired`、`cancelled`、`not_executed` 或 `null`。待提交的手动草稿可按 `validUntil` 判断是否过期，之后执行的订单由单独的回报关联。 |
 
 保护恢复在可核对开仓和保护退出成交数量一致时，依据币安成交均价记录退出价、估算的毛已实现盈亏和 R 倍数，费用与资金费未计入。成交订单的更新时间齐全时记录退出时间和持有时长。手动平仓或成交证据不足的退出保留 `finalStatus: null`，不以行情触及目标或止损替代真实成交。分析及委托照常处理，OSS 日志写入失败单独记录 `trade_result_log_failed`。
 

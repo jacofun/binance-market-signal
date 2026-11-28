@@ -1,5 +1,5 @@
 # CI preserves environment variables, role, layers and resources.
-# After code verification it reconciles only the existing analysis timer cadence.
+# After code verification it reconciles existing analysis and entry recheck timers.
 edition: 3.0.0
 name: binance-market-signal
 access: default
@@ -20,3 +20,4 @@ resources:
         port: 9000
       code: ./dist/binance-market-signal.zip
       analysisCron: "5 */5 * * * *"
+      entryRecheckCron: "15 * * * * *"

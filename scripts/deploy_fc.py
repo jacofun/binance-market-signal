@@ -42,6 +42,8 @@ def target_from_yaml(path):
             raise ValueError()
         if not re.fullmatch(r"(?:[0-9]|[1-5][0-9]) \*/(?:[1-9]|[1-5][0-9]) \* \* \* \*", props["analysisCron"]):
             raise ValueError()
+        if not re.fullmatch(r"(?:[0-9]|[1-5][0-9]) \* \* \* \* \*", props["entryRecheckCron"]):
+            raise ValueError()
         return props
     except (KeyError, TypeError, ValueError, AttributeError):
         raise DeployError("s.yaml deployment target is invalid.") from None
@@ -210,9 +212,8 @@ def deploy(client, target, package, *, sleep=time.sleep, now=time.monotonic):
     raise DeployError("FC deployment readback timed out; inspect the FC console before retrying.")
 
 
-def sync_analysis_schedule(client, target):
+def sync_analysis_schedule(client, target, trigger="binance-market-analysis", cron_field="analysisCron"):
     name = target["functionName"]
-    trigger = "binance-market-analysis"
     try:
         current = client.get_trigger(name, trigger).body
         if current.trigger_type != "timer":
@@ -220,8 +221,8 @@ def sync_analysis_schedule(client, target):
         config = json.loads(current.trigger_config)
         if not isinstance(config, dict) or not isinstance(config.get("cronExpression"), str) or type(config.get("enable")) is not bool:
             return "unrecognized_trigger_config"
-        if config["cronExpression"] != target["analysisCron"]:
-            config["cronExpression"] = target["analysisCron"]
+        if config["cronExpression"] != target[cron_field]:
+            config["cronExpression"] = target[cron_field]
             client.update_trigger(name, trigger, models.UpdateTriggerRequest(
                 body=models.UpdateTriggerInput(trigger_config=json.dumps(config))))
             updated = client.get_trigger(name, trigger).body
@@ -253,6 +254,9 @@ def main():
     result["analysisSchedule"] = sync_analysis_schedule(client, target)
     if result["analysisSchedule"] != "verified":
         print(f"::warning title=Analysis schedule::Check binance-market-analysis in FC ({result['analysisSchedule']}).")
+    result["entryRecheckSchedule"] = sync_analysis_schedule(client, target, "market-entry-recheck", "entryRecheckCron")
+    if result["entryRecheckSchedule"] != "verified":
+        print(f"::warning title=Entry recheck schedule::Check market-entry-recheck in FC ({result['entryRecheckSchedule']}).")
     (root / "dist/deploy-result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     if os.environ.get("GITHUB_STEP_SUMMARY"):

@@ -6,12 +6,13 @@ import type { Proposal, Snapshot, Style, TriggerInterval } from "./types.js";
 
 export const DETERMINISTIC_VERSION = "deterministic-m1-m2-v3";
 export const DETERMINISTIC_5M_VERSION = "deterministic-m1-m2-v3-5m";
+export const minimumM2RewardToRisk = 1.5;
 const thresholds = {
   referenceHalfWidthAtr: 0.15,
   stopBufferAtr: 0.15,
   minStopDistanceAtr: 0.5,
   maxRiskAtr: 2,
-  minFirstTargetR: 1.5,
+  minFirstTargetR: minimumM2RewardToRisk,
   maxTargetDistanceAtr: 6,
   maxTargets: 2,
   validForSeconds: 120,

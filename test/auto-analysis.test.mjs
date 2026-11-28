@@ -38,6 +38,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
   const analysisFetch = async (input, options) => {
     const url = new URL(input);
     if (url.hostname.endsWith("aliyuncs.com") && url.hostname.startsWith("auto-analysis-test.")) {
+      if (url.search === "?versioning") return new Response("<VersioningConfiguration/>");
       const current = objects.get(url.pathname);
       const ossHeaders = { "x-oss-request-id": "mock-oss-id" };
       if (state.rejectQuota && url.pathname.startsWith(storage)) return new Response(null, { status: 503, headers: ossHeaders });
@@ -53,9 +54,9 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
         return new Response(null);
       }
       if (options.method === "PUT") {
-        const heartbeat = url.pathname.endsWith("/protection/heartbeat.json");
-        if (!heartbeat) assert.equal(options.headers["x-oss-forbid-overwrite"], "true");
-        if (current && !heartbeat) return new Response(null, { status: 409 });
+        const mutable = url.pathname.endsWith("/protection/heartbeat.json") || url.pathname.includes("/entry-waits/v1/failures/");
+        if (!mutable) assert.equal(options.headers["x-oss-forbid-overwrite"], "true");
+        if (current && !mutable) return new Response(null, { status: 409 });
         objects.set(url.pathname, options.body);
         return new Response(null);
       }
@@ -71,6 +72,18 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
       nextFundingTime: state.now + 3600000, time: state.now });
     if (url.pathname.endsWith("/openInterestHist")) {
       return Response.json([{ symbol: "BTCUSDT", timestamp: state.now - 1000, sumOpenInterest: "100", sumOpenInterestValue: "1000000" }]);
+    }
+    if (url.pathname.endsWith("/markPriceKlines")) {
+      const minute = INTERVAL_MS["1m"];
+      const start = Number(url.searchParams.get("startTime"));
+      const end = Number(url.searchParams.get("endTime"));
+      const mark = state.mark ?? 10000;
+      const rows = [];
+      for (let at = start; at <= end; at += minute) {
+        rows.push([at, String(mark), String(state.markHigh ?? mark), String(state.markLow ?? mark), String(mark), "0", at + minute - 1]);
+      }
+      if (state.markHistoryGap) rows.shift();
+      return Response.json(rows);
     }
     assert.ok(url.pathname.endsWith("/klines"), url.pathname);
     const interval = url.searchParams.get("interval");
@@ -168,6 +181,7 @@ async function testServer(t, limit, state = { now: NOW + 5000 }, objects = new M
     post("/scans", { action: "execution", analysisId: analysis.analysisId, scanId: requestedScanId }, ticket(scope));
   return { state, objects, marketCalls, submissions, logs, post, timer, invoke, ticket, protection, execution,
     recover: () => timer("market-order-protection"),
+    recheck: () => timer("market-entry-recheck"),
     decision: id => JSON.parse(objects.get(`${tradeLogs}/decisions/${id}.json`)),
     outcome: (id, phase = "analysis") => JSON.parse(objects.get(`${tradeLogs}/outcomes/${id}/${phase}.json`)),
     saved: id => JSON.parse(objects.get(`${archive}/records/${id}.json`)) };
@@ -179,6 +193,8 @@ test("retired timer and untrusted events cannot start analysis", async t => {
   assert.equal((await app.timer(AUTO_ANALYSIS_TRIGGER, app.state.now, { "x-fc-control-path": "/http-invoke" })).http, 401);
   assert.equal((await app.timer(AUTO_ANALYSIS_TRIGGER, app.state.now, { Origin: "https://yanxiao.me" })).http, 401);
   assert.equal((await app.timer(AUTO_ANALYSIS_TRIGGER, app.state.now + 6000)).data.error.code, "INVALID_AUTO_ANALYSIS_TIMER");
+  assert.equal((await app.timer("market-entry-recheck", app.state.now, { "x-fc-control-path": "/http-invoke" })).http, 401);
+  assert.equal((await app.timer("market-entry-recheck", app.state.now - 60000)).data.error.code, "INVALID_ENTRY_RECHECK_TIMER");
   assert.equal((await app.invoke(NOW - period)).status, "stale");
   assert.deepEqual(app.marketCalls, []);
   assert.equal(app.objects.size, 0);
@@ -348,8 +364,8 @@ test("a validated M2 candidate reaches protected IOC with the same market endpoi
   assert.equal(app.submissions.length, 3);
 });
 
-test("an M2 range outside the requoted mark is archived as waiting and never submitted", async t => {
-  const app = await testServer(t, "2", { now: NOW + 5000, autoOrder: true, execution: true });
+async function waitingSetup(t) {
+  const app = await testServer(t, "5", { now: NOW + 5000, autoOrder: true, execution: true });
   const baseline = await app.invoke();
   const plan = app.saved(baseline.analysisId).m2Order;
   assert.equal(baseline.order.code, "ORDER_RECOVERY_NOT_READY");
@@ -362,7 +378,96 @@ test("an M2 range outside the requoted mark is archived as waiting and never sub
   assert.equal(saved.status, "watch");
   assert.equal(saved.opportunity.title, "M2 方案等待入场");
   assert.deepEqual(saved.opportunity.entry, plan.entryRange);
-  assert.equal(waiting.order.code, "AUTO_ORDER_NOT_CANDIDATE");
+  assert.equal(waiting.entryWait.state, "waiting");
+  assert.equal(waiting.entryWait.analysisId, waiting.analysisId);
+  assert.equal(waiting.entryWait.waitUntil, app.state.now + 15 * 60000);
+  assert.deepEqual((await app.execution(waiting)).data.execution, { state: "waiting", waitUntil: waiting.entryWait.waitUntil });
+  assert.deepEqual(app.submissions, []);
+  return { app, waiting, plan };
+}
+
+test("out-of-range M2 waits and a later quote enters through protected IOC only once", async t => {
+  const { app, waiting, plan } = await waitingSetup(t);
+  assert.equal((await app.recheck()).data.results[0].result, "waiting");
+  app.state.now += 60000;
+  app.state.mark = 10000;
+  await app.recover();
+  await Promise.all([app.recheck(), app.recheck()]);
+  assert.equal(app.submissions.length, 3, JSON.stringify(app.logs.slice(-8)));
+  assert.equal(app.submissions[0].timeInForce, "IOC");
+  assert.deepEqual(app.submissions.slice(1).map(item => [item.type, Number(item.triggerPrice)]),
+    [["STOP_MARKET", plan.stopLoss], ["TAKE_PROFIT_MARKET", plan.takeProfits[0].price]]);
+  assert.equal((await app.execution(waiting)).data.execution.state, "filled");
+  assert.equal((await app.recheck()).data.results[0].result, "resolved");
+  assert.equal([...app.objects.keys()].filter(key => key.startsWith(`${tradeLogs}/decisions/`)).length, 2);
+});
+
+test("a new five-minute signal for the same zone does not replace or bypass the pending plan", async t => {
+  const { app, waiting } = await waitingSetup(t);
+  app.state.now += period;
+  app.state.mark = 10000;
+  await app.recover();
+  const repeated = await app.invoke();
+  assert.deepEqual(repeated.entryWait, { ...waiting.entryWait, state: "existing" });
+  assert.equal((await app.execution(repeated)).data.execution.reasonCode, "ENTRY_WAIT_DUPLICATE");
+  assert.equal((await app.execution(waiting)).data.execution.state, "waiting");
+  assert.deepEqual(app.submissions, []);
+});
+
+test("touching the original stop or target before reentry closes the plan", async t => {
+  for (const [reason, field, oldPrice] of [["target_touched", "markHigh", plan => plan.takeProfits[0].price],
+    ["stop_touched", "markLow", plan => plan.stopLoss]]) {
+    const { app, waiting, plan } = await waitingSetup(t);
+    app.state.now += 60000;
+    app.state.mark = 10000;
+    app.state[field] = oldPrice(plan);
+    assert.equal((await app.recheck()).data.results[0].result, reason);
+    assert.deepEqual((await app.execution(waiting)).data.execution,
+      { state: "invalidated", reasonCode: reason, waitUntil: waiting.entryWait.waitUntil });
+    assert.equal(app.outcome(waiting.analysisId, "entry-wait").finalStatus, "not_executed");
+    assert.deepEqual(app.submissions, []);
+  }
+});
+
+test("missing mark history prevents entry and an expired plan cannot execute", async t => {
+  const { app, waiting } = await waitingSetup(t);
+  app.state.now += 60000;
+  app.state.mark = 10000;
+  app.state.markHistoryGap = true;
+  const check = await app.recheck();
+  assert.equal(check.http, 200);
+  assert.notEqual(check.data.results[0].result, "waiting");
+  assert.deepEqual((await app.execution(waiting)).data.execution, { state: "waiting",
+    reasonCode: check.data.results[0].result, waitUntil: waiting.entryWait.waitUntil });
+  app.state.now = waiting.entryWait.waitUntil;
+  app.state.markHistoryGap = false;
+  assert.equal((await app.recheck()).data.results[0].result, "wait_expired");
+  assert.equal((await app.execution(waiting)).data.execution.reasonCode, "wait_expired");
+  assert.equal(app.outcome(waiting.analysisId, "entry-wait").finalStatus, "expired");
+  assert.deepEqual(app.submissions, []);
+});
+
+test("waiting entry cannot bypass the final order and quote rules", async t => {
+  const { app, waiting, plan } = await waitingSetup(t);
+  app.state.now += 60000;
+  app.state.mark = 10000;
+  app.state.askPrice = String(plan.entryRange.max + 1);
+  await app.recover();
+  assert.equal((await app.recheck()).data.results[0].result, "ORDER_RULE_CHANGED");
+  assert.deepEqual((await app.execution(waiting)).data.execution, {
+    state: "waiting", reasonCode: "ORDER_RULE_CHANGED", waitUntil: waiting.entryWait.waitUntil,
+  });
+  assert.deepEqual(app.submissions, []);
+});
+
+test("the original target zone must still be valid at reentry", async t => {
+  const { app, waiting } = await waitingSetup(t);
+  app.state.now += 60000;
+  app.state.mark = 10000;
+  app.state.noOrder = true;
+  await app.recover();
+  assert.equal((await app.recheck()).data.results[0].result, "structure_invalid");
+  assert.equal((await app.execution(waiting)).data.execution.reasonCode, "structure_invalid");
   assert.deepEqual(app.submissions, []);
 });
 

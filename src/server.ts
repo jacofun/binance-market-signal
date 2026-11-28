@@ -14,6 +14,7 @@ import { makeOrderExchange } from "./order-binance.js";
 import { makeProtectedExecution } from "./order-execution.js";
 import { makeOrders } from "./orders.js";
 import { makeScanHistory } from "./scan-history.js";
+import { ENTRY_RECHECK_TRIGGER, runEntryRecheck, validateEntryRecheckTimer } from "./entry-wait.js";
 import { exportScanDecisions } from "./scan-export.js";
 import { makeTradeResultLog } from "./trade-result-log.js";
 import { analysisIdPattern, attachAutomaticScanArchive, AUTO_ANALYSIS_TRIGGER, readAutomaticScanRows,
@@ -131,6 +132,15 @@ export function makeServer({ env = process.env, provider, model, now = Date.now,
           const result = await execution.recover();
           logger.info(JSON.stringify({ event: "order_protection_recovery", requestId, ...result }));
           send(200, { requestId, ...result }); return;
+        }
+        if (timerEvent && input.triggerName === ENTRY_RECHECK_TRIGGER) {
+          isOrder = true;
+          orderAction = "entry_recheck";
+          validateEntryRecheckTimer(input, now());
+          const results = await runEntryRecheck({ env, now, request: analysisFetch, orderRequest: orderFetch,
+            deadline: startedAt + 55_000, tradeResults, report: event => logger.info(JSON.stringify({ requestId, ...event })) });
+          logger.info(JSON.stringify({ event: "market_entry_rechecked", requestId, results }));
+          send(200, { requestId, results }); return;
         }
         throw new AppError("UNAUTHORIZED", "分析请求需要 X-JWT-Token。", 401);
       }

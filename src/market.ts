@@ -145,6 +145,24 @@ export class RestMarketDataProvider implements MarketDataProvider {
     if (age < -2000 || age > this.config.maxPriceAgeMs) throw new AppError("STALE_MARKET_DATA", "最新标记价格已过期，本次不生成有效机会。", 503);
     return q;
   }
+  async markPriceExtremes(symbol: string, from: number, through: number, signal: AbortSignal) {
+    const first = closedCandleBoundary(from, "1m");
+    const last = closedCandleBoundary(through, "1m");
+    const minute = INTERVAL_MS["1m"];
+    const count = (last - first) / minute + 1;
+    if (count < 1 || count > 20) throw badData();
+    const raw = await this.get("/fapi/v1/markPriceKlines", { symbol, interval: "1m", startTime: String(first),
+      endTime: String(through), limit: String(count) }, signal);
+    if (!Array.isArray(raw) || raw.length !== count) throw badData();
+    const bars = raw.map((row, index) => {
+      const openTime = first + index * minute;
+      if (!Array.isArray(row) || timestamp(row[0]) !== openTime || timestamp(row[6]) !== openTime + minute - 1) throw badData();
+      const high = numeric(row[2], true), low = numeric(row[3], true);
+      if (high < low) throw badData();
+      return { high, low };
+    });
+    return { high: Math.max(...bars.map(bar => bar.high)), low: Math.min(...bars.map(bar => bar.low)) };
+  }
   async candles(symbol: string, interval: CandleInterval, at: number, signal: AbortSignal, allowOneMissingClose = false): Promise<Candle[]> {
     return parseCandles(await this.get("/fapi/v1/klines", { symbol, interval, limit: String(candleLimit(interval) + 1), endTime: String(at) }, signal), interval, at, allowOneMissingClose);
   }
