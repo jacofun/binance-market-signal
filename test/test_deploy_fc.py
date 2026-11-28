@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import tempfile
 import zipfile
 
@@ -143,6 +143,16 @@ class DeployTests(unittest.TestCase):
              patch.object(client, "update_trigger", create=True) as update:
             self.assertEqual(module.sync_analysis_schedule(client, self.target), "unverified_PermissionError")
             update.assert_not_called()
+
+    def test_entry_recheck_schedule_updates_only_the_named_timer(self):
+        before = {"cronExpression": "5 * * * * *", "enable": True}
+        after = {**before, "cronExpression": "15 * * * * *"}
+        responses = [SimpleNamespace(body=SimpleNamespace(trigger_type="timer", trigger_config=json.dumps(config)))
+                     for config in (before, after)]
+        client = SimpleNamespace(get_trigger=Mock(side_effect=responses), update_trigger=Mock())
+        self.assertEqual(module.sync_analysis_schedule(client, self.target, "market-entry-recheck", "entryRecheckCron"), "verified")
+        client.get_trigger.assert_called_with("binance-market-signal", "market-entry-recheck")
+        self.assertEqual(json.loads(client.update_trigger.call_args.args[2].body.trigger_config), after)
 
 
 if __name__ == "__main__":

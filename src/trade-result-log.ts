@@ -10,7 +10,7 @@ import type { Snapshot, TriggerInterval } from "./types.js";
 export const tradeResultPrefix = "records/trade-results/v1";
 export const tradeDecisionPath = (analysisId: string) => `${tradeResultPrefix}/decisions/${analysisId}.json`;
 const schemaVersion = 1;
-type Phase = "analysis" | "submission" | "recovery" | "closure" | "terminal";
+type Phase = "analysis" | "entry-wait" | "submission" | "recovery" | "closure" | "terminal";
 export type TradeFinalStatus = "win" | "loss" | "breakeven" | "expired" | "cancelled" | "not_executed";
 type Analysis = Awaited<ReturnType<typeof analyze>>;
 type DecisionContext = { source: "manual"; orderPermitIssued: boolean } | {
@@ -22,6 +22,7 @@ interface Outcome {
   finalStatus: TradeFinalStatus | null;
   reason?: string;
   message?: string;
+  waitUntil?: number;
   exchangeCode?: number;
   execution?: {
     mode: "demo" | "live"; clientId: string; requestedQty: string; entryState: ExchangeOrder["state"];

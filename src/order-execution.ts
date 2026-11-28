@@ -1,7 +1,7 @@
 import { AppError, exceptionChain } from "./errors.js";
 import { digest, object, ORDER_ID, type OrderConfig, type OrderPlan } from "./order-auth.js";
 import type { ExchangeOrder, OrderExchange, PositionSide, ProtectionLeg } from "./order-binance.js";
-import { assertQuote, DECIMAL, orderOption, type OrderOption, type TradingRules } from "./order-rules.js";
+import { assertQuote, DECIMAL, orderOption, type OrderOption, type Quote, type TradingRules } from "./order-rules.js";
 import type { OrderStore } from "./order-oss.js";
 import { closedTradeOutcome, type TradeResultLog } from "./trade-result-log.js";
 
@@ -198,7 +198,8 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
     }
     return entry;
   }
-  async function submit(plan: OrderPlan, expiresAt: number, draft?: ProtectedDraft, deadline = Infinity) {
+  async function submit(plan: OrderPlan, expiresAt: number, draft?: ProtectedDraft, deadline = Infinity,
+    beforeAutomaticEntry?: (quote: Quote, option: OrderOption) => Promise<void>) {
     if (deadline - now() <= autoProtectionBudgetMs + 3000) {
       throw new AppError("AUTO_ORDER_DEADLINE", "扫描调用剩余时间不足以开仓并提交保护单。", 409);
     }
@@ -223,6 +224,7 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
       option.price !== draft.option.price || option.triggerPrice !== draft.option.triggerPrice)) {
       throw new AppError("ORDER_QUOTE_CHANGED", "盘口相较确认草稿变化过大，请刷新。", 409);
     }
+    await beforeAutomaticEntry?.(quote, option);
     const intent: Intent = { ...(option.kind === "market" ? { version: 2, kind: "market" } :
       { version: 3, kind: option.kind, entryExpiresAt: now() + pendingEntryMs }),
       analysisId: plan.id, owner: plan.owner,
@@ -275,7 +277,8 @@ export function makeProtectedExecution(config: OrderConfig, store: OrderStore, e
   return {
     ready,
     submit: (draft: ProtectedDraft) => submit(draft.plan, draft.expiresAt, draft),
-    submitAutomatic: (plan: OrderPlan, deadline: number) => submit(plan, plan.expiresAt, undefined, deadline),
+    submitAutomatic: (plan: OrderPlan, deadline: number, beforeEntry?: (quote: Quote, option: OrderOption) => Promise<void>) =>
+      submit(plan, plan.expiresAt, undefined, deadline, beforeEntry),
     async inspect(intent: Intent) {
       const closed = await store.read(`${path(intent)}/closed.json`);
       const cached = await knownOrder(intent);
