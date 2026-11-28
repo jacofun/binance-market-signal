@@ -253,7 +253,7 @@ test("candidate previews fix both protective levels and issue no executable draf
   assert.equal(preview.quantity, "0.001");
   assert.equal(preview.mode, "demo");
   assert.deepEqual(preview.options.map(o => [o.kind, o.price, o.triggerPrice]), [
-    ["market", "10000.1", undefined], ["limit", "9985", undefined], ["conditional", "10015", "10015"],
+    ["market", "10000.1", undefined], ["limit", "9985", undefined], ["conditional", "10020", "10020"],
   ]);
   for (const option of preview.options) {
     assert.equal(option.stopLossPrice, "9935");
@@ -347,7 +347,7 @@ test("manual analysis and submission share an analysis ID in the trade logs", as
   assert.equal(decision.orderPermitIssued, true);
   assert.equal(decision.decisionSource, "deterministic");
   assert.deepEqual(decision.snapshot, m2Snapshot());
-  assert.equal(decision.deterministicVersion, "deterministic-m1-m2-v1");
+  assert.equal(decision.deterministicVersion, "deterministic-m1-m2-v3");
   const submission = await app.submit(entryDraft(preview));
   assert.equal(submission.http, 200);
   const outcome = app.objects.get(`${tradeLogs}/outcomes/${preview.analysisId}/submission.json`);

@@ -17,13 +17,13 @@ test("deterministic long order uses the M1 zone, tick-aligned prices and the adv
   const order = generateM2Order(market, trigger, "trend");
   assert.ok(trigger.triggered);
   assert.equal(order.direction, "long");
-  assert.deepEqual(order.entryRange, { min: 9985, max: 10015 });
+  assert.deepEqual(order.entryRange, { min: 9985, max: 10020 });
   assert.equal(order.stopLoss, 9935);
-  assert.equal(order.keyFeatures.riskDistance, 80);
+  assert.equal(order.keyFeatures.riskDistance, 85);
   assert.equal(order.keyFeatures.entryZoneId, "entry");
   assert.deepEqual(order.takeProfits, [
-    { price: 10180.1, zoneId: "up", rMultiple: (10180.1 - 10015) / 80 },
-    { price: 10400, zoneId: "second", rMultiple: (10400 - 10015) / 80 },
+    { price: 10180.1, zoneId: "up", rMultiple: (10180.1 - 10020) / 85 },
+    { price: 10400, zoneId: "second", rMultiple: (10400 - 10020) / 85 },
   ]);
   assert.equal(order.riskReward, order.takeProfits[0].rMultiple);
   assert.deepEqual(generateM2Order(market, trigger, "trend"), order);
@@ -43,7 +43,7 @@ test("short proposals round toward the inside of target zones and beyond the sto
   const trigger = evaluateM1Trigger(market);
   const order = generateM2Order(market, trigger);
   assert.equal(order.direction, "short");
-  assert.deepEqual(order.entryRange, { min: 9985, max: 10015 });
+  assert.deepEqual(order.entryRange, { min: 9980, max: 10015 });
   assert.equal(order.stopLoss, 10065);
   assert.deepEqual(order.takeProfits.map(target => target.price), [9820, 9700]);
   assert.equal(validateProposal(deterministicProposal(market, trigger, order), market).direction, "short");
@@ -62,24 +62,31 @@ test("missing, stale or incompatible triggers and broken or tickless entry zones
   assert.equal(generateM2Order(market, trigger), null);
 });
 
-test("entry distance, stop distance and first-target R gate the order", () => {
+test("M2 holds the structural range and stop constant as the mark moves", () => {
   const market = m2Snapshot();
   const trigger = evaluateM1Trigger(market);
-  market.quote.price = 10070;
-  assert.ok(generateM2Order(market, trigger));
-  market.quote.price = 10070.1;
-  assert.equal(generateM2Order(market, trigger), null);
+  const base = generateM2Order(market, trigger);
+  market.quote.price = 10090;
+  const waiting = generateM2Order(market, trigger);
+  assert.deepEqual(waiting.entryRange, base.entryRange);
+  assert.equal(waiting.stopLoss, base.stopLoss);
+  assert.deepEqual(waiting.takeProfits, base.takeProfits);
   market.quote.price = 9979.9;
   assert.equal(generateM2Order(market, trigger), null);
-  market.quote.price = 10000;
-  const [zone] = hourly(market).zones;
-  zone.lower = 9800;
+  market.quote.price = base.takeProfits[0].price;
   assert.equal(generateM2Order(market, trigger), null);
-  zone.lower = 9980;
+});
+
+test("M2 trims the unfavorable edge to 1.5R and rejects a target even one tick too close", () => {
+  const market = m2Snapshot();
+  const trigger = evaluateM1Trigger(market);
   const first = hourly(market).zones.find(item => item.id === "up");
-  first.lower = 10135;
+  first.lower = 10120;
+  assert.deepEqual(generateM2Order(market, trigger).entryRange, { min: 9985, max: 10009 });
   assert.equal(generateM2Order(market, trigger).riskReward, 1.5);
-  first.lower = 10134.9;
+  first.lower = 10060;
+  assert.deepEqual(generateM2Order(market, trigger).entryRange, { min: 9985, max: 9985 });
+  first.lower = 10059.9;
   assert.equal(generateM2Order(market, trigger), null);
 });
 
@@ -97,19 +104,15 @@ test("M2 neither invents targets nor skips a closer zone to obtain a higher R", 
   assert.equal(generateM2Order(market, trigger), null);
 });
 
-test("M2 reports the first failed gate with its inputs and leaves the result unchanged", () => {
+test("M2 reports an empty intersection instead of skipping a nearby target", () => {
   const market = m2Snapshot();
   const trigger = evaluateM1Trigger(market);
   const messages = [];
   const evaluate = () => generateM2Order(market, trigger, undefined, reason => messages.push(reason));
   assert.deepEqual(evaluate(), generateM2Order(market, trigger));
   assert.equal(messages.length, 0);
-  market.quote.price = 10071;
-  assert.equal(evaluate(), null);
-  assert.match(messages.pop(), /51\.00 USDT.*0\.5 ATR.*50\.00 USDT/);
-  market.quote.price = 10000;
   const [support] = hourly(market).zones;
-  hourly(market).zones.push({ ...support, id: "retested", status: "retested", lower: 10071, upper: 10100 });
+  hourly(market).zones.push({ ...support, id: "retested", status: "retested", lower: 10059.9, upper: 10100 });
   assert.equal(evaluate(), null);
-  assert.match(messages.pop(), /0\.70R.*1\.50R.*10071.*10015.*9935/);
+  assert.match(messages.pop(), /止损 9935.*目标 10059\.9.*没有达到 1\.50R/);
 });

@@ -66,9 +66,13 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
     }
   }
   let status: Proposal["status"] | "expired" = expiryReasons.length ? "expired" : p.status;
+  let title = p.title;
   if (status === "candidate" && p.entry && (latest.price < p.entry.min || latest.price > p.entry.max)) {
     status = "watch";
-    decisionReasons.push({ code: "quote_outside_entry", message: `分析后的标记价 ${latest.price} 不在候选入场区间 ${p.entry.min}–${p.entry.max} 内。` });
+    if (m2Order) title = "M2 方案等待入场";
+    decisionReasons.push({ code: "quote_outside_entry", message: m2Order ?
+      `M2 已生成方案，等待标记价进入 ${p.entry.min}–${p.entry.max}。当前标记价 ${latest.price}。` :
+      `分析后的标记价 ${latest.price} 不在候选入场区间 ${p.entry.min}–${p.entry.max} 内。` });
   }
   const entryReference = p.entry ? (p.direction === "long" ? p.entry.max : p.entry.min) : null;
   const risk = entryReference && p.stopLoss ? Math.abs(entryReference - p.stopLoss) : null;
@@ -77,7 +81,7 @@ export async function analyze(config: Config, provider: MarketDataProvider, symb
     ...(m1Trigger ? { m1Trigger } : {}),
     ...(config.useDeterministicModels ? { decisionSource: "deterministic" as const, m2Order } : {}),
     decision: { ...modelDecision, reasons: [...decisionReasons, ...expiryReasons] },
-    opportunity: { ...p, status, rewardRisk: p.targets.map(t => ({ target: t.price, ratio: risk ? Math.abs(t.price - entryReference!) / risk : null })),
+    opportunity: { ...p, title, status, rewardRisk: p.targets.map(t => ({ target: t.price, ratio: risk ? Math.abs(t.price - entryReference!) / risk : null })),
       triggerVerified: false, priceReference: "markPrice", expiredReasons: expiryReasons.map(reason => reason.message) },
     research: assessResearch(snapshot, p),
     market: { tickSize: snapshot.tickSize, ...researchContext(snapshot), asOf: snapshot.asOf, frames: snapshot.frames.map(({ recentCandles: _candles, zones: _zones, historicalRanges: _ranges, priceLevels: _priceLevels, ...f }) => f),

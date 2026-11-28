@@ -209,7 +209,7 @@ test("the timer uses fresh REST 5m volume evidence alongside the 4h/1h/15m struc
   assert.equal(saved.m1Trigger.keyFeatures.triggerInterval, "5m");
   assert.equal(saved.m2Order.keyFeatures.atr15m, saved.market.frames.find(frame => frame.interval === "15m").atr14);
   assert.equal(saved.opportunity.evidence[0].metric, "5m.volumePrice");
-  assert.deepEqual(saved.model, { name: "m1-m2", promptVersion: "deterministic-m1-m2-v2-5m", inputTokens: null, outputTokens: null });
+  assert.deepEqual(saved.model, { name: "m1-m2", promptVersion: "deterministic-m1-m2-v3-5m", inputTokens: null, outputTokens: null });
   const decision = app.decision(result.analysisId);
   assert.equal(decision.schemaVersion, 1);
   assert.equal(decision.recordType, "decision");
@@ -346,6 +346,24 @@ test("a validated M2 candidate reaches protected IOC with the same market endpoi
     [["STOP_MARKET", order.stopLoss], ["TAKE_PROFIT_MARKET", order.takeProfits[0].price]]);
   assert.equal((await app.invoke()).status, "duplicate");
   assert.equal(app.submissions.length, 3);
+});
+
+test("an M2 range outside the requoted mark is archived as waiting and never submitted", async t => {
+  const app = await testServer(t, "2", { now: NOW + 5000, autoOrder: true, execution: true });
+  const baseline = await app.invoke();
+  const plan = app.saved(baseline.analysisId).m2Order;
+  assert.equal(baseline.order.code, "ORDER_RECOVERY_NOT_READY");
+  app.state.now += period;
+  app.state.mark = plan.entryRange.max + 1;
+  assert.ok(app.state.mark < plan.takeProfits[0].price);
+  await app.recover();
+  const waiting = await app.invoke();
+  const saved = app.saved(waiting.analysisId);
+  assert.equal(saved.status, "watch");
+  assert.equal(saved.opportunity.title, "M2 方案等待入场");
+  assert.deepEqual(saved.opportunity.entry, plan.entryRange);
+  assert.equal(waiting.order.code, "AUTO_ORDER_NOT_CANDIDATE");
+  assert.deepEqual(app.submissions, []);
 });
 
 test("trade results join IOC submission to a reconciled protective fill", async t => {
